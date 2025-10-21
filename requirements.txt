@@ -1,7 +1,21 @@
+pip>=23.2
+setuptools>=68.0
+wheel>=0.41
+
+# Core
+requests
+gTTS
+
+# YouTube + Google auth
 google-api-python-client
 google-auth
 google-auth-oauthlib
-requests
-moviepy
-gTTS
+
+# Trends
 pytrends
+
+# Video (pinning to avoid import/runtime issues)
+moviepy==1.0.3
+imageio>=2.31
+imageio-ffmpeg>=0.4.9
+numpy<2
