@@ -1,4 +1,3 @@
-# handle_comment.py
 import os, re, json, tempfile, subprocess, requests, traceback, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,9 +12,17 @@ REGION = os.getenv("REGION", "IN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Use Groq mistral-saba-24b (configurable via env)
-GROQ_MODEL = os.getenv("GROQ_MODEL", "mistral-saba-24b")
-GROQ_FALLBACK_MODELS = [GROQ_MODEL]
+
+# Primary model (configurable) and robust fallbacks
+# Default to a Qwen 2.5 32B instruct model on Groq; adjust as needed in workflow env
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen2.5-32b-instruct")
+GROQ_FALLBACK_MODELS = [
+    GROQ_MODEL,
+    "qwen2.5-14b-instruct",
+    "qwen2.5-7b-instruct",
+    "llama3-8b-8192"
+]
+
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
 
@@ -57,7 +64,7 @@ def extract_json_block(text):
     return m.group(0) if m else None
 
 def parse_topics_from_body(body):
-    # 1) Try JSON metadata topics block
+    # 1) Try JSON metadata topics
     try:
         block = extract_json_block(body)
         if block:
@@ -83,7 +90,7 @@ def parse_topics_from_body(body):
             continue
         if flag:
             s_ln = ln.strip()
-            if not s_ln or s_ln.lower().startswith("reply with"):  # FIX: use .startswith (lowercase)
+            if not s_ln or s_ln.lower().startswith("reply with"):  # FIX: correct method name
                 break
             s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[KATEX_INLINE_CLOSE\.\-:])?\s*", "", s_ln).strip()
             if s:
@@ -93,6 +100,7 @@ def parse_topics_from_body(body):
     return []
 
 def get_slot_from_labels(labels):
+    # Return "morning" or "afternoon" based on label "slot:morning"/"slot:afternoon"
     for lbl in labels or []:
         name = lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)
         if name.startswith("slot:"):
@@ -150,6 +158,7 @@ Output pure JSON with:
             except Exception:
                 errj = {"error": {"message": r.text}}
             msg = str(errj.get("error", {}).get("message", r.text))
+            # If this model is decommissioned, just try the next fallback; accumulate the last error
             last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
             continue
     raise last_err or RuntimeError("Groq call failed with all fallback models")
