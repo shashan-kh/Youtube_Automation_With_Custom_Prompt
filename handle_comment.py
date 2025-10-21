@@ -59,19 +59,16 @@ def get_slot_from_labels(labels):
     return "morning"
 
 def extract_json_block(text):
-    # Try ```json ... ``` first
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
     if m:
         return m.group(1)
-    # Try generic code fence
     m = re.search(r"```\s*(\{.*?\})\s*```", text, re.S)
     if m:
         return m.group(1)
-    # Try to find the first JSON object heuristically
     m = re.search(r"\{.*\}", text, re.S)
     if m:
         return m.group(0)
-    return text  # maybe it's already raw JSON
+    return text
 
 def llm_script(trending_query, word_hint="90–105"):
     if not GROQ_API_KEY:
@@ -108,7 +105,6 @@ Output pure JSON with:
         data = json.loads(block)
     except Exception as e:
         raise RuntimeError(f"Failed to parse LLM JSON: {e}\nRaw: {raw[:500]}")
-    # Normalize tags (string or list)
     if isinstance(data.get("tags"), list):
         data["tags"] = ",".join(data["tags"])
     return data
@@ -132,7 +128,7 @@ def fetch_broll(query, need=4):
     for q in [query, "healthy lifestyle", "fitness", "sleep", "hydration", "walking", "stretching", "posture", "nutrition", "yoga"]:
         try:
             r = requests.get(url, headers=headers, params={"query": q, "per_page": 20, "orientation": "portrait"}, timeout=60)
-            if r.status_code == 401 or r.status_code == 403:
+            if r.status_code in (401, 403):
                 raise RuntimeError(f"Pexels API auth error {r.status_code}: {r.text}")
             for v in r.json().get("videos", []):
                 files = sorted(v.get("video_files", []), key=lambda f: f.get("height",0), reverse=True)
@@ -197,7 +193,6 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
     make_srt(overlay_lines, end, srt_path)
     burn_subs(temp_mp4, srt_path, final_mp4)
     v = VideoFileClip(final_mp4); d = v.duration; v.close()
-    # Final safety trim if needed (correct ffmpeg args: no stray space before -c)
     if d >= 58.0 or d > PREVIEW_MAX + 0.2:
         subprocess.run(["ffmpeg","-y","-i",final_mp4,"-t",str(PREVIEW_MAX),"-c","copy","short_trim.mp4"], check=False)
         if os.path.exists("short_trim.mp4"):
@@ -214,7 +209,6 @@ def upload_preview(file_path):
     return r.text.strip()
 
 def yt_client():
-    # Validate required YT secrets
     for v in ["YT_CLIENT_ID","YT_CLIENT_SECRET","YT_REFRESH_TOKEN"]:
         if not os.getenv(v):
             raise RuntimeError(f"Missing {v} secret")
@@ -273,14 +267,11 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
     for attempt in range(1, max_attempts+1):
         word_hint = word_targets[min(attempt-1, len(word_targets)-1)]
         s = llm_script(topic, word_hint=word_hint)
-        # TTS
         voice = "voice.mp3"; gTTS(s["voiceover"], lang=TTS_LANG).save(voice)
         voice, _ = ensure_voice_under_target(voice, target=PREVIEW_MAX)
-        # B-roll
         broll = fetch_broll(topic, need=4)
         if not broll:
             continue
-        # Render + captions
         temp, final = "temp.mp4", "short.mp4"
         dur = render_and_cap(broll, voice, temp, final, s.get("overlay_lines", []))
         if dur < 58.0:
@@ -391,7 +382,6 @@ def main():
     try:
         safe_main()
     except Exception as e:
-        # Try to report in the Issue; if that fails, at least print traceback
         try:
             e_json = ev()
             owner, repo = REPO.split("/")
@@ -401,7 +391,6 @@ def main():
         except Exception:
             print("FATAL:", e)
             print(traceback.format_exc())
-        # Do not re-raise to avoid failing the job hard; just return
         return
 
 if __name__ == "__main__":
