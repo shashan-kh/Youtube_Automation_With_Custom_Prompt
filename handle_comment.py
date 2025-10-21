@@ -44,31 +44,56 @@ def remove_label(owner, repo, number, label):
 def get_issue(owner, repo, number):
     return gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}").json()
 
+def extract_json_block(text):
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
+    if m: return m.group(1)
+    m = re.search(r"```\s*(\{.*?\})\s*```", text, re.S)
+    if m: return m.group(1)
+    m = re.search(r"\{.*\}", text, re.S)
+    return m.group(0) if m else None
+
 def parse_topics_from_body(body):
+    # 1) Try JSON metadata topics
+    try:
+        block = extract_json_block(body)
+        if block:
+            data = json.loads(block)
+            if isinstance(data, dict) and "topics" in data and isinstance(data["topics"], list) and data["topics"]:
+                return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
+    except Exception:
+        pass
+    # 2) Try numbered lines: 1) Topic ... or "1. Topic", "1 - Topic"
     topics = []
     for line in body.splitlines():
-        m = re.match(r"\s*(\d+)KATEX_INLINE_CLOSE\s+(.*)", line.strip())
+        m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[KATEX_INLINE_CLOSE\.\-:]\s+(.*\S)", line)
         if m:
             topics.append(m.group(2).strip())
-    return topics
+    if topics:
+        return topics[:3]
+    # 3) Try lines after "Choose one:" up to "Reply with"
+    lines = body.splitlines()
+    cleaned = []
+    flag = False
+    for ln in lines:
+        if not flag and "Choose one" in ln:
+            flag = True
+            continue
+        if flag:
+            if not ln.strip() or ln.strip().lower().startswith("reply with"):
+                break
+            # strip bullets/numbering
+            s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[KATEX_INLINE_CLOSE\.\-:])?\s*", "", ln).strip()
+            if s:
+                cleaned.append(s)
+    if cleaned:
+        return cleaned[:3]
+    return []
 
 def get_slot_from_labels(labels):
     for lbl in labels:
         if lbl["name"].startswith("slot:"):
             return lbl["name"].split(":",1)[1]
     return "morning"
-
-def extract_json_block(text):
-    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
-    if m:
-        return m.group(1)
-    m = re.search(r"```\s*(\{.*?\})\s*```", text, re.S)
-    if m:
-        return m.group(1)
-    m = re.search(r"\{.*\}", text, re.S)
-    if m:
-        return m.group(0)
-    return text
 
 def llm_script(trending_query, word_hint="90–105"):
     if not GROQ_API_KEY:
@@ -100,11 +125,8 @@ Output pure JSON with:
     raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     if not raw:
         raise RuntimeError("Groq returned empty content")
-    block = extract_json_block(raw)
-    try:
-        data = json.loads(block)
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse LLM JSON: {e}\nRaw: {raw[:500]}")
+    block = extract_json_block(raw) or raw
+    data = json.loads(block)
     if isinstance(data.get("tags"), list):
         data["tags"] = ",".join(data["tags"])
     return data
@@ -260,6 +282,7 @@ def set_metadata_in_issue_body(issue_body, meta):
     block = "```json\n" + json.dumps(meta, indent=2) + "\n```"
     if "```json" in issue_body:
         return re.sub(r"```json\s*\{.*?\}\s*```", block, issue_body, flags=re.S)
+        # fall-through won't happen
     return issue_body + "\n\nMetadata:\n" + block
 
 def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
@@ -320,15 +343,21 @@ def safe_main():
 
     if comment.lower().startswith("/approve-topic"):
         topics = parse_topics_from_body(body)
+        if not topics:
+            post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Please reply /new-topic to get fresh options.")
+            return
         parts = comment.split()
-        idx = 1 if len(parts) < 2 or not parts[1].isdigit() else int(parts[1])
+        if len(parts) > 1 and parts[1].isdigit():
+            idx = int(parts[1])
+        else:
+            idx = 1
         if not (1 <= idx <= len(topics)):
-            post_comment(owner, repo, number, "Invalid index. Use 1/2/3.")
+            post_comment(owner, repo, number, f"Invalid index. Use 1/2/3. Detected topics:\n1) {topics[0]}\n2) {topics[1]}\n3) {topics[2]}")
             return
         topic = topics[idx-1]
         meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Use /new-topic for different topics.")
+            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Reply /new-topic for different topics.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
