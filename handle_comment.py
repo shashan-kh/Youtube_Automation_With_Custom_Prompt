@@ -12,6 +12,15 @@ REGION = os.getenv("REGION", "IN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Configurable Groq model (default to a supported one)
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+# Fallback models to try automatically if the first one fails
+GROQ_FALLBACK_MODELS = [
+    GROQ_MODEL,
+    "mixtral-8x7b-32768",   # widely available on Groq
+    # Add more if needed (ensure they exist in your Groq console):
+    # "gemma-7b-it",
+]
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
 
@@ -53,7 +62,7 @@ def extract_json_block(text):
     return m.group(0) if m else None
 
 def parse_topics_from_body(body):
-    # 1) Try JSON metadata topics
+    # Try JSON metadata block with topics
     try:
         block = extract_json_block(body)
         if block:
@@ -62,7 +71,7 @@ def parse_topics_from_body(body):
                 return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
     except Exception:
         pass
-    # 2) Try numbered lines: 1) Topic ... or "1. Topic", "1 - Topic"
+    # Try numbered or bulleted lines
     topics = []
     for line in body.splitlines():
         m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[KATEX_INLINE_CLOSE\.\-:]\s+(.*\S)", line)
@@ -70,10 +79,9 @@ def parse_topics_from_body(body):
             topics.append(m.group(2).strip())
     if topics:
         return topics[:3]
-    # 3) Try lines after "Choose one:" up to "Reply with"
+    # Fallback: lines after “Choose one:” up to “Reply with”
     lines = body.splitlines()
-    cleaned = []
-    flag = False
+    cleaned, flag = [], False
     for ln in lines:
         if not flag and "Choose one" in ln:
             flag = True
@@ -81,7 +89,6 @@ def parse_topics_from_body(body):
         if flag:
             if not ln.strip() or ln.strip().lower().startswith("reply with"):
                 break
-            # strip bullets/numbering
             s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[KATEX_INLINE_CLOSE\.\-:])?\s*", "", ln).strip()
             if s:
                 cleaned.append(s)
@@ -89,15 +96,23 @@ def parse_topics_from_body(body):
         return cleaned[:3]
     return []
 
-def get_slot_from_labels(labels):
-    for lbl in labels:
-        if lbl["name"].startswith("slot:"):
-            return lbl["name"].split(":",1)[1]
-    return "morning"
+def call_groq(prompt, model):
+    r = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        json={
+            "model": model,
+            "messages": [{"role":"user","content":prompt}],
+            "temperature": 0.8
+        },
+        timeout=90
+    )
+    return r
 
 def llm_script(trending_query, word_hint="90–105"):
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret")
+
     prompt = f"""
 You are a careful health educator. Create a strictly under-58s YouTube Short based on this trending query:
 "{trending_query}"
@@ -115,21 +130,39 @@ Output pure JSON with:
 - description: 2–3 sentences + “Educational only, not medical advice.” + 1 credible source (WHO/CDC/NIH/NHS)
 - tags: 6–10 comma-separated general tags
 """
-    r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={"model":"llama3-70b-8192","messages":[{"role":"user","content":prompt}],"temperature":0.8},
-        timeout=90
-    )
-    if r.status_code >= 400:
-        raise RuntimeError(f"Groq API error {r.status_code}: {r.text}")
-    raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    if not raw:
-        raise RuntimeError("Groq returned empty content")
-    block = extract_json_block(raw) or raw
-    data = json.loads(block)
-    if isinstance(data.get("tags"), list):
-        data["tags"] = ",".join(data["tags"])
-    return data
+
+    last_err = None
+    for model in GROQ_FALLBACK_MODELS:
+        r = call_groq(prompt, model)
+        if r.status_code == 200:
+            raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if not raw:
+                last_err = RuntimeError("Groq returned empty content")
+                continue
+            block = extract_json_block(raw) or raw
+            try:
+                data = json.loads(block)
+                if isinstance(data.get("tags"), list):
+                    data["tags"] = ",".join(data["tags"])
+                return data
+            except Exception as e:
+                last_err = RuntimeError(f"Failed to parse LLM JSON: {e}\nRaw: {raw[:500]}")
+                continue
+        else:
+            # If the model is decommissioned or invalid, try the next
+            try:
+                errj = r.json()
+            except Exception:
+                errj = {"error": {"message": r.text}}
+            msg = str(errj.get("error", {}).get("message", r.text))
+            if "decommissioned" in msg.lower() or "not supported" in msg.lower() or r.status_code == 400:
+                last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
+                continue
+            last_err = RuntimeError(f"Groq API error {r.status_code}: {msg}")
+            # For rate limits/5xx you could break or retry; here we fall through to try next model
+            continue
+    # If we exhausted all models
+    raise last_err or RuntimeError("Groq call failed with all fallback models")
 
 def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
     a = AudioFileClip(voice_path); dur = a.duration; a.close()
@@ -282,7 +315,6 @@ def set_metadata_in_issue_body(issue_body, meta):
     block = "```json\n" + json.dumps(meta, indent=2) + "\n```"
     if "```json" in issue_body:
         return re.sub(r"```json\s*\{.*?\}\s*```", block, issue_body, flags=re.S)
-        # fall-through won't happen
     return issue_body + "\n\nMetadata:\n" + block
 
 def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
@@ -347,12 +379,9 @@ def safe_main():
             post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Please reply /new-topic to get fresh options.")
             return
         parts = comment.split()
-        if len(parts) > 1 and parts[1].isdigit():
-            idx = int(parts[1])
-        else:
-            idx = 1
+        idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
         if not (1 <= idx <= len(topics)):
-            post_comment(owner, repo, number, f"Invalid index. Use 1/2/3. Detected topics:\n1) {topics[0]}\n2) {topics[1]}\n3) {topics[2]}")
+            post_comment(owner, repo, number, f"Invalid index. Use 1/2/3. Detected topics:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(topics[:3])]))
             return
         topic = topics[idx-1]
         meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
