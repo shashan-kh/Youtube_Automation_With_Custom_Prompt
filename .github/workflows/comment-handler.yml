@@ -32,7 +32,15 @@ jobs:
           sudo apt-get install -y ffmpeg fonts-dejavu-core
 
       - name: Install Python deps
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+          python - << 'PY'
+          import sys
+          print("Python:", sys.version)
+          import moviepy, gtts, googleapiclient, pytrends
+          print("Imports OK")
+          PY
 
       - name: Check required secrets
         shell: bash
