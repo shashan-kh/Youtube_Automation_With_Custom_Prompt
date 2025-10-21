@@ -12,11 +12,10 @@ REGION = os.getenv("REGION", "IN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Configurable Groq model (set in workflow env or defaults)
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+# Use Groq mistral-saba-24b (configurable via env)
+GROQ_MODEL = os.getenv("GROQ_MODEL", "mistral-saba-24b")
 GROQ_FALLBACK_MODELS = [
     GROQ_MODEL,
-    "mixtral-8x7b-32768",
 ]
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
@@ -84,7 +83,7 @@ def parse_topics_from_body(body):
             flag = True
             continue
         if flag:
-            if not ln.strip() or ln.strip().lower().startswith("reply with"):
+            if not ln.strip() or ln.strip().lower().startsWith("reply with"):
                 break
             s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[KATEX_INLINE_CLOSE\.\-:])?\s*", "", ln).strip()
             if s:
@@ -96,10 +95,7 @@ def parse_topics_from_body(body):
 def get_slot_from_labels(labels):
     # Return "morning" or "afternoon" based on label "slot:morning"/"slot:afternoon"
     for lbl in labels or []:
-        if isinstance(lbl, dict):
-            name = lbl.get("name", "")
-        else:
-            name = str(lbl)
+        name = lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)
         if name.startswith("slot:"):
             return name.split(":", 1)[1].strip() or "morning"
     return "morning"
@@ -156,7 +152,6 @@ Output pure JSON with:
                 errj = {"error": {"message": r.text}}
             msg = str(errj.get("error", {}).get("message", r.text))
             last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
-            # try the next fallback model
             continue
     raise last_err or RuntimeError("Groq call failed with all fallback models")
 
