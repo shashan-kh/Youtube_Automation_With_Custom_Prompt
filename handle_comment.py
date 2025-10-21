@@ -1,5 +1,4 @@
-# handle_comment.py
-import os, re, json, tempfile, subprocess, requests
+import os, re, json, tempfile, subprocess, requests, traceback, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip
@@ -8,6 +7,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+# Env
 REGION = os.getenv("REGION", "IN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
@@ -16,7 +16,7 @@ PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
 
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
-PREVIEW_MAX = 57.3  # hard target well below 58s
+PREVIEW_MAX = 57.3  # target well below 58s
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def gh(method, url, **kwargs):
@@ -58,7 +58,24 @@ def get_slot_from_labels(labels):
             return lbl["name"].split(":",1)[1]
     return "morning"
 
+def extract_json_block(text):
+    # Try ```json ... ``` first
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
+    if m:
+        return m.group(1)
+    # Try generic code fence
+    m = re.search(r"```\s*(\{.*?\})\s*```", text, re.S)
+    if m:
+        return m.group(1)
+    # Try to find the first JSON object heuristically
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
+        return m.group(0)
+    return text  # maybe it's already raw JSON
+
 def llm_script(trending_query, word_hint="90–105"):
+    if not GROQ_API_KEY:
+        raise RuntimeError("Missing GROQ_API_KEY secret")
     prompt = f"""
 You are a careful health educator. Create a strictly under-58s YouTube Short based on this trending query:
 "{trending_query}"
@@ -81,8 +98,20 @@ Output pure JSON with:
         json={"model":"llama3-70b-8192","messages":[{"role":"user","content":prompt}],"temperature":0.8},
         timeout=90
     )
-    content = r.json()["choices"][0]["message"]["content"].strip().strip("`")
-    return json.loads(content)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Groq API error {r.status_code}: {r.text}")
+    raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    if not raw:
+        raise RuntimeError("Groq returned empty content")
+    block = extract_json_block(raw)
+    try:
+        data = json.loads(block)
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse LLM JSON: {e}\nRaw: {raw[:500]}")
+    # Normalize tags (string or list)
+    if isinstance(data.get("tags"), list):
+        data["tags"] = ",".join(data["tags"])
+    return data
 
 def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
     a = AudioFileClip(voice_path); dur = a.duration; a.close()
@@ -95,12 +124,16 @@ def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
     return out, d2
 
 def fetch_broll(query, need=4):
+    if not PEXELS_API_KEY:
+        raise RuntimeError("Missing PEXELS_API_KEY secret")
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": PEXELS_API_KEY}
     vids = []
     for q in [query, "healthy lifestyle", "fitness", "sleep", "hydration", "walking", "stretching", "posture", "nutrition", "yoga"]:
         try:
             r = requests.get(url, headers=headers, params={"query": q, "per_page": 20, "orientation": "portrait"}, timeout=60)
+            if r.status_code == 401 or r.status_code == 403:
+                raise RuntimeError(f"Pexels API auth error {r.status_code}: {r.text}")
             for v in r.json().get("videos", []):
                 files = sorted(v.get("video_files", []), key=lambda f: f.get("height",0), reverse=True)
                 for f in files:
@@ -118,7 +151,9 @@ def fmt_time(t):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def make_srt(lines, duration, path):
-    lines = [l.strip() for l in lines if l.strip()]
+    lines = [l.strip() for l in (lines or []) if str(l).strip()]
+    if not lines:
+        lines = ["Simple wellness tip", "Small steps add up", "Move, hydrate, rest", "You’ve got this!"]
     n = max(1, min(9, len(lines)))
     step = max(1.2, duration / n)
     t = 0.5
@@ -162,7 +197,7 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
     make_srt(overlay_lines, end, srt_path)
     burn_subs(temp_mp4, srt_path, final_mp4)
     v = VideoFileClip(final_mp4); d = v.duration; v.close()
-    # Final safety trim if needed (fix: correct ffmpeg -c arg)
+    # Final safety trim if needed (correct ffmpeg args: no stray space before -c)
     if d >= 58.0 or d > PREVIEW_MAX + 0.2:
         subprocess.run(["ffmpeg","-y","-i",final_mp4,"-t",str(PREVIEW_MAX),"-c","copy","short_trim.mp4"], check=False)
         if os.path.exists("short_trim.mp4"):
@@ -179,6 +214,10 @@ def upload_preview(file_path):
     return r.text.strip()
 
 def yt_client():
+    # Validate required YT secrets
+    for v in ["YT_CLIENT_ID","YT_CLIENT_SECRET","YT_REFRESH_TOKEN"]:
+        if not os.getenv(v):
+            raise RuntimeError(f"Missing {v} secret")
     creds = Credentials(
         token=None,
         refresh_token=os.getenv("YT_REFRESH_TOKEN"),
@@ -245,7 +284,6 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
         temp, final = "temp.mp4", "short.mp4"
         dur = render_and_cap(broll, voice, temp, final, s.get("overlay_lines", []))
         if dur < 58.0:
-            # Upload preview
             preview_url = upload_preview(final)
             desc = f"""{s['description']}
 
@@ -256,7 +294,7 @@ Educational only, not medical advice. Consult a qualified professional for perso
             return meta, new_body
     return None, issue_body
 
-def main():
+def safe_main():
     e = ev()
     owner, repo = REPO.split("/")
     issue = e["issue"]; number = issue["number"]
@@ -297,12 +335,7 @@ def main():
             post_comment(owner, repo, number, "Invalid index. Use 1/2/3.")
             return
         topic = topics[idx-1]
-        # Auto-regenerate until <58s BEFORE asking to approve upload
-        try:
-            meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
-        except Exception as e:
-            post_comment(owner, repo, number, f"Generation error: {e}. Use /new-topic for fresh options.")
-            return
+        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
         if not meta:
             post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Use /new-topic for different topics.")
             return
@@ -323,12 +356,7 @@ def main():
         if not topic:
             post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic first.")
             return
-        # Rebuild until <58s again
-        try:
-            meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
-        except Exception as e:
-            post_comment(owner, repo, number, f"Regeneration error: {e}. Use /new-topic.")
-            return
+        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
         if not meta2:
             post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Use /new-topic.")
             return
@@ -342,7 +370,6 @@ def main():
         if not meta or "preview_url" not in meta:
             post_comment(owner, repo, number, "No preview metadata found. Approve a topic first.")
             return
-        # Download preview, verify duration, and schedule
         r = requests.get(meta["preview_url"], timeout=300)
         if r.status_code >= 400:
             post_comment(owner, repo, number, f"Preview link expired. Please /regenerate-video.")
@@ -352,49 +379,30 @@ def main():
         if d >= 58.0:
             post_comment(owner, repo, number, f"Video is {d:.2f}s ≥ 58s. I will rebuild it. Please reply /regenerate-video.")
             return
-
-        # Upload PRIVATE + schedule
-        creds = Credentials(
-            token=None,
-            refresh_token=os.getenv("YT_REFRESH_TOKEN"),
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=os.getenv("YT_CLIENT_ID"),
-            client_secret=os.getenv("YT_CLIENT_SECRET"),
-            scopes=["https://www.googleapis.com/auth/youtube.upload","https://www.googleapis.com/auth/youtube"]
-        )
-        yt = build("youtube", "v3", credentials=creds)
-        tomorrow_ist = datetime.now(IST).date() + timedelta(days=1)
-        if meta.get("slot","morning") == "afternoon":
-            ist_dt = datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, 16, 0, tzinfo=IST)
-        else:
-            ist_dt = datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, 9, 0, tzinfo=IST)
-        publish_at = ist_dt.astimezone(timezone.utc).isoformat()
-        body_up = {
-            "snippet": {
-                "title": meta["title"][:100],
-                "description": meta["description"][:4900],
-                "tags": [t.strip() for t in (meta.get("tags","") or ",".join(SAFE_TAGS)).split(",")][:10],
-                "categoryId": "27",
-                "defaultLanguage": "en"
-            },
-            "status": {"privacyStatus": "private", "publishAt": publish_at, "selfDeclaredMadeForKids": False}
-        }
-        media = MediaFileUpload("short.mp4", chunksize=-1, resumable=True)
-        req = yt.videos().insert(part="snippet,status", body=body_up, media_body=media)
-        resp = None
-        while resp is None:
-            status, resp = req.next_chunk()
-        vid_id = resp.get("id")
+        vid_id, publish_at_utc = upload_youtube_scheduled("short.mp4", meta["title"], meta["description"], meta.get("tags",""), meta.get("slot","morning"))
+        ist_time = datetime.fromisoformat(publish_at_utc.replace("Z","")).astimezone(IST).strftime("%Y-%m-%d %H:%M")
         link = f"https://youtu.be/{vid_id}"
-        ist_time = ist_dt.strftime("%Y-%m-%d %H:%M")
         post_comment(owner, repo, number, f"Scheduled ✅ {link}\nPublishes at (IST): {ist_time}\nClosing this thread.")
         remove_label(owner, repo, number, "await-video-approval")
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"state":"closed"})
         return
 
-def get_metadata_from_issue_body(issue_body):
-    m = re.search(r"```json\s*(\{.*?\})\s*```", issue_body, re.S)
-    return json.loads(m.group(1)) if m else None
+def main():
+    try:
+        safe_main()
+    except Exception as e:
+        # Try to report in the Issue; if that fails, at least print traceback
+        try:
+            e_json = ev()
+            owner, repo = REPO.split("/")
+            issue = e_json["issue"]; number = issue["number"]
+            msg = f"❌ Error: {e}\n```\n{traceback.format_exc()}\n```"
+            post_comment(owner, repo, number, msg)
+        except Exception:
+            print("FATAL:", e)
+            print(traceback.format_exc())
+        # Do not re-raise to avoid failing the job hard; just return
+        return
 
 if __name__ == "__main__":
     main()
