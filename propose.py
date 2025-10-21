@@ -8,7 +8,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")  # owner/repo
 
 IST = timezone(timedelta(hours=5, minutes=30))
-MORNING_IST = (9, 0)   # 09:00
+MORNING_IST = (9, 0)    # 09:00
 AFTERNOON_IST = (16, 0) # 16:00
 
 def next_slot_ist():
@@ -61,6 +61,7 @@ def open_issues_with_labels(owner, repo, labels):
 def create_topic_issue(owner, repo, topics, scheduled_ist):
     slot_label = f"slot:{SLOT}"
     title = f"Topic approval for {SLOT} slot ({scheduled_ist.strftime('%Y-%m-%d')} {scheduled_ist.strftime('%H:%M')} IST)"
+    # Provide both numbered list and JSON metadata to make parsing robust
     body = f"""Proposed topics for tomorrow's {SLOT} slot.
 Scheduled publish (IST): {scheduled_ist.strftime('%Y-%m-%d %H:%M')}.
 
@@ -73,11 +74,12 @@ Reply with:
 - /approve-topic 1   (or 2/3)
 - /reject-topic      (I’ll propose new topics)
 
-Flow:
-1) After you approve a topic, I’ll create a strictly <58s vertical Short with voice + captions and post a preview link here.
-2) Reply /approve-video → I’ll upload to YouTube as PRIVATE and schedule it to publish at the time above.
-3) /reject-video → propose new topics; /regenerate-video → optional (auto-regeneration already ensures <58s).
-"""
+/regenerate-video (rebuild same topic under 58s) and /approve-video (schedule upload) are used after preview is ready.
+
+Metadata:
+```json
+{json.dumps({"slot": SLOT, "scheduled_ist": scheduled_ist.strftime('%Y-%m-%d %H:%M'), "topics": topics[:3]}, indent=2)}
+```"""
     url = f"https://api.github.com/repos/{owner}/{repo}/issues"
     data = {"title": title, "body": body, "labels": ["await-topic-approval", slot_label]}
     r = requests.post(url, headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept":"application/vnd.github+json"}, json=data, timeout=60)
