@@ -12,14 +12,11 @@ REGION = os.getenv("REGION", "IN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-# Configurable Groq model (default to a supported one)
+# Configurable Groq model (set in workflow env or defaults)
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
-# Fallback models to try automatically if the first one fails
 GROQ_FALLBACK_MODELS = [
     GROQ_MODEL,
-    "mixtral-8x7b-32768",   # widely available on Groq
-    # Add more if needed (ensure they exist in your Groq console):
-    # "gemma-7b-it",
+    "mixtral-8x7b-32768",
 ]
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
@@ -62,16 +59,16 @@ def extract_json_block(text):
     return m.group(0) if m else None
 
 def parse_topics_from_body(body):
-    # Try JSON metadata block with topics
+    # Try JSON metadata topics
     try:
         block = extract_json_block(body)
         if block:
             data = json.loads(block)
-            if isinstance(data, dict) and "topics" in data and isinstance(data["topics"], list) and data["topics"]:
+            if isinstance(data, dict) and isinstance(data.get("topics"), list) and data["topics"]:
                 return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
     except Exception:
         pass
-    # Try numbered or bulleted lines
+    # Try numbered/bulleted lines like: "1) topic", "1. topic", "1 - topic"
     topics = []
     for line in body.splitlines():
         m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[KATEX_INLINE_CLOSE\.\-:]\s+(.*\S)", line)
@@ -79,7 +76,7 @@ def parse_topics_from_body(body):
             topics.append(m.group(2).strip())
     if topics:
         return topics[:3]
-    # Fallback: lines after “Choose one:” up to “Reply with”
+    # Fallback: lines after "Choose one:" until "Reply with"
     lines = body.splitlines()
     cleaned, flag = [], False
     for ln in lines:
@@ -96,23 +93,28 @@ def parse_topics_from_body(body):
         return cleaned[:3]
     return []
 
+def get_slot_from_labels(labels):
+    # Return "morning" or "afternoon" based on label "slot:morning"/"slot:afternoon"
+    for lbl in labels or []:
+        if isinstance(lbl, dict):
+            name = lbl.get("name", "")
+        else:
+            name = str(lbl)
+        if name.startswith("slot:"):
+            return name.split(":", 1)[1].strip() or "morning"
+    return "morning"
+
 def call_groq(prompt, model):
-    r = requests.post(
+    return requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={
-            "model": model,
-            "messages": [{"role":"user","content":prompt}],
-            "temperature": 0.8
-        },
+        json={"model": model, "messages": [{"role":"user","content":prompt}], "temperature": 0.8},
         timeout=90
     )
-    return r
 
 def llm_script(trending_query, word_hint="90–105"):
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret")
-
     prompt = f"""
 You are a careful health educator. Create a strictly under-58s YouTube Short based on this trending query:
 "{trending_query}"
@@ -130,7 +132,6 @@ Output pure JSON with:
 - description: 2–3 sentences + “Educational only, not medical advice.” + 1 credible source (WHO/CDC/NIH/NHS)
 - tags: 6–10 comma-separated general tags
 """
-
     last_err = None
     for model in GROQ_FALLBACK_MODELS:
         r = call_groq(prompt, model)
@@ -149,19 +150,14 @@ Output pure JSON with:
                 last_err = RuntimeError(f"Failed to parse LLM JSON: {e}\nRaw: {raw[:500]}")
                 continue
         else:
-            # If the model is decommissioned or invalid, try the next
             try:
                 errj = r.json()
             except Exception:
                 errj = {"error": {"message": r.text}}
             msg = str(errj.get("error", {}).get("message", r.text))
-            if "decommissioned" in msg.lower() or "not supported" in msg.lower() or r.status_code == 400:
-                last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
-                continue
-            last_err = RuntimeError(f"Groq API error {r.status_code}: {msg}")
-            # For rate limits/5xx you could break or retry; here we fall through to try next model
+            last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
+            # try the next fallback model
             continue
-    # If we exhausted all models
     raise last_err or RuntimeError("Groq call failed with all fallback models")
 
 def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
@@ -381,7 +377,7 @@ def safe_main():
         parts = comment.split()
         idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
         if not (1 <= idx <= len(topics)):
-            post_comment(owner, repo, number, f"Invalid index. Use 1/2/3. Detected topics:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(topics[:3])]))
+            post_comment(owner, repo, number, "Invalid index. Use 1/2/3.\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(topics[:3])]))
             return
         topic = topics[idx-1]
         meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
