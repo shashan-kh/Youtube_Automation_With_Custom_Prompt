@@ -73,5 +73,5 @@ jobs:
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           TTS_LANG: en
-          GROQ_MODEL: mistral-saba-24b   # Use Groq mistral-saba-24b
+          GROQ_MODEL: qwen2.5-32b-instruct
         run: python handle_comment.py
