@@ -1,3 +1,4 @@
+# handle_comment.py
 import os, re, json, tempfile, subprocess, requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -161,7 +162,7 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
     make_srt(overlay_lines, end, srt_path)
     burn_subs(temp_mp4, srt_path, final_mp4)
     v = VideoFileClip(final_mp4); d = v.duration; v.close()
-    # Final safety trim if needed
+    # Final safety trim if needed (fix: correct ffmpeg -c arg)
     if d >= 58.0 or d > PREVIEW_MAX + 0.2:
         subprocess.run(["ffmpeg","-y","-i",final_mp4,"-t",str(PREVIEW_MAX),"-c","copy","short_trim.mp4"], check=False)
         if os.path.exists("short_trim.mp4"):
