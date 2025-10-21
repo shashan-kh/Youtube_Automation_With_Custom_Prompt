@@ -2,8 +2,7 @@ name: comment-handler
 
 on:
   issue_comment:
-    types:
-      - created
+    types: [created]
 
 permissions:
   contents: read
@@ -23,12 +22,39 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Dump event payload (debug)
+        run: cat "$GITHUB_EVENT_PATH"
+
       - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-dejavu-core
+
       - name: Install Python deps
         run: pip install -r requirements.txt
+
+      - name: Check required secrets
+        shell: bash
+        run: |
+          missing=0
+          for v in GROQ_API_KEY PEXELS_API_KEY YT_CLIENT_ID YT_CLIENT_SECRET YT_REFRESH_TOKEN; do
+            if [ -z "${!v}" ]; then
+              echo "::error ::Missing secret $v"; missing=1
+            else
+              echo "$v=***"
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "One or more secrets are missing"; exit 1
+          fi
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+
       - name: Handle comment
         env:
           REGION: IN
