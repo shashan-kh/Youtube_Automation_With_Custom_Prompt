@@ -73,5 +73,7 @@ jobs:
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           TTS_LANG: en
-          GROQ_MODEL: qwen2.5-32b-instruct
+          # Customize these if your Groq key has different model IDs:
+          GROQ_MODEL: qwen3-32b-instruct
+          GROQ_FALLBACK_MODELS: qwen2.5-32b-instruct,qwen2.5-14b-instruct,qwen2.5-7b-instruct
         run: python handle_comment.py
