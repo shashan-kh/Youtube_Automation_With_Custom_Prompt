@@ -13,15 +13,17 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Primary and fallback models (can be overridden via workflow env)
-# Your requested target:
-DEFAULT_PRIMARY = "qwen3-32b-instruct"
+# Primary + fallbacks (can be overridden via workflow env)
+DEFAULT_PRIMARY = "qwen/qwen3-32b"
 DEFAULT_FALLBACKS = [
-    "qwen2.5-32b-instruct",
-    "qwen2.5-14b-instruct",
-    "qwen2.5-7b-instruct",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "groq/compound-mini",
+    "groq/compound",
+    "moonshotai/kimi-k2-instruct",
 ]
-# Read from env (comma-separated), else use defaults
 GROQ_MODEL = os.getenv("GROQ_MODEL", DEFAULT_PRIMARY).strip()
 GROQ_FALLBACK_MODELS_ENV = os.getenv("GROQ_FALLBACK_MODELS", ",".join(DEFAULT_FALLBACKS)).strip()
 
@@ -29,7 +31,7 @@ PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
 
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
-PREVIEW_MAX = 57.3  # target well below 58s
+PREVIEW_MAX = 57.3  # target under 58s
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def gh(method, url, **kwargs):
@@ -66,7 +68,7 @@ def extract_json_block(text):
     return m.group(0) if m else None
 
 def parse_topics_from_body(body):
-    # 1) Try JSON metadata topics
+    # 1) JSON metadata with topics
     try:
         block = extract_json_block(body)
         if block:
@@ -75,7 +77,7 @@ def parse_topics_from_body(body):
                 return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
     except Exception:
         pass
-    # 2) Try numbered/bulleted lines like: "1) topic", "1. topic", "1 - topic"
+    # 2) Numbered/bulleted lines like "1) topic", "1. topic", "1 - topic"
     topics = []
     for line in body.splitlines():
         m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[KATEX_INLINE_CLOSE\.\-:]\s+(.*\S)", line)
@@ -83,7 +85,7 @@ def parse_topics_from_body(body):
             topics.append(m.group(2).strip())
     if topics:
         return topics[:3]
-    # 3) Fallback: lines after "Choose one:" until "Reply with"
+    # 3) Lines after "Choose one:" until "Reply with"
     lines = body.splitlines()
     cleaned, flag = [], False
     for ln in lines:
@@ -102,7 +104,6 @@ def parse_topics_from_body(body):
     return []
 
 def get_slot_from_labels(labels):
-    # Return "morning" or "afternoon" based on label "slot:morning"/"slot:afternoon"
     for lbl in labels or []:
         name = lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)
         if name.startswith("slot:"):
@@ -123,57 +124,42 @@ def list_groq_models():
                          headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                          timeout=60)
         if r.status_code == 200:
-            js = r.json()
-            data = js.get("data", [])
-            # OpenAI-compatible structure or Groq variant: ids under 'id'
-            ids = [d.get("id") for d in data if isinstance(d, dict) and d.get("id")]
-            return ids
-        return []
+            data = r.json().get("data", [])
+            return [d.get("id") for d in data if isinstance(d, dict) and d.get("id")]
     except Exception:
-        return []
+        pass
+    return []
 
 def build_model_list():
-    # Build from env -> then prefer Qwen* instruct -> Llama 3.1* -> Gemma* if present
     env_models = []
     if GROQ_MODEL:
         env_models.append(GROQ_MODEL)
     if GROQ_FALLBACK_MODELS_ENV:
         env_models.extend([m.strip() for m in GROQ_FALLBACK_MODELS_ENV.split(",") if m.strip()])
-    # De-dup keep order
+    # De-dup
     seen = set(); env_models = [m for m in env_models if not (m in seen or seen.add(m))]
-
     available = list_groq_models()
-
-    def prefer_from_available(patterns):
-        out = []
-        for pat in patterns:
-            rx = re.compile(pat, re.I)
-            for mid in available:
-                if rx.search(mid or "") and mid not in out:
-                    out.append(mid)
-        return out
-
-    if available:
-        # If env models exist, keep them first; then add preferred matches that are AVAILABLE
-        order_pref = []
-        order_pref.extend([m for m in env_models if m in available])
-        # Preferred patterns by desirability
-        preferred_patterns = [
-            r"^qwen3.*instruct",
-            r"^qwen2\.5.*instruct",
-            r"^qwen.*instruct",
-            r"llama[-_]?3\.1.*(versatile|instant|instruct)",
-            r"gemma.*(it|instruct)",
-        ]
-        order_pref.extend([m for m in prefer_from_available(preferred_patterns) if m not in order_pref])
-        # As a last resort, add the rest of available ids
-        order_pref.extend([m for m in available if m not in order_pref])
-        # Keep first N
-        models_to_try = order_pref[:8]
-        return models_to_try
-
-    # If we can't list models, fall back to env list or defaults
-    return env_models if env_models else [DEFAULT_PRIMARY] + DEFAULT_FALLBACKS
+    if not available:
+        return env_models if env_models else [DEFAULT_PRIMARY] + DEFAULT_FALLBACKS
+    # Merge env models (if available) + preferred matches from available + others
+    ordered = [m for m in env_models if m in available]
+    # Basic preference: Qwen instruct → Llama 3.3/3.1 chat → OpenAI OSS → Groq compound → moonshot
+    patterns = [
+        r"^qwen.*32b.*", r"^qwen.*14b.*", r"^qwen.*7b.*",
+        r"llama-3\.3.*versatile", r"llama-3\.1.*instant",
+        r"openai/gpt-oss-120b", r"openai/gpt-oss-20b",
+        r"groq/compound-mini", r"groq/compound",
+        r"moonshotai/kimi-k2-instruct"
+    ]
+    for pat in patterns:
+        rx = re.compile(pat, re.I)
+        for mid in available:
+            if rx.search(mid) and mid not in ordered:
+                ordered.append(mid)
+    for mid in available:
+        if mid not in ordered:
+            ordered.append(mid)
+    return ordered[:10]
 
 def llm_script(trending_query, word_hint="90–105"):
     if not GROQ_API_KEY:
@@ -220,9 +206,8 @@ Output pure JSON with:
                 errj = {"error": {"message": r.text}}
             msg = str(errj.get("error", {}).get("message", r.text))
             last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
-            # try next model
             continue
-    # Exhausted all; include available list to help user set env models
+    # Exhausted all, show available IDs to help configure
     avail = list_groq_models()
     if avail:
         raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS in workflow env to one of the above.")
@@ -298,7 +283,7 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
     for p in local:
         c = VideoFileClip(p)
         take = min(8, max(4, int(c.duration)))
-        c = c.subclip(0, take).resize(height=target_h)
+        c = c.subclip(0, take).resize(height=target_h)  # Pillow<10 required by moviepy 1.0.3
         if c.w != target_w:
             c = c.crop(x_center=c.w/2, width=target_w, height=target_h)
         clips.append(c)
@@ -343,10 +328,7 @@ def yt_client():
 
 def upload_youtube_scheduled(video_path, title, description, tags, slot):
     tomorrow_ist = datetime.now(IST).date() + timedelta(days=1)
-    if slot == "afternoon":
-        ist_dt = datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, 16, 0, tzinfo=IST)
-    else:
-        ist_dt = datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, 9, 0, tzinfo=IST)
+    ist_dt = datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, (16 if slot == "afternoon" else 9), 0, tzinfo=IST)
     publish_at_utc = ist_dt.astimezone(timezone.utc).isoformat()
 
     yt = yt_client()
@@ -384,8 +366,7 @@ def set_metadata_in_issue_body(issue_body, meta):
 def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
     word_targets = ["90–105","75–90","60–75","55–65","50–60"]
     for attempt in range(1, max_attempts+1):
-        word_hint = word_targets[min(attempt-1, len(word_targets)-1)]
-        s = llm_script(topic, word_hint=word_hint)
+        s = llm_script(topic, word_hint=word_targets[min(attempt-1, len(word_targets)-1)])
         voice = "voice.mp3"; gTTS(s["voiceover"], lang=TTS_LANG).save(voice)
         voice, _ = ensure_voice_under_target(voice, target=PREVIEW_MAX)
         broll = fetch_broll(topic, need=4)
@@ -430,10 +411,7 @@ def safe_main():
         except Exception:
             pass
         options = list(dict.fromkeys([s.title() for s in found + seeds]))[:3]
-        body += "\n\nNew topic options:\n"
-        for i,t in enumerate(options,1):
-            body += f"{i}) {t}\n"
-        body += "\nReply with /approve-topic 1 (or 2/3)."
+        body += "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3)."
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": body})
         return
 
@@ -504,15 +482,15 @@ def main():
     try:
         safe_main()
     except Exception as e:
+        # Append list of available models to help configure GROQ_MODEL env
         try:
             e_json = ev()
             owner, repo = REPO.split("/")
             issue = e_json["issue"]; number = issue["number"]
-            # Append available models to help user configure
             avail = list_groq_models()
             addendum = ""
             if avail:
-                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nYou can set GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
+                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
