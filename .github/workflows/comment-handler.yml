@@ -73,6 +73,5 @@ jobs:
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           TTS_LANG: en
-          # Configure Groq model here if you want a specific one
-          GROQ_MODEL: llama3-8b-8192
+          GROQ_MODEL: mistral-saba-24b   # Use Groq mistral-saba-24b
         run: python handle_comment.py
