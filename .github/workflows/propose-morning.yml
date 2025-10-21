@@ -1,8 +1,8 @@
 name: propose-morning
 
 on:
-  workflow_dispatch:          # enable manual runs from Actions tab
-  push:                       # also runs on pushes to master (helps GitHub detect it)
+  workflow_dispatch:          # manual runs
+  push:                       # helps GitHub detect it on master
     branches:
       - master
     paths:
@@ -24,7 +24,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
       - name: Propose topics for tomorrow morning slot
         env:
           REGION: IN
