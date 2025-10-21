@@ -1,3 +1,4 @@
+# handle_comment.py
 import os, re, json, tempfile, subprocess, requests, traceback, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,9 +15,7 @@ REPO = os.getenv("GITHUB_REPOSITORY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 # Use Groq mistral-saba-24b (configurable via env)
 GROQ_MODEL = os.getenv("GROQ_MODEL", "mistral-saba-24b")
-GROQ_FALLBACK_MODELS = [
-    GROQ_MODEL,
-]
+GROQ_FALLBACK_MODELS = [GROQ_MODEL]
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
 
@@ -58,7 +57,7 @@ def extract_json_block(text):
     return m.group(0) if m else None
 
 def parse_topics_from_body(body):
-    # Try JSON metadata topics
+    # 1) Try JSON metadata topics block
     try:
         block = extract_json_block(body)
         if block:
@@ -67,7 +66,7 @@ def parse_topics_from_body(body):
                 return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
     except Exception:
         pass
-    # Try numbered/bulleted lines like: "1) topic", "1. topic", "1 - topic"
+    # 2) Try numbered/bulleted lines like: "1) topic", "1. topic", "1 - topic"
     topics = []
     for line in body.splitlines():
         m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[KATEX_INLINE_CLOSE\.\-:]\s+(.*\S)", line)
@@ -75,7 +74,7 @@ def parse_topics_from_body(body):
             topics.append(m.group(2).strip())
     if topics:
         return topics[:3]
-    # Fallback: lines after "Choose one:" until "Reply with"
+    # 3) Fallback: lines after "Choose one:" until "Reply with"
     lines = body.splitlines()
     cleaned, flag = [], False
     for ln in lines:
@@ -83,9 +82,10 @@ def parse_topics_from_body(body):
             flag = True
             continue
         if flag:
-            if not ln.strip() or ln.strip().lower().startsWith("reply with"):
+            s_ln = ln.strip()
+            if not s_ln or s_ln.lower().startswith("reply with"):  # FIX: use .startswith (lowercase)
                 break
-            s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[KATEX_INLINE_CLOSE\.\-:])?\s*", "", ln).strip()
+            s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[KATEX_INLINE_CLOSE\.\-:])?\s*", "", s_ln).strip()
             if s:
                 cleaned.append(s)
     if cleaned:
@@ -93,7 +93,6 @@ def parse_topics_from_body(body):
     return []
 
 def get_slot_from_labels(labels):
-    # Return "morning" or "afternoon" based on label "slot:morning"/"slot:afternoon"
     for lbl in labels or []:
         name = lbl.get("name", "") if isinstance(lbl, dict) else str(lbl)
         if name.startswith("slot:"):
