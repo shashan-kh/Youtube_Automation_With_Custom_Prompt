@@ -13,15 +13,17 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Primary model (configurable) and robust fallbacks
-# Default to a Qwen 2.5 32B instruct model on Groq; adjust as needed in workflow env
-GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen2.5-32b-instruct")
-GROQ_FALLBACK_MODELS = [
-    GROQ_MODEL,
+# Primary and fallback models (can be overridden via workflow env)
+# Your requested target:
+DEFAULT_PRIMARY = "qwen3-32b-instruct"
+DEFAULT_FALLBACKS = [
+    "qwen2.5-32b-instruct",
     "qwen2.5-14b-instruct",
     "qwen2.5-7b-instruct",
-    "llama3-8b-8192"
 ]
+# Read from env (comma-separated), else use defaults
+GROQ_MODEL = os.getenv("GROQ_MODEL", DEFAULT_PRIMARY).strip()
+GROQ_FALLBACK_MODELS_ENV = os.getenv("GROQ_FALLBACK_MODELS", ",".join(DEFAULT_FALLBACKS)).strip()
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
@@ -90,7 +92,7 @@ def parse_topics_from_body(body):
             continue
         if flag:
             s_ln = ln.strip()
-            if not s_ln or s_ln.lower().startswith("reply with"):  # FIX: correct method name
+            if not s_ln or s_ln.lower().startswith("reply with"):
                 break
             s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[KATEX_INLINE_CLOSE\.\-:])?\s*", "", s_ln).strip()
             if s:
@@ -115,6 +117,64 @@ def call_groq(prompt, model):
         timeout=90
     )
 
+def list_groq_models():
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models",
+                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                         timeout=60)
+        if r.status_code == 200:
+            js = r.json()
+            data = js.get("data", [])
+            # OpenAI-compatible structure or Groq variant: ids under 'id'
+            ids = [d.get("id") for d in data if isinstance(d, dict) and d.get("id")]
+            return ids
+        return []
+    except Exception:
+        return []
+
+def build_model_list():
+    # Build from env -> then prefer Qwen* instruct -> Llama 3.1* -> Gemma* if present
+    env_models = []
+    if GROQ_MODEL:
+        env_models.append(GROQ_MODEL)
+    if GROQ_FALLBACK_MODELS_ENV:
+        env_models.extend([m.strip() for m in GROQ_FALLBACK_MODELS_ENV.split(",") if m.strip()])
+    # De-dup keep order
+    seen = set(); env_models = [m for m in env_models if not (m in seen or seen.add(m))]
+
+    available = list_groq_models()
+
+    def prefer_from_available(patterns):
+        out = []
+        for pat in patterns:
+            rx = re.compile(pat, re.I)
+            for mid in available:
+                if rx.search(mid or "") and mid not in out:
+                    out.append(mid)
+        return out
+
+    if available:
+        # If env models exist, keep them first; then add preferred matches that are AVAILABLE
+        order_pref = []
+        order_pref.extend([m for m in env_models if m in available])
+        # Preferred patterns by desirability
+        preferred_patterns = [
+            r"^qwen3.*instruct",
+            r"^qwen2\.5.*instruct",
+            r"^qwen.*instruct",
+            r"llama[-_]?3\.1.*(versatile|instant|instruct)",
+            r"gemma.*(it|instruct)",
+        ]
+        order_pref.extend([m for m in prefer_from_available(preferred_patterns) if m not in order_pref])
+        # As a last resort, add the rest of available ids
+        order_pref.extend([m for m in available if m not in order_pref])
+        # Keep first N
+        models_to_try = order_pref[:8]
+        return models_to_try
+
+    # If we can't list models, fall back to env list or defaults
+    return env_models if env_models else [DEFAULT_PRIMARY] + DEFAULT_FALLBACKS
+
 def llm_script(trending_query, word_hint="90–105"):
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret")
@@ -135,13 +195,14 @@ Output pure JSON with:
 - description: 2–3 sentences + “Educational only, not medical advice.” + 1 credible source (WHO/CDC/NIH/NHS)
 - tags: 6–10 comma-separated general tags
 """
+    models_to_try = build_model_list()
     last_err = None
-    for model in GROQ_FALLBACK_MODELS:
+    for model in models_to_try:
         r = call_groq(prompt, model)
         if r.status_code == 200:
             raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not raw:
-                last_err = RuntimeError("Groq returned empty content")
+                last_err = RuntimeError(f"Groq '{model}' returned empty content")
                 continue
             block = extract_json_block(raw) or raw
             try:
@@ -150,7 +211,7 @@ Output pure JSON with:
                     data["tags"] = ",".join(data["tags"])
                 return data
             except Exception as e:
-                last_err = RuntimeError(f"Failed to parse LLM JSON: {e}\nRaw: {raw[:500]}")
+                last_err = RuntimeError(f"Failed to parse LLM JSON from '{model}': {e}\nRaw: {raw[:500]}")
                 continue
         else:
             try:
@@ -158,10 +219,14 @@ Output pure JSON with:
             except Exception:
                 errj = {"error": {"message": r.text}}
             msg = str(errj.get("error", {}).get("message", r.text))
-            # If this model is decommissioned, just try the next fallback; accumulate the last error
             last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
+            # try next model
             continue
-    raise last_err or RuntimeError("Groq call failed with all fallback models")
+    # Exhausted all; include available list to help user set env models
+    avail = list_groq_models()
+    if avail:
+        raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS in workflow env to one of the above.")
+    raise last_err or RuntimeError("Groq call failed; no models available to try")
 
 def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
     a = AudioFileClip(voice_path); dur = a.duration; a.close()
@@ -443,7 +508,12 @@ def main():
             e_json = ev()
             owner, repo = REPO.split("/")
             issue = e_json["issue"]; number = issue["number"]
-            msg = f"❌ Error: {e}\n```\n{traceback.format_exc()}\n```"
+            # Append available models to help user configure
+            avail = list_groq_models()
+            addendum = ""
+            if avail:
+                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nYou can set GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
+            msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
             print("FATAL:", e)
