@@ -73,7 +73,7 @@ jobs:
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           TTS_LANG: en
-          # Set the models seen in your available list (ordered by your preference)
+          # Use one of the available models your key supports (from your list)
           GROQ_MODEL: qwen/qwen3-32b
           GROQ_FALLBACK_MODELS: llama-3.3-70b-versatile,llama-3.1-8b-instant,openai/gpt-oss-20b,openai/gpt-oss-120b,groq/compound-mini,groq/compound,moonshotai/kimi-k2-instruct
         run: python handle_comment.py
