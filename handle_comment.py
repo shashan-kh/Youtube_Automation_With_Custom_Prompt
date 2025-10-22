@@ -13,7 +13,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Primary + fallbacks (can be overridden via workflow env)
+# Models (override via workflow env)
 DEFAULT_PRIMARY = "qwen/qwen3-32b"
 DEFAULT_FALLBACKS = [
     "llama-3.3-70b-versatile",
@@ -31,7 +31,7 @@ PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
 
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
-PREVIEW_MAX = 57.3  # target under 58s
+PREVIEW_MAX = 57.3
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def gh(method, url, **kwargs):
@@ -77,10 +77,10 @@ def parse_topics_from_body(body):
                 return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
     except Exception:
         pass
-    # 2) Numbered/bulleted lines like "1) topic", "1. topic", "1 - topic"
+    # 2) Numbered/bulleted lines
     topics = []
     for line in body.splitlines():
-        m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[KATEX_INLINE_CLOSE\.\-:]\s+(.*\S)", line)
+        m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[\)\.\-:]\s+(.*\S)", line)
         if m:
             topics.append(m.group(2).strip())
     if topics:
@@ -96,7 +96,7 @@ def parse_topics_from_body(body):
             s_ln = ln.strip()
             if not s_ln or s_ln.lower().startswith("reply with"):
                 break
-            s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[KATEX_INLINE_CLOSE\.\-:])?\s*", "", s_ln).strip()
+            s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])?\s*", "", s_ln).strip()
             if s:
                 cleaned.append(s)
     if cleaned:
@@ -115,7 +115,7 @@ def call_groq(prompt, model):
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
         json={"model": model, "messages": [{"role":"user","content":prompt}], "temperature": 0.8},
-        timeout=90
+        timeout=120
     )
 
 def list_groq_models():
@@ -141,11 +141,9 @@ def build_model_list():
     available = list_groq_models()
     if not available:
         return env_models if env_models else [DEFAULT_PRIMARY] + DEFAULT_FALLBACKS
-    # Merge env models (if available) + preferred matches from available + others
     ordered = [m for m in env_models if m in available]
-    # Basic preference: Qwen instruct → Llama 3.3/3.1 chat → OpenAI OSS → Groq compound → moonshot
     patterns = [
-        r"^qwen.*32b.*", r"^qwen.*14b.*", r"^qwen.*7b.*",
+        r"^qwen.*32b", r"^qwen.*14b", r"^qwen.*7b",
         r"llama-3\.3.*versatile", r"llama-3\.1.*instant",
         r"openai/gpt-oss-120b", r"openai/gpt-oss-20b",
         r"groq/compound-mini", r"groq/compound",
@@ -207,10 +205,9 @@ Output pure JSON with:
             msg = str(errj.get("error", {}).get("message", r.text))
             last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
             continue
-    # Exhausted all, show available IDs to help configure
     avail = list_groq_models()
     if avail:
-        raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS in workflow env to one of the above.")
+        raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS to one of the above.")
     raise last_err or RuntimeError("Groq call failed; no models available to try")
 
 def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
@@ -283,7 +280,7 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
     for p in local:
         c = VideoFileClip(p)
         take = min(8, max(4, int(c.duration)))
-        c = c.subclip(0, take).resize(height=target_h)  # Pillow<10 required by moviepy 1.0.3
+        c = c.subclip(0, take).resize(height=target_h)  # pillow<10 via requirements fixes ANTIALIAS removal
         if c.w != target_w:
             c = c.crop(x_center=c.w/2, width=target_w, height=target_h)
         clips.append(c)
@@ -305,13 +302,7 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
             return d2
     return d
 
-def upload_preview(file_path):
-    with open(file_path, "rb") as f:
-        r = requests.put("https://transfer.sh/short.mp4", data=f, timeout=300)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Preview upload failed: {r.text}")
-    return r.text.strip()
-
+# ---------- YouTube helpers (preview as UNLISTED; schedule by updating the same video) ----------
 def yt_client():
     for v in ["YT_CLIENT_ID","YT_CLIENT_SECRET","YT_REFRESH_TOKEN"]:
         if not os.getenv(v):
@@ -326,23 +317,18 @@ def yt_client():
     )
     return build("youtube", "v3", credentials=creds)
 
-def upload_youtube_scheduled(video_path, title, description, tags, slot):
-    tomorrow_ist = datetime.now(IST).date() + timedelta(days=1)
-    ist_dt = datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, (16 if slot == "afternoon" else 9), 0, tzinfo=IST)
-    publish_at_utc = ist_dt.astimezone(timezone.utc).isoformat()
-
+def upload_youtube_unlisted(video_path, title, description, tags):
     yt = yt_client()
     body = {
         "snippet": {
             "title": title[:100],
             "description": description[:4900],
-            "tags": [t.strip() for t in (tags or ",".join(SAFE_TAGS)).split(",")][:10],
+            "tags": [t.strip() for t in (tags or ",".join(SAFE_TAGS)).split(",") if t.strip()][:10],
             "categoryId": "27",
             "defaultLanguage": "en"
         },
         "status": {
-            "privacyStatus": "private",
-            "publishAt": publish_at_utc,
+            "privacyStatus": "unlisted",
             "selfDeclaredMadeForKids": False
         }
     }
@@ -351,7 +337,123 @@ def upload_youtube_scheduled(video_path, title, description, tags, slot):
     resp = None
     while resp is None:
         status, resp = req.next_chunk()
-    return resp.get("id"), publish_at_utc
+    vid_id = resp.get("id")
+    return vid_id, f"https://youtu.be/{vid_id}"
+
+def schedule_existing_video(video_id, slot):
+    yt = yt_client()
+    tomorrow_ist = datetime.now(IST).date() + timedelta(days=1)
+    ist_dt = datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, (16 if slot == "afternoon" else 9), 0, tzinfo=IST)
+    publish_at_utc = ist_dt.astimezone(timezone.utc).isoformat()
+
+    body = {
+        "id": video_id,
+        "status": {
+            "privacyStatus": "private",
+            "publishAt": publish_at_utc,
+            "selfDeclaredMadeForKids": False
+        }
+    }
+    yt.videos().update(part="status", body=body).execute()
+    return publish_at_utc
+
+# ---------- Groq LLM ----------
+def build_model_list():
+    env_models = []
+    if GROQ_MODEL:
+        env_models.append(GROQ_MODEL)
+    if GROQ_FALLBACK_MODELS_ENV:
+        env_models.extend([m.strip() for m in GROQ_FALLBACK_MODELS_ENV.split(",") if m.strip()])
+    # De-dup
+    seen = set(); env_models = [m for m in env_models if not (m in seen or seen.add(m))]
+    available = list_groq_models()
+    if not available:
+        return env_models if env_models else [DEFAULT_PRIMARY] + DEFAULT_FALLBACKS
+    ordered = [m for m in env_models if m in available]
+    patterns = [
+        r"^qwen.*32b", r"^qwen.*14b", r"^qwen.*7b",
+        r"llama-3\.3.*versatile", r"llama-3\.1.*instant",
+        r"openai/gpt-oss-120b", r"openai/gpt-oss-20b",
+        r"groq/compound-mini", r"groq/compound",
+        r"moonshotai/kimi-k2-instruct"
+    ]
+    for pat in patterns:
+        rx = re.compile(pat, re.I)
+        for mid in available:
+            if rx.search(mid) and mid not in ordered:
+                ordered.append(mid)
+    for mid in available:
+        if mid not in ordered:
+            ordered.append(mid)
+    return ordered[:10]
+
+def list_groq_models():
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models",
+                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                         timeout=60)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            return [d.get("id") for d in data if isinstance(d, dict) and d.get("id")]
+    except Exception:
+        pass
+    return []
+
+def llm_script(trending_query, word_hint="90–105"):
+    if not GROQ_API_KEY:
+        raise RuntimeError("Missing GROQ_API_KEY secret")
+    prompt = f"""
+You are a careful health educator. Create a strictly under-58s YouTube Short based on this trending query:
+"{trending_query}"
+
+Rules:
+- General wellness only (sleep, hydration, movement, posture, stress, basic nutrition).
+- No disease claims, diagnoses, dosages, or supplement promises. Avoid COVID/vaccines.
+- If the query is unsafe/specific (e.g., drugs/diseases), pivot to a safe, related habit.
+- Style: energetic, plain language, second-person; target {word_hint} words.
+
+Output pure JSON with:
+- voiceover: string
+- overlay_lines: array of 7–9 short lines (4–7 words each) for captions
+- title: catchy, <=90 chars, include #Shorts
+- description: 2–3 sentences + “Educational only, not medical advice.” + 1 credible source (WHO/CDC/NIH/NHS)
+- tags: 6–10 comma-separated general tags
+"""
+    models_to_try = build_model_list()
+    last_err = None
+    for model in models_to_try:
+        r = call_groq(prompt, model)
+        if r.status_code == 200:
+            raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if not raw:
+                last_err = RuntimeError(f"Groq '{model}' returned empty content")
+                continue
+            block = extract_json_block(raw) or raw
+            try:
+                data = json.loads(block)
+                if isinstance(data.get("tags"), list):
+                    data["tags"] = ",".join(data["tags"])
+                return data
+            except Exception as e:
+                last_err = RuntimeError(f"Failed to parse LLM JSON from '{model}': {e}\nRaw: {raw[:500]}")
+                continue
+        else:
+            try:
+                errj = r.json()
+            except Exception:
+                errj = {"error": {"message": r.text}}
+            msg = str(errj.get("error", {}).get("message", r.text))
+            last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
+            continue
+    avail = list_groq_models()
+    if avail:
+        raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS to one of the above.")
+    raise last_err or RuntimeError("Groq call failed; no models available to try")
+
+# ---------- Build preview and schedule ----------
+def upload_preview_youtube(video_path, title, description, tags):
+    vid_id, link = upload_youtube_unlisted(video_path, title, description, tags)
+    return vid_id, link
 
 def get_metadata_from_issue_body(issue_body):
     m = re.search(r"```json\s*(\{.*?\})\s*```", issue_body, re.S)
@@ -375,12 +477,24 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
         temp, final = "temp.mp4", "short.mp4"
         dur = render_and_cap(broll, voice, temp, final, s.get("overlay_lines", []))
         if dur < 58.0:
-            preview_url = upload_preview(final)
             desc = f"""{s['description']}
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
 #Shorts #health #wellness"""
-            meta = {"topic": topic, "title": s["title"], "description": desc, "tags": s.get("tags",""), "preview_url": preview_url, "slot": slot, "created_at": datetime.utcnow().isoformat(), "duration_sec": round(dur,2), "attempt": attempt}
+            # Upload preview to YouTube as UNLISTED
+            vid_id, link = upload_preview_youtube(final, s["title"], desc, s.get("tags",""))
+            meta = {
+                "topic": topic,
+                "title": s["title"],
+                "description": desc,
+                "tags": s.get("tags",""),
+                "preview_video_id": vid_id,
+                "preview_link": link,
+                "slot": slot,
+                "created_at": datetime.utcnow().isoformat(),
+                "duration_sec": round(dur,2),
+                "attempt": attempt
+            }
             new_body = set_metadata_in_issue_body(issue_body, meta)
             return meta, new_body
     return None, issue_body
@@ -432,7 +546,7 @@ def safe_main():
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
-        post_comment(owner, repo, number, f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_url']}\nReply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n- /reject-video (pick a new topic)")
+        post_comment(owner, repo, number, f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\nReply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n- /reject-video (pick a new topic)")
         return
 
     if comment.lower().startswith("/reject-video"):
@@ -453,24 +567,16 @@ def safe_main():
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval")
-        post_comment(owner, repo, number, f"New preview ready (attempt {meta2['attempt']}, {meta2['duration_sec']}s): {meta2['preview_url']}\nReply /approve-video to schedule.")
+        post_comment(owner, repo, number, f"New preview ready (attempt {meta2['attempt']}, {meta2['duration_sec']}s): {meta2['preview_link']}\nReply /approve-video to schedule.")
         return
 
     if comment.lower().startswith("/approve-video"):
         meta = get_metadata_from_issue_body(body)
-        if not meta or "preview_url" not in meta:
-            post_comment(owner, repo, number, "No preview metadata found. Approve a topic first.")
+        if not meta or "preview_video_id" not in meta:
+            post_comment(owner, repo, number, "No preview video found. Please /regenerate-video.")
             return
-        r = requests.get(meta["preview_url"], timeout=300)
-        if r.status_code >= 400:
-            post_comment(owner, repo, number, f"Preview link expired. Please /regenerate-video.")
-            return
-        with open("short.mp4","wb") as f: f.write(r.content)
-        v = VideoFileClip("short.mp4"); d = v.duration; v.close()
-        if d >= 58.0:
-            post_comment(owner, repo, number, f"Video is {d:.2f}s ≥ 58s. I will rebuild it. Please reply /regenerate-video.")
-            return
-        vid_id, publish_at_utc = upload_youtube_scheduled("short.mp4", meta["title"], meta["description"], meta.get("tags",""), meta.get("slot","morning"))
+        vid_id = meta["preview_video_id"]
+        publish_at_utc = schedule_existing_video(vid_id, meta.get("slot","morning"))
         ist_time = datetime.fromisoformat(publish_at_utc.replace("Z","")).astimezone(IST).strftime("%Y-%m-%d %H:%M")
         link = f"https://youtu.be/{vid_id}"
         post_comment(owner, repo, number, f"Scheduled ✅ {link}\nPublishes at (IST): {ist_time}\nClosing this thread.")
@@ -482,11 +588,11 @@ def main():
     try:
         safe_main()
     except Exception as e:
-        # Append list of available models to help configure GROQ_MODEL env
         try:
             e_json = ev()
             owner, repo = REPO.split("/")
             issue = e_json["issue"]; number = issue["number"]
+            # Show available models to help configure
             avail = list_groq_models()
             addendum = ""
             if avail:
