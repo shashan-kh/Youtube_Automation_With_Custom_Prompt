@@ -1,4 +1,4 @@
-import os, re, json, tempfile, subprocess, requests, traceback, sys, math
+import os, re, json, base64, tempfile, subprocess, requests, traceback, sys, math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip
@@ -60,17 +60,45 @@ def remove_label(owner, repo, number, label):
 def get_issue(owner, repo, number):
     return gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}").json()
 
-# ------------ Parsing helpers ------------
-def extract_json_block(text):
-    # Capture EVERYTHING between ```json ... ``` (non-greedy)
-    m = re.search(r"```json\s*(.*?)\s*```", text, re.S | re.I)
+# ------------ Metadata block helpers (base64) ------------
+def set_metadata_in_issue_body(issue_body, meta: dict) -> str:
+    # Store as base64 to avoid control-char JSON issues
+    meta_json = json.dumps(meta, separators=(",", ":"), ensure_ascii=True)
+    meta_b64 = base64.b64encode(meta_json.encode("utf-8")).decode("ascii")
+    block = f"```meta\n{meta_b64}\n```"
+    if re.search(r"```meta\s*.*?\s*```", issue_body, re.S | re.I):
+        return re.sub(r"```meta\s*.*?\s*```", block, issue_body, flags=re.S | re.I)
+    # Remove old json block if present, then append meta block
+    issue_body = re.sub(r"```json\s*.*?\s*```", "", issue_body, flags=re.S | re.I)
+    return issue_body.strip() + "\n\nMetadata (do not edit):\n" + block
+
+def get_metadata_from_issue_body(issue_body):
+    # Try base64 meta block first
+    m = re.search(r"```meta\s*(.*?)\s*```", issue_body, re.S | re.I)
     if m:
-        return m.group(1)
-    # Fallback to any fenced block (riskier)
-    m = re.search(r"```\s*(\{.*?\})\s*```", text, re.S)
+        b64 = m.group(1).strip()
+        try:
+            js = base64.b64decode(b64.encode("ascii"), validate=True).decode("utf-8")
+            return json.loads(js)
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse base64 metadata: {e}")
+    # Fallback to old json block
+    m = re.search(r"```json\s*(.*?)\s*```", issue_body, re.S | re.I)
     if m:
-        return m.group(1)
+        s = sanitize_json_text(m.group(1))
+        return json.loads(s)
     return None
+
+def sanitize_json_text(s: str) -> str:
+    # Remove control characters except tab/newline
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return s
+
+# ------------ Topic parsing ------------
+def extract_json_block(text):
+    m = re.search(r"```json\s*(.*?)\s*```", text, re.S | re.I)
+    return m.group(1) if m else None
 
 def parse_topics_from_body(body):
     # 1) JSON metadata with topics
@@ -116,13 +144,6 @@ def get_slot_from_labels(labels):
             return name.split(":", 1)[1].strip() or "morning"
     return "morning"
 
-# Ensure JSON text has no unescaped control characters
-def sanitize_json_text(s: str) -> str:
-    # Remove NUL and other control chars except tab/newline/carriage return
-    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", s)
-    # Normalize Windows newlines
-    return s.replace("\r\n", "\n").replace("\r", "\n")
-
 # ------------ Groq LLM ------------
 def call_groq(prompt, model):
     return requests.post(
@@ -151,12 +172,10 @@ def build_model_list():
     if env_primary:
         models.append(env_primary)
     models += env_fallbacks
-    # de-dup
     seen = set(); models = [m for m in models if not (m in seen or seen.add(m))]
     available = list_groq_models()
     if not available:
         return models
-    # keep only available
     ordered = [m for m in models if m in available]
     if not ordered:
         ordered = available[:8]
@@ -189,8 +208,7 @@ Output PURE JSON with keys:
         if r.status_code == 200:
             raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not raw:
-                last_err = RuntimeError(f"Groq '{model}' returned empty content")
-                continue
+                last_err = RuntimeError(f"Groq '{model}' returned empty content"); continue
             block = extract_json_block(raw) or raw
             try:
                 data = json.loads(sanitize_json_text(block))
@@ -198,8 +216,7 @@ Output PURE JSON with keys:
                     data["tags"] = ",".join(data["tags"])
                 return data
             except Exception as e:
-                last_err = RuntimeError(f"Failed to parse LLM JSON from '{model}': {e}\nRaw: {raw[:500]}")
-                continue
+                last_err = RuntimeError(f"Failed to parse LLM JSON from '{model}': {e}\nRaw: {raw[:500]}"); continue
         else:
             try:
                 errj = r.json()
@@ -397,35 +414,6 @@ def schedule_existing_video(video_id, slot):
     yt.videos().update(part="status", body=body).execute()
     return publish_at_utc
 
-# ------------ Metadata helpers ------------
-def set_metadata_in_issue_body(issue_body, meta):
-    block = "```json\n" + json.dumps(meta, indent=2, ensure_ascii=False) + "\n```"
-    if "```json" in issue_body:
-        return re.sub(r"```json\s*.*?\s*```", block, issue_body, flags=re.S | re.I)
-    return issue_body + "\n\nMetadata:\n" + block
-
-def get_metadata_from_issue_body(issue_body):
-    blk = extract_json_block(issue_body)
-    if not blk:
-        return None
-    s = sanitize_json_text(blk)
-    try:
-        return json.loads(s)
-    except Exception as e:
-        # Try to repair common mistakes (dangling backticks etc.)
-        s2 = s.replace("```", "")
-        try:
-            return json.loads(s2)
-        except Exception as e2:
-            raise RuntimeError(f"Failed to parse metadata JSON: {e2}")
-
-def sanitize_json_text(s: str) -> str:
-    # Remove control characters except tab/newline
-    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", s)
-    # Normalize CRLF/CR to LF
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    return s
-
 # ------------ Build preview in band ------------
 def build_preview_until_in_band(topic, slot, issue_body, max_attempts=6):
     word_ranges = ["130–160","140–170","120–150","150–180","110–140","100–130"]
@@ -545,7 +533,7 @@ def main():
             avail = list_groq_models()
             addendum = ""
             if avail:
-                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS in workflow env to one of the above."
+                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS env to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
