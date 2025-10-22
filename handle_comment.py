@@ -14,18 +14,9 @@ REPO = os.getenv("GITHUB_REPOSITORY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # Models (override via workflow env)
-DEFAULT_PRIMARY = "qwen/qwen3-32b"
-DEFAULT_FALLBACKS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-20b",
-    "openai/gpt-oss-120b",
-    "groq/compound-mini",
-    "groq/compound",
-    "moonshotai/kimi-k2-instruct",
-]
-GROQ_MODEL = os.getenv("GROQ_MODEL", DEFAULT_PRIMARY).strip()
-GROQ_FALLBACK_MODELS_ENV = os.getenv("GROQ_FALLBACK_MODELS", ",".join(DEFAULT_FALLBACKS)).strip()
+DEFAULT_PRIMARY = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
+DEFAULT_FALLBACKS = os.getenv("GROQ_FALLBACK_MODELS",
+                              "llama-3.3-70b-versatile,llama-3.1-8b-instant,openai/gpt-oss-20b,openai/gpt-oss-120b,groq/compound-mini,groq/compound,moonshotai/kimi-k2-instruct")
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
@@ -35,9 +26,9 @@ PREVIEW_MIN = 50.0            # minimum strict target (seconds)
 PREVIEW_MAX = 57.8            # hard cap to remain < 58s
 TARGET_H = 1920               # 9:16 vertical
 TARGET_W = 1080
-CAPTION_FONTSIZE = 46         # smaller than before
-CAPTION_MARGIN_V = 120        # bottom margin
-APPLY_STABILIZE = True        # run ffmpeg deshake on each clip
+CAPTION_FONTSIZE = 34         # smaller captions
+CAPTION_MARGIN_V = 220        # further from bottom edge
+APPLY_STABILIZE = True        # ffmpeg deshake on each clip
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -139,32 +130,18 @@ def list_groq_models():
     return []
 
 def build_model_list():
-    env_models = []
-    if GROQ_MODEL: env_models.append(GROQ_MODEL)
-    if GROQ_FALLBACK_MODELS_ENV:
-        env_models += [m.strip() for m in GROQ_FALLBACK_MODELS_ENV.split(",") if m.strip()]
+    env_primary = DEFAULT_PRIMARY
+    env_fallbacks = [m.strip() for m in DEFAULT_FALLBACKS.split(",") if m.strip()]
+    models = []
+    if env_primary: models.append(env_primary)
+    models += env_fallbacks
     # de-dup
-    seen=set(); env_models=[m for m in env_models if not (m in seen or seen.add(m))]
+    seen=set(); models=[m for m in models if not (m in seen or seen.add(m))]
     available = list_groq_models()
     if not available:
-        return env_models if env_models else [DEFAULT_PRIMARY] + DEFAULT_FALLBACKS
-    ordered = [m for m in env_models if m in available]
-    patterns = [
-        r"^qwen.*32b", r"^qwen.*14b", r"^qwen.*7b",
-        r"llama-3\.3.*versatile", r"llama-3\.1.*instant",
-        r"openai/gpt-oss-120b", r"openai/gpt-oss-20b",
-        r"groq/compound-mini", r"groq/compound",
-        r"moonshotai/kimi-k2-instruct"
-    ]
-    for pat in patterns:
-        rx = re.compile(pat, re.I)
-        for mid in available:
-            if rx.search(mid) and mid not in ordered:
-                ordered.append(mid)
-    for mid in available:
-        if mid not in ordered:
-            ordered.append(mid)
-    return ordered[:10]
+        return models
+    # keep only available
+    return [m for m in models if m in available] or available[:8]
 
 def llm_script(trending_query, word_hint="130–160"):
     if not GROQ_API_KEY:
@@ -182,7 +159,7 @@ Rules:
 Output PURE JSON with keys:
 - voiceover: string
 - overlay_lines: array of 7–9 very short lines (3–6 words each), suitable for bottom captions
-- title: catchy, <=90 chars (include #Shorts if you wish)
+- title: catchy, <=90 chars
 - description: 2 short sentences + “Educational only, not medical advice.” + 1 credible source (WHO/CDC/NIH/NHS)
 - tags: 6–10 comma-separated general tags
 """
@@ -212,7 +189,7 @@ Output PURE JSON with keys:
             continue
     avail = list_groq_models()
     if avail:
-        raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS env to one of these.")
+        raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS env to one of the above.")
     raise last_err or RuntimeError("Groq call failed; no models available")
 
 # ------------ Media helpers ------------
@@ -222,14 +199,14 @@ def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
         return voice_path, dur
     factor = max(0.5, min(2.0, target / dur))
     out = "voice_fast.mp3"
-    subprocess.run(["ffmpeg","-y","-i",voice_path,"-filter:a",f"atempo={factor}","-vn",out], check=True)
+    subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-y","-i",voice_path,"-filter:a",f"atempo={factor}","-vn",out], check=True)
     a2 = AudioFileClip(out); d2 = a2.duration; a2.close()
     return out, d2
 
 def stabilize_video(in_path, out_path):
     # Deshake filter to reduce shaky footage
-    # 'edge=mirror' avoids black borders, 'rx/ry' adjust search area
-    cmd = ["ffmpeg","-y","-i",in_path,"-vf","deshake=rx=64:ry=64:edge=mirror","-c:v","libx264","-preset","veryfast","-crf","20","-an",out_path]
+    cmd = ["ffmpeg","-hide_banner","-loglevel","error","-y","-i",in_path,
+           "-vf","deshake=rx=64:ry=64:edge=mirror","-c:v","libx264","-preset","veryfast","-crf","20","-an",out_path]
     subprocess.run(cmd, check=True)
 
 def fetch_broll(query, need=4):
@@ -245,7 +222,7 @@ def fetch_broll(query, need=4):
                 raise RuntimeError(f"Pexels API auth error {r.status_code}: {r.text}")
             for v in r.json().get("videos", []):
                 dur = int(v.get("duration", 0))
-                if dur < 6:  # try to avoid micro-clips (often shakier)
+                if dur < 6:  # skip micro-clips (often shakier)
                     continue
                 files = sorted(v.get("video_files", []), key=lambda f: f.get("height",0), reverse=True)
                 for f in files:
@@ -254,36 +231,58 @@ def fetch_broll(query, need=4):
             if len(vids) >= need*2: break
         except Exception:
             continue
-    # Prefer longer clips first to reduce jumpiness
     vids = sorted(vids, key=lambda x: x[1], reverse=True)
     return [link for link,_ in vids[:max(need,4)]]
 
 def fmt_time(t):
-    h = int(t // 3600); m = int((t % 3600)//60); s = int(t % 60); ms = int((t - int(t))*1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    h = int(t // 3600); m = int((t % 3600)//60); s = int(t % 60); cs = int((t - int(t))*100)
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"  # ASS times are centiseconds
 
-def make_srt(lines, duration, path):
+def make_ass(lines, duration, path, width=TARGET_W, height=TARGET_H, fontsize=CAPTION_FONTSIZE, margin_v=CAPTION_MARGIN_V):
+    # Create ASS with a bottom-centered style (white text + black stroke), no box
     lines = [l.strip() for l in (lines or []) if str(l).strip()]
     if not lines:
         lines = ["Small steps add up","Move, hydrate, rest","Focus on form","You've got this!"]
-    # Distribute evenly across duration
     n = max(1, min(9, len(lines)))
-    step = max(1.5, duration / n)
+    step = max(1.6, duration / n)
     t = 0.5
-    out = []
-    for i in range(n):
-        start = min(t, duration-0.5)
-        end = min(start + step, duration)
-        out.append(f"{i+1}\n{fmt_time(start)} --> {fmt_time(end)}\n{lines[i]}\n\n")
-        t = end - 0.2
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(out)
 
-def burn_subs(in_mp4, srt_path, out_mp4):
-    # Bottom captions, bright white text with black stroke
-    style = f"FontName=DejaVu Sans,FontSize={CAPTION_FONTSIZE},Bold=1,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=4,Shadow=1,Alignment=2,MarginV={CAPTION_MARGIN_V}"
-    vf = f"subtitles={srt_path}:force_style='{style}'"
-    subprocess.run(["ffmpeg","-y","-i",in_mp4,"-vf",vf,"-c:a","copy",out_mp4], check=True)
+    ass = []
+    ass.append("[Script Info]")
+    ass.append("ScriptType: v4.00+")
+    ass.append(f"PlayResX: {width}")
+    ass.append(f"PlayResY: {height}")
+    ass.append("")
+    ass.append("[V4+ Styles]")
+    ass.append("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+               "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+               "Alignment, MarginL, MarginR, MarginV, Encoding")
+    # PrimaryColour &H00FFFFFF& (white), OutlineColour &H00000000& (black)
+    ass.append(f"Style: Bot,DejaVu Sans,{fontsize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,1,2,30,30,{margin_v},1")
+    ass.append("")
+    ass.append("[Events]")
+    ass.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+    for i, text in enumerate(lines):
+        start = fmt_time(min(t, max(0, duration-0.5)))
+        end = fmt_time(min(t + step, duration))
+        # Prevent too-long lines (keep small bottom captions)
+        clean = re.sub(r"\s+", " ", text)
+        if len(clean) > 34:
+            clean = clean[:32] + "…"
+        ass.append(f"Dialogue: 0,{start},{end},Bot,,0,0,0,,{clean}")
+        t = min(end_time := (t + step - 0.2), duration - 0.2)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(ass))
+
+def burn_ass(in_mp4, ass_path, out_mp4):
+    # Burn ASS with style (bottom, small font, stroke)
+    subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-y","-i",in_mp4,"-vf",f"subtitles={ass_path}", "-c:a","copy", out_mp4], check=True)
+
+def normalize_1080x1920(in_mp4, out_mp4):
+    # Force exact 1080x1920 (cover + crop)
+    vf = "scale=1080:1920:force_original_aspect_ratio=cover,crop=1080:1920"
+    subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-y","-i",in_mp4,"-vf",vf,"-c:a","copy",out_mp4], check=True)
 
 def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines):
     tmp = Path(tempfile.mkdtemp())
@@ -300,16 +299,16 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines):
             try:
                 stabilize_video(str(p), str(sp))
             except Exception:
-                sp = p  # fall back if deshake fails
+                sp = p  # fallback
         else:
             sp = p
         local.append(str(sp))
 
-    # Determine per-clip "take" based on voice length for smoother pacing
+    # Determine take length per clip based on voice length for smooth pacing
     voice = AudioFileClip(voice_mp3)
     voice_len = voice.duration
     num = max(1, len(local))
-    per_clip = min(12, max(7, math.ceil((voice_len + 1.5) / num)))  # aim to cover voice nicely
+    per_clip = min(12, max(7, math.ceil((voice_len + 1.5) / num)))
     clips = []
     for p in local:
         c = VideoFileClip(p)
@@ -320,27 +319,32 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines):
         clips.append(c)
 
     merged = concatenate_videoclips(clips)
-    # Final length: follow voice length but clamp to [PREVIEW_MIN, PREVIEW_MAX]
+    # Follow voice length but clamp to [PREVIEW_MIN, PREVIEW_MAX]
     end = min(merged.duration, voice_len + 0.4, PREVIEW_MAX)
     merged = merged.subclip(0, end).set_audio(voice)
     merged.write_videofile(temp_mp4, fps=30, codec="libx264", audio_codec="aac", threads=2, preset="fast", verbose=False, logger=None)
     voice.close(); [c.close() for c in clips]; merged.close()
 
-    srt_path = str(tmp / "cap.srt")
-    make_srt(overlay_lines, end, srt_path)
-    burn_subs(temp_mp4, srt_path, final_mp4)
+    # Make ASS captions and burn
+    ass_path = str(tmp / "cap.ass")
+    make_ass(overlay_lines, end, ass_path, width=TARGET_W, height=TARGET_H, fontsize=CAPTION_FONTSIZE, margin_v=CAPTION_MARGIN_V)
+    burned = str(tmp / "burned.mp4")
+    burn_ass(temp_mp4, ass_path, burned)
+
+    # Normalize to exact 1080x1920 (prevents any odd sizing)
+    normalize_1080x1920(burned, final_mp4)
 
     v = VideoFileClip(final_mp4); d = v.duration; v.close()
     # Final safety cap (rare)
     if d > PREVIEW_MAX + 0.15:
-        subprocess.run(["ffmpeg","-y","-i",final_mp4,"-t",str(PREVIEW_MAX),"-c","copy","short_trim.mp4"], check=False)
+        subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-y","-i",final_mp4,"-t",str(PREVIEW_MAX),"-c","copy","short_trim.mp4"], check=False)
         if os.path.exists("short_trim.mp4"):
             os.replace("short_trim.mp4", final_mp4)
             v2 = VideoFileClip(final_mp4); d2 = v2.duration; v2.close()
             return d2
     return d
 
-# ------------ YouTube helpers (UNLISTED preview → schedule same video) ------------
+# ------------ YouTube helpers (UNLISTED preview → schedule) ------------
 def yt_client():
     for v in ["YT_CLIENT_ID","YT_CLIENT_SECRET","YT_REFRESH_TOKEN"]:
         if not os.getenv(v): raise RuntimeError(f"Missing {v} secret")
@@ -384,7 +388,7 @@ def schedule_existing_video(video_id, slot):
     yt.videos().update(part="status", body=body).execute()
     return publish_at_utc
 
-# ------------ Build preview (50–58s) ------------
+# ------------ Build preview in band ------------
 def set_metadata_in_issue_body(issue_body, meta):
     block = "```json\n" + json.dumps(meta, indent=2) + "\n```"
     if "```json" in issue_body:
@@ -399,21 +403,16 @@ def build_preview_until_in_band(topic, slot, issue_body, max_attempts=6):
     word_ranges = ["130–160","140–170","120–150","150–180","110–140","100–130"]
     for attempt in range(1, max_attempts+1):
         s = llm_script(topic, word_hint=word_ranges[min(attempt-1, len(word_ranges)-1)])
-        # TTS
         voice = "voice.mp3"; gTTS(s["voiceover"], lang=TTS_LANG).save(voice)
         voice, vdur = ensure_voice_under_target(voice, target=PREVIEW_MAX)
-        # If too short, regenerate with higher target words
         if vdur < PREVIEW_MIN and attempt < max_attempts:
             continue
-        # B-roll
         broll = fetch_broll(topic, need=4)
         if not broll:
             continue
-        # Render + captions
         temp, final = "temp.mp4", "short.mp4"
         dur = render_and_cap(broll, voice, temp, final, s.get("overlay_lines", []))
         if PREVIEW_MIN <= dur <= PREVIEW_MAX:
-            # Upload preview to YouTube as UNLISTED
             desc = f"""{s['description']}
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
@@ -426,7 +425,6 @@ Educational only, not medical advice. Consult a qualified professional for perso
             }
             new_body = set_metadata_in_issue_body(issue_body, meta)
             return meta, new_body
-        # else retry with next word range
     return None, issue_body
 
 # ------------ Main flow ------------
