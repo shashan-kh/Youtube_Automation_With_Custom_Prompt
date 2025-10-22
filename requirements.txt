@@ -19,4 +19,4 @@ moviepy==1.0.3
 imageio>=2.31
 imageio-ffmpeg>=0.4.9
 numpy<2
-pillow<10          # FIX: avoid Image.ANTIALIAS removal (e.g., 9.5.0)
+pillow<10
