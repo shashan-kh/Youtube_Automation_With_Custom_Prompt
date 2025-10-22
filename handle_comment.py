@@ -15,8 +15,10 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # Models (override via workflow env)
 DEFAULT_PRIMARY = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
-DEFAULT_FALLBACKS = os.getenv("GROQ_FALLBACK_MODELS",
-                              "llama-3.3-70b-versatile,llama-3.1-8b-instant,openai/gpt-oss-20b,openai/gpt-oss-120b,groq/compound-mini,groq/compound,moonshotai/kimi-k2-instruct")
+DEFAULT_FALLBACKS = os.getenv(
+    "GROQ_FALLBACK_MODELS",
+    "llama-3.3-70b-versatile,llama-3.1-8b-instant,openai/gpt-oss-20b,openai/gpt-oss-120b,groq/compound-mini,groq/compound,moonshotai/kimi-k2-instruct"
+)
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
@@ -60,19 +62,23 @@ def get_issue(owner, repo, number):
 
 # ------------ Parsing helpers ------------
 def extract_json_block(text):
-    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
-    if m: return m.group(1)
+    # Capture EVERYTHING between ```json ... ``` (non-greedy)
+    m = re.search(r"```json\s*(.*?)\s*```", text, re.S | re.I)
+    if m:
+        return m.group(1)
+    # Fallback to any fenced block (riskier)
     m = re.search(r"```\s*(\{.*?\})\s*```", text, re.S)
-    if m: return m.group(1)
-    m = re.search(r"\{.*\}", text, re.S)
-    return m.group(0) if m else None
+    if m:
+        return m.group(1)
+    return None
 
 def parse_topics_from_body(body):
     # 1) JSON metadata with topics
     try:
         block = extract_json_block(body)
         if block:
-            data = json.loads(block)
+            s = sanitize_json_text(block)
+            data = json.loads(s)
             if isinstance(data, dict) and isinstance(data.get("topics"), list) and data["topics"]:
                 return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
     except Exception:
@@ -81,7 +87,8 @@ def parse_topics_from_body(body):
     topics = []
     for line in body.splitlines():
         m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[\)\.\-:]\s+(.*\S)", line)
-        if m: topics.append(m.group(2).strip())
+        if m:
+            topics.append(m.group(2).strip())
     if topics:
         return topics[:3]
     # 3) After "Choose one:" until "Reply with"
@@ -96,7 +103,8 @@ def parse_topics_from_body(body):
             if not s_ln or s_ln.lower().startswith("reply with"):
                 break
             s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])?\s*", "", s_ln).strip()
-            if s: cleaned.append(s)
+            if s:
+                cleaned.append(s)
     if cleaned:
         return cleaned[:3]
     return []
@@ -107,6 +115,13 @@ def get_slot_from_labels(labels):
         if name.startswith("slot:"):
             return name.split(":", 1)[1].strip() or "morning"
     return "morning"
+
+# Ensure JSON text has no unescaped control characters
+def sanitize_json_text(s: str) -> str:
+    # Remove NUL and other control chars except tab/newline/carriage return
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", s)
+    # Normalize Windows newlines
+    return s.replace("\r\n", "\n").replace("\r", "\n")
 
 # ------------ Groq LLM ------------
 def call_groq(prompt, model):
@@ -133,15 +148,19 @@ def build_model_list():
     env_primary = DEFAULT_PRIMARY
     env_fallbacks = [m.strip() for m in DEFAULT_FALLBACKS.split(",") if m.strip()]
     models = []
-    if env_primary: models.append(env_primary)
+    if env_primary:
+        models.append(env_primary)
     models += env_fallbacks
     # de-dup
-    seen=set(); models=[m for m in models if not (m in seen or seen.add(m))]
+    seen = set(); models = [m for m in models if not (m in seen or seen.add(m))]
     available = list_groq_models()
     if not available:
         return models
     # keep only available
-    return [m for m in models if m in available] or available[:8]
+    ordered = [m for m in models if m in available]
+    if not ordered:
+        ordered = available[:8]
+    return ordered
 
 def llm_script(trending_query, word_hint="130–160"):
     if not GROQ_API_KEY:
@@ -170,15 +189,17 @@ Output PURE JSON with keys:
         if r.status_code == 200:
             raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not raw:
-                last_err = RuntimeError(f"Groq '{model}' returned empty content"); continue
+                last_err = RuntimeError(f"Groq '{model}' returned empty content")
+                continue
             block = extract_json_block(raw) or raw
             try:
-                data = json.loads(block)
+                data = json.loads(sanitize_json_text(block))
                 if isinstance(data.get("tags"), list):
                     data["tags"] = ",".join(data["tags"])
                 return data
             except Exception as e:
-                last_err = RuntimeError(f"Failed to parse LLM JSON from '{model}': {e}\nRaw: {raw[:500]}"); continue
+                last_err = RuntimeError(f"Failed to parse LLM JSON from '{model}': {e}\nRaw: {raw[:500]}")
+                continue
         else:
             try:
                 errj = r.json()
@@ -204,7 +225,6 @@ def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
     return out, d2
 
 def stabilize_video(in_path, out_path):
-    # Deshake filter to reduce shaky footage
     cmd = ["ffmpeg","-hide_banner","-loglevel","error","-y","-i",in_path,
            "-vf","deshake=rx=64:ry=64:edge=mirror","-c:v","libx264","-preset","veryfast","-crf","20","-an",out_path]
     subprocess.run(cmd, check=True)
@@ -222,7 +242,7 @@ def fetch_broll(query, need=4):
                 raise RuntimeError(f"Pexels API auth error {r.status_code}: {r.text}")
             for v in r.json().get("videos", []):
                 dur = int(v.get("duration", 0))
-                if dur < 6:  # skip micro-clips (often shakier)
+                if dur < 6:
                     continue
                 files = sorted(v.get("video_files", []), key=lambda f: f.get("height",0), reverse=True)
                 for f in files:
@@ -234,12 +254,11 @@ def fetch_broll(query, need=4):
     vids = sorted(vids, key=lambda x: x[1], reverse=True)
     return [link for link,_ in vids[:max(need,4)]]
 
-def fmt_time(t):
+def fmt_time_ass(t):
     h = int(t // 3600); m = int((t % 3600)//60); s = int(t % 60); cs = int((t - int(t))*100)
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"  # ASS times are centiseconds
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 def make_ass(lines, duration, path, width=TARGET_W, height=TARGET_H, fontsize=CAPTION_FONTSIZE, margin_v=CAPTION_MARGIN_V):
-    # Create ASS with a bottom-centered style (white text + black stroke), no box
     lines = [l.strip() for l in (lines or []) if str(l).strip()]
     if not lines:
         lines = ["Small steps add up","Move, hydrate, rest","Focus on form","You've got this!"]
@@ -257,37 +276,32 @@ def make_ass(lines, duration, path, width=TARGET_W, height=TARGET_H, fontsize=CA
     ass.append("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
                "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
                "Alignment, MarginL, MarginR, MarginV, Encoding")
-    # PrimaryColour &H00FFFFFF& (white), OutlineColour &H00000000& (black)
     ass.append(f"Style: Bot,DejaVu Sans,{fontsize},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,1,2,30,30,{margin_v},1")
     ass.append("")
     ass.append("[Events]")
     ass.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
     for i, text in enumerate(lines):
-        start = fmt_time(min(t, max(0, duration-0.5)))
-        end = fmt_time(min(t + step, duration))
-        # Prevent too-long lines (keep small bottom captions)
+        start = fmt_time_ass(min(t, max(0, duration-0.5)))
+        end = fmt_time_ass(min(t + step, duration))
         clean = re.sub(r"\s+", " ", text)
         if len(clean) > 34:
             clean = clean[:32] + "…"
         ass.append(f"Dialogue: 0,{start},{end},Bot,,0,0,0,,{clean}")
-        t = min(end_time := (t + step - 0.2), duration - 0.2)
+        t = min((t + step - 0.2), duration - 0.2)
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(ass))
 
 def burn_ass(in_mp4, ass_path, out_mp4):
-    # Burn ASS with style (bottom, small font, stroke)
     subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-y","-i",in_mp4,"-vf",f"subtitles={ass_path}", "-c:a","copy", out_mp4], check=True)
 
 def normalize_1080x1920(in_mp4, out_mp4):
-    # Force exact 1080x1920 (cover + crop)
     vf = "scale=1080:1920:force_original_aspect_ratio=cover,crop=1080:1920"
     subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-y","-i",in_mp4,"-vf",vf,"-c:a","copy",out_mp4], check=True)
 
 def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines):
     tmp = Path(tempfile.mkdtemp())
     local = []
-    # Download + optionally stabilize
     for i,u in enumerate(broll_urls):
         p = tmp / f"b{i}.mp4"
         with requests.get(u, stream=True, timeout=120) as r:
@@ -299,12 +313,11 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines):
             try:
                 stabilize_video(str(p), str(sp))
             except Exception:
-                sp = p  # fallback
+                sp = p
         else:
             sp = p
         local.append(str(sp))
 
-    # Determine take length per clip based on voice length for smooth pacing
     voice = AudioFileClip(voice_mp3)
     voice_len = voice.duration
     num = max(1, len(local))
@@ -319,23 +332,18 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines):
         clips.append(c)
 
     merged = concatenate_videoclips(clips)
-    # Follow voice length but clamp to [PREVIEW_MIN, PREVIEW_MAX]
     end = min(merged.duration, voice_len + 0.4, PREVIEW_MAX)
     merged = merged.subclip(0, end).set_audio(voice)
     merged.write_videofile(temp_mp4, fps=30, codec="libx264", audio_codec="aac", threads=2, preset="fast", verbose=False, logger=None)
     voice.close(); [c.close() for c in clips]; merged.close()
 
-    # Make ASS captions and burn
     ass_path = str(tmp / "cap.ass")
     make_ass(overlay_lines, end, ass_path, width=TARGET_W, height=TARGET_H, fontsize=CAPTION_FONTSIZE, margin_v=CAPTION_MARGIN_V)
     burned = str(tmp / "burned.mp4")
     burn_ass(temp_mp4, ass_path, burned)
-
-    # Normalize to exact 1080x1920 (prevents any odd sizing)
     normalize_1080x1920(burned, final_mp4)
 
     v = VideoFileClip(final_mp4); d = v.duration; v.close()
-    # Final safety cap (rare)
     if d > PREVIEW_MAX + 0.15:
         subprocess.run(["ffmpeg","-hide_banner","-loglevel","error","-y","-i",final_mp4,"-t",str(PREVIEW_MAX),"-c","copy","short_trim.mp4"], check=False)
         if os.path.exists("short_trim.mp4"):
@@ -347,7 +355,8 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines):
 # ------------ YouTube helpers (UNLISTED preview → schedule) ------------
 def yt_client():
     for v in ["YT_CLIENT_ID","YT_CLIENT_SECRET","YT_REFRESH_TOKEN"]:
-        if not os.getenv(v): raise RuntimeError(f"Missing {v} secret")
+        if not os.getenv(v):
+            raise RuntimeError(f"Missing {v} secret")
     creds = Credentials(
         token=None,
         refresh_token=os.getenv("YT_REFRESH_TOKEN"),
@@ -388,17 +397,36 @@ def schedule_existing_video(video_id, slot):
     yt.videos().update(part="status", body=body).execute()
     return publish_at_utc
 
-# ------------ Build preview in band ------------
+# ------------ Metadata helpers ------------
 def set_metadata_in_issue_body(issue_body, meta):
-    block = "```json\n" + json.dumps(meta, indent=2) + "\n```"
+    block = "```json\n" + json.dumps(meta, indent=2, ensure_ascii=False) + "\n```"
     if "```json" in issue_body:
-        return re.sub(r"```json\s*\{.*?\}\s*```", block, issue_body, flags=re.S)
+        return re.sub(r"```json\s*.*?\s*```", block, issue_body, flags=re.S | re.I)
     return issue_body + "\n\nMetadata:\n" + block
 
 def get_metadata_from_issue_body(issue_body):
-    m = re.search(r"```json\s*(\{.*?\})\s*```", issue_body, re.S)
-    return json.loads(m.group(1)) if m else None
+    blk = extract_json_block(issue_body)
+    if not blk:
+        return None
+    s = sanitize_json_text(blk)
+    try:
+        return json.loads(s)
+    except Exception as e:
+        # Try to repair common mistakes (dangling backticks etc.)
+        s2 = s.replace("```", "")
+        try:
+            return json.loads(s2)
+        except Exception as e2:
+            raise RuntimeError(f"Failed to parse metadata JSON: {e2}")
 
+def sanitize_json_text(s: str) -> str:
+    # Remove control characters except tab/newline
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", s)
+    # Normalize CRLF/CR to LF
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    return s
+
+# ------------ Build preview in band ------------
 def build_preview_until_in_band(topic, slot, issue_body, max_attempts=6):
     word_ranges = ["130–160","140–170","120–150","150–180","110–140","100–130"]
     for attempt in range(1, max_attempts+1):
