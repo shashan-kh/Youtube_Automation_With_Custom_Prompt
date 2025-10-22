@@ -13,6 +13,7 @@ from gtts import gTTS
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from video_utils import normalize_1080x1920
 
 # ------------ Config / Env ------------
 REGION = os.getenv("REGION", "IN")
