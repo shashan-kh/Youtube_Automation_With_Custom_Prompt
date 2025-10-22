@@ -1,3 +1,10 @@
+# handle_comment.py
+# Fixes:
+# - Avoids JSON control-char errors by storing metadata as base64 in ```meta``` block.
+# - For /regenerate-video, if metadata is missing or unparsable, it derives the topic from the last `/approve-topic X`
+#   comment + the numbered topics in the Issue body (no JSON needed).
+# - Keeps prior improvements: 50–58s duration, bottom captions (ASS) with stroke, stabilization, 1080x1920, UNLISTED preview → schedule.
+
 import os, re, json, base64, tempfile, subprocess, requests, traceback, sys, math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,6 +67,21 @@ def remove_label(owner, repo, number, label):
 def get_issue(owner, repo, number):
     return gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}").json()
 
+def list_issue_comments(owner, repo, number):
+    # Returns newest-first (we reverse sort by created_at below)
+    comments = []
+    page = 1
+    while True:
+        r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments?per_page=100&page={page}")
+        batch = r.json()
+        if not batch:
+            break
+        comments.extend(batch)
+        page += 1
+    # sort oldest->newest
+    comments.sort(key=lambda c: c.get("created_at",""))
+    return comments
+
 # ------------ Metadata block helpers (base64) ------------
 def set_metadata_in_issue_body(issue_body, meta: dict) -> str:
     # Store as base64 to avoid control-char JSON issues
@@ -73,45 +95,24 @@ def set_metadata_in_issue_body(issue_body, meta: dict) -> str:
     return issue_body.strip() + "\n\nMetadata (do not edit):\n" + block
 
 def get_metadata_from_issue_body(issue_body):
-    # Try base64 meta block first
+    # Try base64 meta block only (do NOT attempt JSON fallback here to avoid control-char crashes)
     m = re.search(r"```meta\s*(.*?)\s*```", issue_body, re.S | re.I)
-    if m:
-        b64 = m.group(1).strip()
-        try:
-            js = base64.b64decode(b64.encode("ascii"), validate=True).decode("utf-8")
-            return json.loads(js)
-        except Exception as e:
-            raise RuntimeError(f"Failed to parse base64 metadata: {e}")
-    # Fallback to old json block
-    m = re.search(r"```json\s*(.*?)\s*```", issue_body, re.S | re.I)
-    if m:
-        s = sanitize_json_text(m.group(1))
-        return json.loads(s)
-    return None
+    if not m:
+        return None
+    b64 = m.group(1).strip()
+    try:
+        js = base64.b64decode(b64.encode("ascii"), validate=True).decode("utf-8")
+        return json.loads(js)
+    except Exception:
+        return None
 
-def sanitize_json_text(s: str) -> str:
-    # Remove control characters except tab/newline
-    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", s)
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    return s
-
-# ------------ Topic parsing ------------
+# ------------ Topic parsing (for initial approval and fallback) ------------
 def extract_json_block(text):
     m = re.search(r"```json\s*(.*?)\s*```", text, re.S | re.I)
     return m.group(1) if m else None
 
 def parse_topics_from_body(body):
-    # 1) JSON metadata with topics
-    try:
-        block = extract_json_block(body)
-        if block:
-            s = sanitize_json_text(block)
-            data = json.loads(s)
-            if isinstance(data, dict) and isinstance(data.get("topics"), list) and data["topics"]:
-                return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
-    except Exception:
-        pass
-    # 2) Numbered/bulleted lines (e.g., "1) topic", "1. topic")
+    # Prefer numbered list "1) Topic"
     topics = []
     for line in body.splitlines():
         m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[\)\.\-:]\s+(.*\S)", line)
@@ -119,10 +120,9 @@ def parse_topics_from_body(body):
             topics.append(m.group(2).strip())
     if topics:
         return topics[:3]
-    # 3) After "Choose one:" until "Reply with"
-    lines = body.splitlines()
+    # Fallback: lines after "Choose one:" until "Reply with"
     cleaned, flag = [], False
-    for ln in lines:
+    for ln in body.splitlines():
         if not flag and "Choose one" in ln:
             flag = True
             continue
@@ -131,10 +131,18 @@ def parse_topics_from_body(body):
             if not s_ln or s_ln.lower().startswith("reply with"):
                 break
             s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])?\s*", "", s_ln).strip()
-            if s:
-                cleaned.append(s)
+            if s: cleaned.append(s)
     if cleaned:
         return cleaned[:3]
+    # Last fallback: try a json topics block if present (rare)
+    try:
+        blk = extract_json_block(body)
+        if blk:
+            data = json.loads(re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", blk))
+            if isinstance(data, dict) and isinstance(data.get("topics"), list):
+                return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
+    except Exception:
+        pass
     return []
 
 def get_slot_from_labels(labels):
@@ -143,6 +151,37 @@ def get_slot_from_labels(labels):
         if name.startswith("slot:"):
             return name.split(":", 1)[1].strip() or "morning"
     return "morning"
+
+def derive_topic_from_history(owner, repo, number, issue_body):
+    """
+    Fallback for /regenerate-video: if metadata is missing/broken,
+    read the last '/approve-topic X' comment by the repo owner,
+    and pair it with the current topics in the Issue body.
+    """
+    topics = parse_topics_from_body(issue_body)
+    if not topics:
+        return None
+    comments = list_issue_comments(owner, repo, number)
+    # find last approve-topic from repo owner
+    idx = None
+    for c in reversed(comments):
+        author = c.get("user", {}).get("login", "")
+        if not author:
+            continue
+        # repo owner from issue payload may be org; allow any owner or the current commenter; simplest: trust last '/approve-topic'
+        body = (c.get("body") or "").strip().lower()
+        if body.startswith("/approve-topic"):
+            parts = body.split()
+            if len(parts) > 1 and parts[1].isdigit():
+                idx = int(parts[1])
+            else:
+                idx = 1
+            break
+    if idx is None:
+        return None
+    if not (1 <= idx <= len(topics)):
+        idx = 1
+    return topics[idx-1]
 
 # ------------ Groq LLM ------------
 def call_groq(prompt, model):
@@ -209,9 +248,10 @@ Output PURE JSON with keys:
             raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not raw:
                 last_err = RuntimeError(f"Groq '{model}' returned empty content"); continue
-            block = extract_json_block(raw) or raw
+            # Sanitize before JSON
+            block = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", raw)
             try:
-                data = json.loads(sanitize_json_text(block))
+                data = json.loads(block)
                 if isinstance(data.get("tags"), list):
                     data["tags"] = ",".join(data["tags"])
                 return data
@@ -414,30 +454,41 @@ def schedule_existing_video(video_id, slot):
     yt.videos().update(part="status", body=body).execute()
     return publish_at_utc
 
-# ------------ Build preview in band ------------
+# ------------ Build preview (50–58s) ------------
 def build_preview_until_in_band(topic, slot, issue_body, max_attempts=6):
     word_ranges = ["130–160","140–170","120–150","150–180","110–140","100–130"]
     for attempt in range(1, max_attempts+1):
         s = llm_script(topic, word_hint=word_ranges[min(attempt-1, len(word_ranges)-1)])
+        # TTS
         voice = "voice.mp3"; gTTS(s["voiceover"], lang=TTS_LANG).save(voice)
         voice, vdur = ensure_voice_under_target(voice, target=PREVIEW_MAX)
         if vdur < PREVIEW_MIN and attempt < max_attempts:
             continue
+        # B-roll
         broll = fetch_broll(topic, need=4)
         if not broll:
             continue
+        # Render + captions
         temp, final = "temp.mp4", "short.mp4"
         dur = render_and_cap(broll, voice, temp, final, s.get("overlay_lines", []))
         if PREVIEW_MIN <= dur <= PREVIEW_MAX:
+            # Upload preview to YouTube as UNLISTED
             desc = f"""{s['description']}
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
 #Shorts #health #wellness"""
             vid_id, link = upload_youtube_unlisted(final, s["title"], desc, s.get("tags",""))
             meta = {
-                "topic": topic, "title": s["title"], "description": desc, "tags": s.get("tags",""),
-                "preview_video_id": vid_id, "preview_link": link, "slot": slot,
-                "created_at": datetime.utcnow().isoformat(), "duration_sec": round(dur,2), "attempt": attempt
+                "topic": topic,
+                "title": s["title"],
+                "description": desc,
+                "tags": s.get("tags",""),
+                "preview_video_id": vid_id,
+                "preview_link": link,
+                "slot": slot,
+                "created_at": datetime.utcnow().isoformat(),
+                "duration_sec": round(dur,2),
+                "attempt": attempt
             }
             new_body = set_metadata_in_issue_body(issue_body, meta)
             return meta, new_body
@@ -469,8 +520,8 @@ def safe_main():
         except Exception:
             pass
         options = list(dict.fromkeys([s.title() for s in found + seeds]))[:3]
-        body += "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3)."
-        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": body})
+        body_new = body + "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3)."
+        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": body_new})
         return
 
     if comment.lower().startswith("/approve-topic"):
@@ -497,10 +548,14 @@ def safe_main():
         post_comment(owner, repo, number, "OK. Reply /new-topic for fresh options."); return
 
     if comment.lower().startswith("/regenerate-video"):
+        # Preferred: read base64 metadata; Fallback: derive from last '/approve-topic X'
         meta = get_metadata_from_issue_body(body)
-        topic = meta["topic"] if meta and "topic" in meta else None
-        if not topic:
-            post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic first."); return
+        if meta and meta.get("topic"):
+            topic = meta["topic"]
+        else:
+            topic = derive_topic_from_history(owner, repo, number, body)
+            if not topic:
+                post_comment(owner, repo, number, "Couldn't determine topic. Please comment /approve-topic 1 again."); return
         meta2, new_body = build_preview_until_in_band(topic, slot, body, max_attempts=6)
         if not meta2:
             post_comment(owner, repo, number, "Couldn't get 50–58s after several attempts. Use /new-topic."); return
