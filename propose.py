@@ -17,6 +17,47 @@ def next_slot_ist():
         return datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, AFTERNOON_IST[0], AFTERNOON_IST[1], tzinfo=IST)
     return datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, MORNING_IST[0], MORNING_IST[1], tzinfo=IST)
 
+def gh(method, url, **kwargs):
+    headers = kwargs.pop("headers", {})
+    headers.update({"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept":"application/vnd.github+json"})
+    r = requests.request(method, url, headers=headers, timeout=60, **kwargs)
+    r.raise_for_status()
+    return r
+
+def ensure_labels(owner, repo, labels):
+    # labels: dict of name -> (color, description)
+    try:
+        existing = []
+        page = 1
+        while True:
+            r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/labels", params={"per_page": 100, "page": page})
+            arr = r.json()
+            if not isinstance(arr, list) or not arr:
+                break
+            existing += [lbl.get("name","") for lbl in arr if isinstance(lbl, dict)]
+            if len(arr) < 100:
+                break
+            page += 1
+    except Exception:
+        existing = []
+    for name, (color, desc) in labels.items():
+        if name in existing:
+            continue
+        try:
+            gh("POST", f"https://api.github.com/repos/{owner}/{repo}/labels",
+               json={"name": name, "color": color, "description": desc})
+        except requests.HTTPError as e:
+            # If it already exists (race) or validation quirks, ignore
+            if e.response is not None and e.response.status_code in (409, 422):
+                continue
+            raise
+
+def open_issues_with_labels(owner, repo, labels):
+    # Use params to ensure proper URL encoding (labels like "slot:morning")
+    r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues",
+           params={"state": "open", "labels": ",".join(labels)})
+    return r.json()
+
 def fetch_trending_candidates(region="IN", max_items=12):
     pt = TrendReq(hl="en-IN", tz=330)
     seeds = ["sleep","hydration","walking","steps","posture","stretching","mobility","stress","breathing","morning sunlight","protein","fiber","yoga","desk ergonomics","screen time","healthy snacks"]
@@ -51,15 +92,13 @@ def fetch_trending_candidates(region="IN", max_items=12):
         if len(out) >= max_items: break
     return out or ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine","Take more walking breaks","Easy stretch flow"]
 
-def open_issues_with_labels(owner, repo, labels):
-    label_q = ",".join(labels)
-    url = f"https://api.github.com/repos/{owner}/{repo}/issues?state=open&labels={label_q}"
-    r = requests.get(url, headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept":"application/vnd.github+json"}, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
 def create_topic_issue(owner, repo, topics, scheduled_ist):
     slot_label = f"slot:{SLOT}"
+    # Ensure labels exist to avoid 422 on issue creation
+    ensure_labels(owner, repo, {
+        "await-topic-approval": ("ededed", "Awaiting topic approval"),
+        slot_label: ("bfd4f2" if SLOT == "morning" else "c2e0c6", f"Issue for {SLOT} slot")
+    })
     title = f"Topic approval for {SLOT} slot ({scheduled_ist.strftime('%Y-%m-%d')} {scheduled_ist.strftime('%H:%M')} IST)"
     # Provide both numbered list and JSON metadata to make parsing robust
     body = f"""Proposed topics for tomorrow's {SLOT} slot.
@@ -80,21 +119,33 @@ Metadata:
 ```json
 {json.dumps({"slot": SLOT, "scheduled_ist": scheduled_ist.strftime('%Y-%m-%d %H:%M'), "topics": topics[:3]}, indent=2)}
 ```"""
-    url = f"https://api.github.com/repos/{owner}/{repo}/issues"
-    data = {"title": title, "body": body, "labels": ["await-topic-approval", slot_label]}
-    r = requests.post(url, headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept":"application/vnd.github+json"}, json=data, timeout=60)
-    r.raise_for_status()
+    gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
+       json={"title": title, "body": body, "labels": ["await-topic-approval", slot_label]})
 
 def main():
+    if not REPO or "/" not in REPO:
+        print("GITHUB_REPOSITORY not set. This workflow must run on GitHub Actions.")
+        return
+    if not GITHUB_TOKEN:
+        print("GITHUB_TOKEN not available. Ensure the workflow has 'issues: write' permission.")
+        return
     owner, repo = REPO.split("/")
-    open_slot = open_issues_with_labels(owner, repo, [f"slot:{SLOT}","await-topic-approval"])
-    if open_slot:
+    # Skip if an approval issue for this slot is already open
+    try:
+        open_slot = open_issues_with_labels(owner, repo, [f"slot:{SLOT}","await-topic-approval"])
+    except requests.HTTPError as e:
+        print("Failed to query issues:", e)
+        return
+    if isinstance(open_slot, list) and open_slot:
         print("An approval issue for this slot is already open. Skipping.")
         return
     topics = fetch_trending_candidates(REGION, max_items=12)[:3]
     scheduled_ist = next_slot_ist()
-    create_topic_issue(owner, repo, topics, scheduled_ist)
-    print("Created topic approval issue for", SLOT)
+    try:
+        create_topic_issue(owner, repo, topics, scheduled_ist)
+        print("Created topic approval issue for", SLOT)
+    except requests.HTTPError as e:
+        print("Failed to create issue:", e.response.text if e.response is not None else str(e))
 
 if __name__ == "__main__":
     main()
