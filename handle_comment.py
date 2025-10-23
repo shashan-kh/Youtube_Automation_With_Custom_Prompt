@@ -35,10 +35,7 @@ PREVIEW_MAX = 57.3
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def is_authorized_commenter(event):
-    """
-    Allow OWNER, MEMBER, COLLABORATOR or the repo owner login.
-    This makes commands work in org repos and for collaborators.
-    """
+    # Allow OWNER, MEMBER, COLLABORATOR or the repo owner login
     assoc = (event.get("comment", {}).get("author_association") or "").upper()
     commenter = event.get("comment", {}).get("user", {}).get("login", "")
     repo_owner = event.get("repository", {}).get("owner", {}).get("login", "")
@@ -78,17 +75,14 @@ def extract_json_block(text):
     return m.group(0) if m else None
 
 def parse_topics_from_body(body):
-    """
-    Prefer the latest numbered list under 'New topic options:' or 'Choose one:'.
-    Fallback to Metadata JSON topics; final fallback to any numbered lines.
-    """
+    # Prefer latest "New topic options:" or "Choose one:" block, else metadata JSON, else any numbered lines
     lines = body.splitlines()
 
     def collect_after_marker(marker):
         idxs = [i for i, l in enumerate(lines) if marker in l.lower()]
         if not idxs:
             return []
-        start = idxs[-1] + 1  # last occurrence
+        start = idxs[-1] + 1
         out = []
         for ln in lines[start:]:
             s = ln.strip()
@@ -98,23 +92,17 @@ def parse_topics_from_body(body):
                 break
             m = re.match(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])\s+(.*\S)", s)
             if not m:
-                if re.match(r"^[A-Z].*:$", s):
-                    break
-                if s.startswith("/"):
+                if re.match(r"^[A-Z].*:$", s) or s.startswith("/"):
                     break
                 continue
             out.append(m.group(1).strip())
         return out[:3]
 
-    # 1) Latest 'New topic options:'
     t = collect_after_marker("new topic options:")
-    if t:
-        return t
-    # 2) Latest 'Choose one:'
+    if t: return t
     t = collect_after_marker("choose one:")
-    if t:
-        return t
-    # 3) Metadata JSON topics
+    if t: return t
+
     try:
         block = extract_json_block(body)
         if block:
@@ -123,7 +111,7 @@ def parse_topics_from_body(body):
                 return [str(x).strip() for x in data["topics"] if str(x).strip()][:3]
     except Exception:
         pass
-    # 4) Any numbered lines (fallback)
+
     fallback = []
     for ln in lines:
         m = re.match(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])\s+(.*\S)", ln)
@@ -308,7 +296,7 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
     for p in local:
         c = VideoFileClip(p)
         take = min(8, max(4, int(c.duration)))
-        c = c.subclip(0, take).resize(height=target_h)  # pillow<10 via requirements fixes ANTIALIAS removal
+        c = c.subclip(0, take).resize(height=target_h)
         if c.w != target_w:
             c = c.crop(x_center=c.w/2, width=target_w, height=target_h)
         clips.append(c)
@@ -330,7 +318,7 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
             return d2
     return d
 
-# ---------- YouTube helpers (preview as UNLISTED; schedule by updating the same video) ----------
+# ---------- YouTube helpers ----------
 def yt_client():
     for v in ["YT_CLIENT_ID","YT_CLIENT_SECRET","YT_REFRESH_TOKEN"]:
         if not os.getenv(v):
@@ -373,7 +361,6 @@ def schedule_existing_video(video_id, slot):
     tomorrow_ist = datetime.now(IST).date() + timedelta(days=1)
     ist_dt = datetime(tomorrow_ist.year, tomorrow_ist.month, tomorrow_ist.day, (16 if slot == "afternoon" else 9), 0, tzinfo=IST)
     publish_at_utc = ist_dt.astimezone(timezone.utc).isoformat()
-
     body = {
         "id": video_id,
         "status": {
@@ -416,7 +403,6 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
 #Shorts #health #wellness"""
-            # Upload preview to YouTube as UNLISTED
             vid_id, link = upload_preview_youtube(final, s["title"], desc, s.get("tags",""))
             meta = {
                 "topic": topic,
@@ -458,7 +444,6 @@ def safe_main():
         except Exception:
             pass
         options = list(dict.fromkeys([s.title() for s in found + seeds]))[:3]
-        # Update metadata JSON topics as well to keep everything consistent
         try:
             meta = get_metadata_from_issue_body(body) or {}
         except Exception:
@@ -518,3 +503,30 @@ def safe_main():
         vid_id = meta["preview_video_id"]
         publish_at_utc = schedule_existing_video(vid_id, meta.get("slot","morning"))
         ist_time = datetime.fromisoformat(publish_at_utc.replace("Z","")).astimezone(IST).strftime("%Y-%m-%d %H:%M")
+        link = f"https://youtu.be/{vid_id}"
+        post_comment(owner, repo, number, f"Scheduled ✅ {link}\nPublishes at (IST): {ist_time}\nClosing this thread.")
+        remove_label(owner, repo, number, "await-video-approval")
+        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"state":"closed"})
+        return
+
+def main():
+    try:
+        safe_main()
+    except Exception as e:
+        try:
+            e_json = ev()
+            owner, repo = REPO.split("/")
+            issue = e_json["issue"]; number = issue["number"]
+            avail = list_groq_models()
+            addendum = ""
+            if avail:
+                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
+            msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
+            post_comment(owner, repo, number, msg)
+        except Exception:
+            print("FATAL:", e)
+            print(traceback.format_exc())
+        return
+
+if __name__ == "__main__":
+    main()
