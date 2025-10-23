@@ -465,4 +465,56 @@ def safe_main():
             meta = {}
         meta["topics"] = options
         new_body = set_metadata_in_issue_body(body, meta)
-        new_body += "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + 
+        new_body += "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3)."
+        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
+        return
+
+    if comment.lower().startswith("/approve-topic"):
+        topics = parse_topics_from_body(body)
+        if not topics:
+            post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Please reply /new-topic to get fresh options.")
+            return
+        parts = comment.split()
+        idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+        if not (1 <= idx <= len(topics)):
+            post_comment(owner, repo, number, "Invalid index. Use 1/2/3.\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(topics[:3])]))
+            return
+        topic = topics[idx-1]
+        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
+        if not meta:
+            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Reply /new-topic for different topics.")
+            return
+        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
+        add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
+        post_comment(owner, repo, number, f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\nReply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n- /reject-video (pick a new topic)")
+        return
+
+    if comment.lower().startswith("/reject-video"):
+        add_label(owner, repo, number, "await-topic-approval")
+        remove_label(owner, repo, number, "await-video-approval")
+        post_comment(owner, repo, number, "OK. Reply /new-topic for fresh options.")
+        return
+
+    if comment.lower().startswith("/regenerate-video"):
+        meta = get_metadata_from_issue_body(body)
+        topic = meta["topic"] if meta and "topic" in meta else None
+        if not topic:
+            post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic first.")
+            return
+        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
+        if not meta2:
+            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Use /new-topic.")
+            return
+        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
+        add_label(owner, repo, number, "await-video-approval")
+        post_comment(owner, repo, number, f"New preview ready (attempt {meta2['attempt']}, {meta2['duration_sec']}s): {meta2['preview_link']}\nReply /approve-video to schedule.")
+        return
+
+    if comment.lower().startswith("/approve-video"):
+        meta = get_metadata_from_issue_body(body)
+        if not meta or "preview_video_id" not in meta:
+            post_comment(owner, repo, number, "No preview video found. Please /regenerate-video.")
+            return
+        vid_id = meta["preview_video_id"]
+        publish_at_utc = schedule_existing_video(vid_id, meta.get("slot","morning"))
+        ist_time = datetime.fromisoformat(publish_at_utc.replace("Z","")).astimezone(IST).strftime("%Y-%m-%d %H:%M")
