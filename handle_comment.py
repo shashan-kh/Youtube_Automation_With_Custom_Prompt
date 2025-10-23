@@ -388,7 +388,8 @@ def get_metadata_from_issue_body(issue_body):
 def set_metadata_in_issue_body(issue_body, meta):
     block = "```json\n" + json.dumps(meta, indent=2) + "\n```"
     if "```json" in issue_body:
-        return re.sub(r"```json\s*\{.*?\}\s*```", block, issue_body, flags=re.S)
+        # Use callable replacement to avoid interpreting backslashes like \u in JSON
+        return re.sub(r"```json\s*\{.*?\}\s*```", lambda m: block, issue_body, flags=re.S)
     return issue_body + "\n\nMetadata:\n" + block
 
 def extract_youtube_id(text):
@@ -510,45 +511,66 @@ def safe_main():
         except Exception:
             pass
         options = list(dict.fromkeys([s.title() for s in found + seeds]))[:3]
-        # Update metadata JSON topics as well to keep everything consistent
         try:
             meta = get_metadata_from_issue_body(body) or {}
         except Exception:
             meta = {}
         meta["topics"] = options
         new_body = set_metadata_in_issue_body(body, meta)
-        new_body += "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3)."
+        new_body += "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3), or provide your own with:\n/custom-topic Your Topic"
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
-        # Ensure labels reflect we're waiting for a topic
         add_label(owner, repo, number, "await-topic-approval")
         remove_label(owner, repo, number, "await-video-approval")
-        # Also post a comment with the options so it's visible in the thread
-        post_comment(owner, repo, number, "New topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3).")
+        post_comment(owner, repo, number, "New topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3)\nOr provide your own topic with:\n/custom-topic Your Topic")
+        return
+
+    if comment.lower().startswith("/custom-topic"):
+        topic = comment[len("/custom-topic"):].strip()
+        if not topic:
+            post_comment(owner, repo, number, "Please provide a topic. Example:\n/custom-topic Morning hydration habit")
+            return
+        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
+        if not meta:
+            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Try a simpler topic or /new-topic.")
+            return
+        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
+        add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
+        post_preview_comment(owner, repo, number, meta, slot)
         return
 
     if comment.lower().startswith("/approve-topic"):
         topics = parse_topics_from_body(body)
-        if not topics:
-            post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Please reply /new-topic to get fresh options.")
-            return
-        parts = comment.split()
-        idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
-        if not (1 <= idx <= len(topics)):
-            post_comment(owner, repo, number, "Invalid index. Use 1/2/3.\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(topics[:3])]))
-            return
-        topic = topics[idx-1]
+        parts = comment.split(maxsplit=1)
+        topic = None
+        # If second argument is a number, use indexed topic; otherwise treat the remainder as custom topic
+        if len(parts) > 1:
+            arg = parts[1].strip()
+            if arg.isdigit():
+                idx = int(arg)
+                if not topics or not (1 <= idx <= len(topics)):
+                    post_comment(owner, repo, number, "Invalid index. Use 1/2/3, or provide your own with:\n/custom-topic Your Topic")
+                    return
+                topic = topics[idx-1]
+            else:
+                # custom topic via /approve-topic Your Topic
+                topic = arg
+        else:
+            # default to 1 if available
+            if not topics:
+                post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Use /new-topic or /custom-topic Your Topic.")
+                return
+            topic = topics[0]
+
         meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Reply /new-topic for different topics.")
+            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Reply /new-topic or /custom-topic Your Topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
-        # Post preview comment with hidden marker
         post_preview_comment(owner, repo, number, meta, slot)
         return
 
     if comment.lower().startswith("/reject-video"):
-        # Try to delete the unlisted preview from YouTube if present
         vid_id = find_preview_video_id(owner, repo, number, body)
         deletion_msg = ""
         if vid_id:
@@ -559,8 +581,6 @@ def safe_main():
                 deletion_msg = f"Couldn't delete preview on YouTube (ID: {vid_id}): {de}"
         else:
             deletion_msg = "No preview video ID found (looked in metadata, body, and recent comments)."
-
-        # Clean preview-related metadata
         try:
             meta = get_metadata_from_issue_body(body) or {}
             for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic"]:
@@ -570,31 +590,27 @@ def safe_main():
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         except Exception as e2:
             deletion_msg += f"\nMetadata cleanup error: {e2}"
-
-        # Reset labels and prompt for new topics
         add_label(owner, repo, number, "await-topic-approval")
         remove_label(owner, repo, number, "await-video-approval")
-        post_comment(owner, repo, number, f"{deletion_msg}\nOK. Reply /new-topic for fresh options.")
+        post_comment(owner, repo, number, f"{deletion_msg}\nOK. Reply /new-topic for fresh options or /custom-topic Your Topic.")
         return
 
     if comment.lower().startswith("/regenerate-video"):
         meta = get_metadata_from_issue_body(body)
         topic = meta["topic"] if meta and "topic" in meta else None
         if not topic:
-            post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic first.")
+            post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic or /custom-topic first.")
             return
         meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
         if not meta2:
-            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Use /new-topic.")
+            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Use /new-topic or /custom-topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval")
-        # Post new preview comment with hidden marker
         post_preview_comment(owner, repo, number, meta2, slot)
         return
 
     if comment.lower().startswith("/approve-video"):
-        # Fallback to recover ID from body/comments if missing in metadata
         vid_id = None
         meta = get_metadata_from_issue_body(body)
         if meta and "preview_video_id" in meta:
