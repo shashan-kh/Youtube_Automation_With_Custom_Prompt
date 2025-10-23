@@ -1,4 +1,4 @@
-import os, re, json, requests
+import os, re, json, requests, sys
 from datetime import datetime, timedelta, timezone
 from pytrends.request import TrendReq
 
@@ -6,10 +6,15 @@ REGION = os.getenv("REGION", "IN")
 SLOT = os.getenv("SLOT", "morning")  # morning or afternoon
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")  # owner/repo
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
 IST = timezone(timedelta(hours=5, minutes=30))
 MORNING_IST = (9, 0)    # 09:00
 AFTERNOON_IST = (16, 0) # 16:00
+
+def log(*args):
+    if DEBUG:
+        print("[propose]", *args)
 
 def next_slot_ist():
     tomorrow_ist = datetime.now(IST).date() + timedelta(days=1)
@@ -20,7 +25,13 @@ def next_slot_ist():
 def gh(method, url, **kwargs):
     headers = kwargs.pop("headers", {})
     headers.update({"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept":"application/vnd.github+json"})
+    if DEBUG and method != "GET":
+        log("HTTP", method, url, "payload:", kwargs.get("json") or kwargs.get("data"))
     r = requests.request(method, url, headers=headers, timeout=60, **kwargs)
+    if DEBUG:
+        log("HTTP", method, url, "->", r.status_code)
+        if r.status_code >= 400:
+            log("Response body:", r.text[:1000])
     r.raise_for_status()
     return r
 
@@ -38,7 +49,9 @@ def ensure_labels(owner, repo, labels):
             if len(arr) < 100:
                 break
             page += 1
-    except Exception:
+        log("Existing labels:", existing)
+    except Exception as e:
+        log("Failed to list labels:", e)
         existing = []
     for name, (color, desc) in labels.items():
         if name in existing:
@@ -46,17 +59,33 @@ def ensure_labels(owner, repo, labels):
         try:
             gh("POST", f"https://api.github.com/repos/{owner}/{repo}/labels",
                json={"name": name, "color": color, "description": desc})
+            log("Created label:", name)
         except requests.HTTPError as e:
-            # If it already exists (race) or validation quirks, ignore
-            if e.response is not None and e.response.status_code in (409, 422):
+            code = e.response.status_code if e.response is not None else None
+            if code in (409, 422):
+                log("Label already exists or validation issue (ok):", name, code)
                 continue
             raise
 
 def open_issues_with_labels(owner, repo, labels):
     # Use params to ensure proper URL encoding (labels like "slot:morning")
     r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues",
-           params={"state": "open", "labels": ",".join(labels)})
-    return r.json()
+           params={"state": "open", "labels": ",".join(labels), "per_page": 100})
+    items = r.json()
+    if not isinstance(items, list):
+        log("Unexpected issues response:", items)
+        return []
+    # Filter out PRs and double-check label inclusion
+    wanted = set(labels)
+    issues = []
+    for it in items:
+        if "pull_request" in it:
+            continue  # we only care about issues, not PRs
+        names = {lbl.get("name","") for lbl in it.get("labels", []) if isinstance(lbl, dict)}
+        if wanted.issubset(names):
+            issues.append(it)
+    log(f"Open issues with labels {labels}:", [(i.get('number'), i.get('title')) for i in issues])
+    return issues
 
 def fetch_trending_candidates(region="IN", max_items=12):
     pt = TrendReq(hl="en-IN", tz=330)
@@ -69,8 +98,8 @@ def fetch_trending_candidates(region="IN", max_items=12):
             for t in df["title"].tolist():
                 if isinstance(t, str) and not banned.search(t) and any(w in t.lower() for w in ["sleep","diet","workout","walk","steps","hydrate","posture","stress","breath","sunlight","healthy","fitness","yoga"]):
                     found.append(t)
-    except Exception:
-        pass
+    except Exception as e:
+        log("pytrends realtime_trending_searches error:", e)
     for s in seeds:
         try:
             pt.build_payload([s], timeframe="now 1-d", geo=region)
@@ -82,7 +111,8 @@ def fetch_trending_candidates(region="IN", max_items=12):
                     for q in df2.head(10)["query"].tolist():
                         if isinstance(q, str) and not banned.search(q):
                             found.append(q)
-        except Exception:
+        except Exception as e:
+            log(f"pytrends related_queries error for seed '{s}':", e)
             continue
     out, seen = [], set()
     for q in found:
@@ -90,7 +120,9 @@ def fetch_trending_candidates(region="IN", max_items=12):
         if key not in seen:
             seen.add(key); out.append(q.strip())
         if len(out) >= max_items: break
-    return out or ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine","Take more walking breaks","Easy stretch flow"]
+    final = out or ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine","Take more walking breaks","Easy stretch flow"]
+    log("Candidate topics:", final[:3])
+    return final
 
 def create_topic_issue(owner, repo, topics, scheduled_ist):
     slot_label = f"slot:{SLOT}"
@@ -100,7 +132,6 @@ def create_topic_issue(owner, repo, topics, scheduled_ist):
         slot_label: ("bfd4f2" if SLOT == "morning" else "c2e0c6", f"Issue for {SLOT} slot")
     })
     title = f"Topic approval for {SLOT} slot ({scheduled_ist.strftime('%Y-%m-%d')} {scheduled_ist.strftime('%H:%M')} IST)"
-    # Provide both numbered list and JSON metadata to make parsing robust
     body = f"""Proposed topics for tomorrow's {SLOT} slot.
 Scheduled publish (IST): {scheduled_ist.strftime('%Y-%m-%d %H:%M')}.
 
@@ -119,18 +150,21 @@ Metadata:
 ```json
 {json.dumps({"slot": SLOT, "scheduled_ist": scheduled_ist.strftime('%Y-%m-%d %H:%M'), "topics": topics[:3]}, indent=2)}
 ```"""
+    log("Creating issue:", title)
     gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
        json={"title": title, "body": body, "labels": ["await-topic-approval", slot_label]})
 
 def main():
+    log("Region:", REGION, "| Slot:", SLOT, "| Repo:", REPO)
     if not REPO or "/" not in REPO:
         print("GITHUB_REPOSITORY not set. This workflow must run on GitHub Actions.")
         return
     if not GITHUB_TOKEN:
         print("GITHUB_TOKEN not available. Ensure the workflow has 'issues: write' permission.")
         return
+
     owner, repo = REPO.split("/")
-    # Skip if an approval issue for this slot is already open
+    # Skip if an approval issue for this slot is already open (ISSUES ONLY; PRs ignored)
     try:
         open_slot = open_issues_with_labels(owner, repo, [f"slot:{SLOT}","await-topic-approval"])
     except requests.HTTPError as e:
@@ -139,6 +173,7 @@ def main():
     if isinstance(open_slot, list) and open_slot:
         print("An approval issue for this slot is already open. Skipping.")
         return
+
     topics = fetch_trending_candidates(REGION, max_items=12)[:3]
     scheduled_ist = next_slot_ist()
     try:
