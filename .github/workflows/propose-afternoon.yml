@@ -31,7 +31,8 @@ jobs:
           REGION: IN
           SLOT: afternoon
           DEBUG: "1"
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Use the built-in token; more reliable than secrets.GITHUB_TOKEN
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           echo "GITHUB_REPOSITORY=$GITHUB_REPOSITORY"
           python propose.py
