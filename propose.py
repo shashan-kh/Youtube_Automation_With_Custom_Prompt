@@ -51,7 +51,7 @@ def ensure_labels(owner, repo, labels):
             page += 1
         log("Existing labels:", existing)
     except Exception as e:
-        log("Failed to list labels:", e)
+        log("Failed to list labels (will try creating anyway):", e)
         existing = []
     for name, (color, desc) in labels.items():
         if name in existing:
@@ -62,10 +62,9 @@ def ensure_labels(owner, repo, labels):
             log("Created label:", name)
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else None
-            if code in (409, 422):
-                log("Label already exists or validation issue (ok):", name, code)
-                continue
-            raise
+            # If we can't create labels (permissions) we'll still try creating the issue below.
+            log("Failed to create label:", name, code, e.response.text[:500] if e.response is not None else "")
+            continue
 
 def open_issues_with_labels(owner, repo, labels):
     # Use params to ensure proper URL encoding (labels like "slot:morning")
@@ -126,7 +125,7 @@ def fetch_trending_candidates(region="IN", max_items=12):
 
 def create_topic_issue(owner, repo, topics, scheduled_ist):
     slot_label = f"slot:{SLOT}"
-    # Ensure labels exist to avoid 422 on issue creation
+    # Try to ensure labels (ignore failures; we'll fall back if needed)
     ensure_labels(owner, repo, {
         "await-topic-approval": ("ededed", "Awaiting topic approval"),
         slot_label: ("bfd4f2" if SLOT == "morning" else "c2e0c6", f"Issue for {SLOT} slot")
@@ -150,9 +149,20 @@ Metadata:
 ```json
 {json.dumps({"slot": SLOT, "scheduled_ist": scheduled_ist.strftime('%Y-%m-%d %H:%M'), "topics": topics[:3]}, indent=2)}
 ```"""
-    log("Creating issue:", title)
-    resp = gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
-              json={"title": title, "body": body, "labels": ["await-topic-approval", slot_label]})
+    payload = {"title": title, "body": body, "labels": ["await-topic-approval", slot_label]}
+    log("Creating issue (with labels):", title)
+    try:
+        resp = gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues", json=payload)
+    except requests.HTTPError as e:
+        code = e.response.status_code if e.response is not None else None
+        text = e.response.text if e.response is not None else str(e)
+        # If labels cause 422 (labels don't exist), retry without labels
+        if code == 422 and "label" in text.lower():
+            log("Label validation failed (422). Retrying without labels.")
+            resp = gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
+                      json={"title": title, "body": body})
+        else:
+            raise
     data = resp.json()
     url = data.get("html_url")
     number = data.get("number")
@@ -170,21 +180,17 @@ def main():
 
     owner, repo = REPO.split("/")
 
-    # Inspect repo, issues availability, and token permissions
+    # Soft-check repository info (don't abort on missing granular permissions field)
     try:
         info = gh("GET", f"https://api.github.com/repos/{owner}/{repo}").json()
         has_issues = bool(info.get("has_issues", True))
         perms = info.get("permissions", {})
-        log("Repo has_issues:", has_issues, "| token permissions:", perms)
+        log("Repo has_issues:", has_issues, "| token permissions field:", perms)
         if not has_issues:
             print("Issues are disabled on this repository. Enable Issues in Settings.")
             sys.exit(3)
-        if perms and not perms.get("issues", False):
-            print("This GITHUB_TOKEN does not have 'issues' permission. Check Actions → Workflow permissions and this job's 'permissions: issues: write'.")
-            sys.exit(3)
     except requests.HTTPError as e:
-        print("Failed to read repo info:", e)
-        # Continue; sometimes permissions field not returned for app tokens
+        log("Failed to read repo info (continuing):", e)
 
     # Skip if an approval issue for this slot is already open (ISSUES ONLY; PRs ignored)
     try:
@@ -202,7 +208,13 @@ def main():
         create_topic_issue(owner, repo, topics, scheduled_ist)
     except requests.HTTPError as e:
         body = e.response.text if e.response is not None else str(e)
-        print("Failed to create issue:", body)
+        # Helpful hints for common 403 cases
+        if e.response is not None and e.response.status_code == 403:
+            print("Failed to create issue (403 Forbidden).")
+            print("Check: Actions → General → Workflow permissions set to 'Read and write',")
+            print("and that this workflow/job has 'permissions: issues: write'.")
+        else:
+            print("Failed to create issue:", body)
         sys.exit(5)
 
 if __name__ == "__main__":
