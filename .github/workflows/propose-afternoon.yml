@@ -30,6 +30,7 @@ jobs:
         env:
           REGION: IN
           SLOT: afternoon
+          DEBUG: "1"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "GITHUB_REPOSITORY=$GITHUB_REPOSITORY"
