@@ -2,9 +2,8 @@ name: propose-morning
 
 on:
   workflow_dispatch:          # manual runs
-  push:                       # helps GitHub detect it on master
-    branches:
-      - master
+  push:                       # also run on push to default branches
+    branches: [main, master]
     paths:
       - ".github/workflows/propose-morning.yml"
       - "propose.py"
@@ -32,4 +31,6 @@ jobs:
           REGION: IN
           SLOT: morning
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python propose.py
+        run: |
+          echo "GITHUB_REPOSITORY=$GITHUB_REPOSITORY"
+          python propose.py
