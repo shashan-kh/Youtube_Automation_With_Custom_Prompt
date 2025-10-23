@@ -34,6 +34,16 @@ SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","moveme
 PREVIEW_MAX = 57.3
 IST = timezone(timedelta(hours=5, minutes=30))
 
+def is_authorized_commenter(event):
+    """
+    Allow OWNER, MEMBER, COLLABORATOR or the repo owner login.
+    This makes commands work in org repos and for collaborators.
+    """
+    assoc = (event.get("comment", {}).get("author_association") or "").upper()
+    commenter = event.get("comment", {}).get("user", {}).get("login", "")
+    repo_owner = event.get("repository", {}).get("owner", {}).get("login", "")
+    return assoc in {"OWNER", "MEMBER", "COLLABORATOR"} or commenter == repo_owner
+
 def gh(method, url, **kwargs):
     headers = kwargs.pop("headers", {})
     headers.update({"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept":"application/vnd.github+json"})
@@ -68,40 +78,58 @@ def extract_json_block(text):
     return m.group(0) if m else None
 
 def parse_topics_from_body(body):
-    # 1) JSON metadata with topics
+    """
+    Prefer the latest numbered list under 'New topic options:' or 'Choose one:'.
+    Fallback to Metadata JSON topics; final fallback to any numbered lines.
+    """
+    lines = body.splitlines()
+
+    def collect_after_marker(marker):
+        idxs = [i for i, l in enumerate(lines) if marker in l.lower()]
+        if not idxs:
+            return []
+        start = idxs[-1] + 1  # last occurrence
+        out = []
+        for ln in lines[start:]:
+            s = ln.strip()
+            if not s:
+                break
+            if "reply with" in s.lower():
+                break
+            m = re.match(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])\s+(.*\S)", s)
+            if not m:
+                if re.match(r"^[A-Z].*:$", s):
+                    break
+                if s.startswith("/"):
+                    break
+                continue
+            out.append(m.group(1).strip())
+        return out[:3]
+
+    # 1) Latest 'New topic options:'
+    t = collect_after_marker("new topic options:")
+    if t:
+        return t
+    # 2) Latest 'Choose one:'
+    t = collect_after_marker("choose one:")
+    if t:
+        return t
+    # 3) Metadata JSON topics
     try:
         block = extract_json_block(body)
         if block:
             data = json.loads(block)
             if isinstance(data, dict) and isinstance(data.get("topics"), list) and data["topics"]:
-                return [str(t).strip() for t in data["topics"] if str(t).strip()][:3]
+                return [str(x).strip() for x in data["topics"] if str(x).strip()][:3]
     except Exception:
         pass
-    # 2) Numbered/bulleted lines
-    topics = []
-    for line in body.splitlines():
-        m = re.match(r"\s*(?:[-*•]\s*)?(\d+)[\)\.\-:]\s+(.*\S)", line)
-        if m:
-            topics.append(m.group(2).strip())
-    if topics:
-        return topics[:3]
-    # 3) Lines after "Choose one:" until "Reply with"
-    lines = body.splitlines()
-    cleaned, flag = [], False
+    # 4) Any numbered lines (fallback)
+    fallback = []
     for ln in lines:
-        if not flag and "Choose one" in ln:
-            flag = True
-            continue
-        if flag:
-            s_ln = ln.strip()
-            if not s_ln or s_ln.lower().startswith("reply with"):
-                break
-            s = re.sub(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])?\s*", "", s_ln).strip()
-            if s:
-                cleaned.append(s)
-    if cleaned:
-        return cleaned[:3]
-    return []
+        m = re.match(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])\s+(.*\S)", ln)
+        if m:
+            fallback.append(m.group(1).strip())
+    return fallback[:3]
 
 def get_slot_from_labels(labels):
     for lbl in labels or []:
@@ -357,99 +385,6 @@ def schedule_existing_video(video_id, slot):
     yt.videos().update(part="status", body=body).execute()
     return publish_at_utc
 
-# ---------- Groq LLM ----------
-def build_model_list():
-    env_models = []
-    if GROQ_MODEL:
-        env_models.append(GROQ_MODEL)
-    if GROQ_FALLBACK_MODELS_ENV:
-        env_models.extend([m.strip() for m in GROQ_FALLBACK_MODELS_ENV.split(",") if m.strip()])
-    # De-dup
-    seen = set(); env_models = [m for m in env_models if not (m in seen or seen.add(m))]
-    available = list_groq_models()
-    if not available:
-        return env_models if env_models else [DEFAULT_PRIMARY] + DEFAULT_FALLBACKS
-    ordered = [m for m in env_models if m in available]
-    patterns = [
-        r"^qwen.*32b", r"^qwen.*14b", r"^qwen.*7b",
-        r"llama-3\.3.*versatile", r"llama-3\.1.*instant",
-        r"openai/gpt-oss-120b", r"openai/gpt-oss-20b",
-        r"groq/compound-mini", r"groq/compound",
-        r"moonshotai/kimi-k2-instruct"
-    ]
-    for pat in patterns:
-        rx = re.compile(pat, re.I)
-        for mid in available:
-            if rx.search(mid) and mid not in ordered:
-                ordered.append(mid)
-    for mid in available:
-        if mid not in ordered:
-            ordered.append(mid)
-    return ordered[:10]
-
-def list_groq_models():
-    try:
-        r = requests.get("https://api.groq.com/openai/v1/models",
-                         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                         timeout=60)
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            return [d.get("id") for d in data if isinstance(d, dict) and d.get("id")]
-    except Exception:
-        pass
-    return []
-
-def llm_script(trending_query, word_hint="90–105"):
-    if not GROQ_API_KEY:
-        raise RuntimeError("Missing GROQ_API_KEY secret")
-    prompt = f"""
-You are a careful health educator. Create a strictly under-58s YouTube Short based on this trending query:
-"{trending_query}"
-
-Rules:
-- General wellness only (sleep, hydration, movement, posture, stress, basic nutrition).
-- No disease claims, diagnoses, dosages, or supplement promises. Avoid COVID/vaccines.
-- If the query is unsafe/specific (e.g., drugs/diseases), pivot to a safe, related habit.
-- Style: energetic, plain language, second-person; target {word_hint} words.
-
-Output pure JSON with:
-- voiceover: string
-- overlay_lines: array of 7–9 short lines (4–7 words each) for captions
-- title: catchy, <=90 chars, include #Shorts
-- description: 2–3 sentences + “Educational only, not medical advice.” + 1 credible source (WHO/CDC/NIH/NHS)
-- tags: 6–10 comma-separated general tags
-"""
-    models_to_try = build_model_list()
-    last_err = None
-    for model in models_to_try:
-        r = call_groq(prompt, model)
-        if r.status_code == 200:
-            raw = r.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            if not raw:
-                last_err = RuntimeError(f"Groq '{model}' returned empty content")
-                continue
-            block = extract_json_block(raw) or raw
-            try:
-                data = json.loads(block)
-                if isinstance(data.get("tags"), list):
-                    data["tags"] = ",".join(data["tags"])
-                return data
-            except Exception as e:
-                last_err = RuntimeError(f"Failed to parse LLM JSON from '{model}': {e}\nRaw: {raw[:500]}")
-                continue
-        else:
-            try:
-                errj = r.json()
-            except Exception:
-                errj = {"error": {"message": r.text}}
-            msg = str(errj.get("error", {}).get("message", r.text))
-            last_err = RuntimeError(f"Groq model '{model}' failed: {msg}")
-            continue
-    avail = list_groq_models()
-    if avail:
-        raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS to one of the above.")
-    raise last_err or RuntimeError("Groq call failed; no models available to try")
-
 # ---------- Build preview and schedule ----------
 def upload_preview_youtube(video_path, title, description, tags):
     vid_id, link = upload_youtube_unlisted(video_path, title, description, tags)
@@ -503,10 +438,8 @@ def safe_main():
     e = ev()
     owner, repo = REPO.split("/")
     issue = e["issue"]; number = issue["number"]
-    commenter = e["comment"]["user"]["login"]
-    repo_owner = e["repository"]["owner"]["login"]
-    if commenter != repo_owner:
-        print("Ignoring comment from non-owner")
+    if not is_authorized_commenter(e):
+        print("Ignoring comment from non-collaborator/owner")
         return
     comment = e["comment"]["body"].strip()
     body = issue["body"]
@@ -525,84 +458,11 @@ def safe_main():
         except Exception:
             pass
         options = list(dict.fromkeys([s.title() for s in found + seeds]))[:3]
-        body += "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3)."
-        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": body})
-        return
-
-    if comment.lower().startswith("/approve-topic"):
-        topics = parse_topics_from_body(body)
-        if not topics:
-            post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Please reply /new-topic to get fresh options.")
-            return
-        parts = comment.split()
-        idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
-        if not (1 <= idx <= len(topics)):
-            post_comment(owner, repo, number, "Invalid index. Use 1/2/3.\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(topics[:3])]))
-            return
-        topic = topics[idx-1]
-        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
-        if not meta:
-            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Reply /new-topic for different topics.")
-            return
-        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
-        add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
-        post_comment(owner, repo, number, f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\nReply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n- /reject-video (pick a new topic)")
-        return
-
-    if comment.lower().startswith("/reject-video"):
-        add_label(owner, repo, number, "await-topic-approval")
-        remove_label(owner, repo, number, "await-video-approval")
-        post_comment(owner, repo, number, "OK. Reply /new-topic for fresh options.")
-        return
-
-    if comment.lower().startswith("/regenerate-video"):
-        meta = get_metadata_from_issue_body(body)
-        topic = meta["topic"] if meta and "topic" in meta else None
-        if not topic:
-            post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic first.")
-            return
-        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
-        if not meta2:
-            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Use /new-topic.")
-            return
-        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
-        add_label(owner, repo, number, "await-video-approval")
-        post_comment(owner, repo, number, f"New preview ready (attempt {meta2['attempt']}, {meta2['duration_sec']}s): {meta2['preview_link']}\nReply /approve-video to schedule.")
-        return
-
-    if comment.lower().startswith("/approve-video"):
-        meta = get_metadata_from_issue_body(body)
-        if not meta or "preview_video_id" not in meta:
-            post_comment(owner, repo, number, "No preview video found. Please /regenerate-video.")
-            return
-        vid_id = meta["preview_video_id"]
-        publish_at_utc = schedule_existing_video(vid_id, meta.get("slot","morning"))
-        ist_time = datetime.fromisoformat(publish_at_utc.replace("Z","")).astimezone(IST).strftime("%Y-%m-%d %H:%M")
-        link = f"https://youtu.be/{vid_id}"
-        post_comment(owner, repo, number, f"Scheduled ✅ {link}\nPublishes at (IST): {ist_time}\nClosing this thread.")
-        remove_label(owner, repo, number, "await-video-approval")
-        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"state":"closed"})
-        return
-
-def main():
-    try:
-        safe_main()
-    except Exception as e:
+        # Update metadata JSON topics as well to keep everything consistent
         try:
-            e_json = ev()
-            owner, repo = REPO.split("/")
-            issue = e_json["issue"]; number = issue["number"]
-            # Show available models to help configure
-            avail = list_groq_models()
-            addendum = ""
-            if avail:
-                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
-            msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
-            post_comment(owner, repo, number, msg)
+            meta = get_metadata_from_issue_body(body) or {}
         except Exception:
-            print("FATAL:", e)
-            print(traceback.format_exc())
-        return
-
-if __name__ == "__main__":
-    main()
+            meta = {}
+        meta["topics"] = options
+        new_body = set_metadata_in_issue_body(body, meta)
+        new_body += "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + 
