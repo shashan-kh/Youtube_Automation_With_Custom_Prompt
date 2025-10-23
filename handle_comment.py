@@ -376,7 +376,7 @@ def yt_delete_video(video_id):
     yt = yt_client()
     yt.videos().delete(id=video_id).execute()
 
-# ---------- Build preview and schedule ----------
+# ---------- Metadata helpers ----------
 def upload_preview_youtube(video_path, title, description, tags):
     vid_id, link = upload_youtube_unlisted(video_path, title, description, tags)
     return vid_id, link
@@ -391,6 +391,68 @@ def set_metadata_in_issue_body(issue_body, meta):
         return re.sub(r"```json\s*\{.*?\}\s*```", block, issue_body, flags=re.S)
     return issue_body + "\n\nMetadata:\n" + block
 
+def extract_youtube_id(text):
+    if not text:
+        return None
+    # Hidden marker takes precedence
+    m = re.search(r"<!--\s*preview_video_id:\s*([A-Za-z0-9_-]{11})\s*-->", text)
+    if m:
+        return m.group(1)
+    # youtu.be/<id>
+    m = re.search(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]{11})", text)
+    if m:
+        return m.group(1)
+    # youtube.com/watch?v=<id>
+    m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?[^ \n\r]*v=([A-Za-z0-9_-]{11})", text)
+    if m:
+        return m.group(1)
+    # youtube.com/shorts/<id>
+    m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", text)
+    if m:
+        return m.group(1)
+    return None
+
+def find_preview_video_id(owner, repo, number, issue_body):
+    # 1) Metadata block
+    try:
+        meta = get_metadata_from_issue_body(issue_body) or {}
+        if "preview_video_id" in meta and meta["preview_video_id"]:
+            return meta["preview_video_id"]
+        if "preview_link" in meta and meta["preview_link"]:
+            vid = extract_youtube_id(meta["preview_link"])
+            if vid:
+                return vid
+    except Exception:
+        pass
+    # 2) Scan body text for hidden marker or YouTube links
+    vid = extract_youtube_id(issue_body)
+    if vid:
+        return vid
+    # 3) Scan recent comments (latest first)
+    try:
+        r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments", params={"per_page": 100})
+        comments = r.json()
+        if isinstance(comments, list):
+            for c in reversed(comments):
+                body = c.get("body", "") or ""
+                vid = extract_youtube_id(body)
+                if vid:
+                    return vid
+    except Exception:
+        pass
+    return None
+
+def post_preview_comment(owner, repo, number, meta, slot):
+    # Include a hidden marker so we can always retrieve the ID later
+    msg = (
+        f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\n"
+        f"Reply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n"
+        f"- /reject-video (delete preview and pick a new topic)\n\n"
+        f"<!-- preview_video_id: {meta['preview_video_id']} -->"
+    )
+    post_comment(owner, repo, number, msg)
+
+# ---------- Build preview and schedule ----------
 def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
     word_targets = ["90–105","75–90","60–75","55–65","50–60"]
     for attempt in range(1, max_attempts+1):
@@ -481,31 +543,34 @@ def safe_main():
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
-        post_comment(owner, repo, number, f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\nReply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n- /reject-video (delete preview and pick a new topic)")
+        # Post preview comment with hidden marker
+        post_preview_comment(owner, repo, number, meta, slot)
         return
 
     if comment.lower().startswith("/reject-video"):
         # Try to delete the unlisted preview from YouTube if present
+        vid_id = find_preview_video_id(owner, repo, number, body)
         deletion_msg = ""
+        if vid_id:
+            try:
+                yt_delete_video(vid_id)
+                deletion_msg = f"Deleted unlisted preview video (ID: {vid_id})."
+            except Exception as de:
+                deletion_msg = f"Couldn't delete preview on YouTube (ID: {vid_id}): {de}"
+        else:
+            deletion_msg = "No preview video ID found (looked in metadata, body, and recent comments)."
+
+        # Clean preview-related metadata
         try:
             meta = get_metadata_from_issue_body(body) or {}
-            vid_id = meta.get("preview_video_id")
-            if vid_id:
-                try:
-                    yt_delete_video(vid_id)
-                    deletion_msg = f"Deleted unlisted preview video (ID: {vid_id})."
-                except Exception as de:
-                    deletion_msg = f"Couldn't delete preview on YouTube (ID: {vid_id}): {de}"
-            else:
-                deletion_msg = "No preview video ID found in metadata."
-            # Clean preview-related metadata
             for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic"]:
                 if k in meta:
                     del meta[k]
             new_body = set_metadata_in_issue_body(body, meta)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         except Exception as e2:
-            deletion_msg = f"Cleanup encountered an error: {e2}"
+            deletion_msg += f"\nMetadata cleanup error: {e2}"
+
         # Reset labels and prompt for new topics
         add_label(owner, repo, number, "await-topic-approval")
         remove_label(owner, repo, number, "await-video-approval")
@@ -524,16 +589,22 @@ def safe_main():
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval")
-        post_comment(owner, repo, number, f"New preview ready (attempt {meta2['attempt']}, {meta2['duration_sec']}s): {meta2['preview_link']}\nReply /approve-video to schedule.")
+        # Post new preview comment with hidden marker
+        post_preview_comment(owner, repo, number, meta2, slot)
         return
 
     if comment.lower().startswith("/approve-video"):
+        # Fallback to recover ID from body/comments if missing in metadata
+        vid_id = None
         meta = get_metadata_from_issue_body(body)
-        if not meta or "preview_video_id" not in meta:
+        if meta and "preview_video_id" in meta:
+            vid_id = meta["preview_video_id"]
+        if not vid_id:
+            vid_id = find_preview_video_id(owner, repo, number, body)
+        if not vid_id:
             post_comment(owner, repo, number, "No preview video found. Please /regenerate-video.")
             return
-        vid_id = meta["preview_video_id"]
-        publish_at_utc = schedule_existing_video(vid_id, meta.get("slot","morning"))
+        publish_at_utc = schedule_existing_video(vid_id, (meta or {}).get("slot","morning"))
         ist_time = datetime.fromisoformat(publish_at_utc.replace("Z","")).astimezone(IST).strftime("%Y-%m-%d %H:%M")
         link = f"https://youtu.be/{vid_id}"
         post_comment(owner, repo, number, f"Scheduled ✅ {link}\nPublishes at (IST): {ist_time}\nClosing this thread.")
