@@ -372,6 +372,10 @@ def schedule_existing_video(video_id, slot):
     yt.videos().update(part="status", body=body).execute()
     return publish_at_utc
 
+def yt_delete_video(video_id):
+    yt = yt_client()
+    yt.videos().delete(id=video_id).execute()
+
 # ---------- Build preview and schedule ----------
 def upload_preview_youtube(video_path, title, description, tags):
     vid_id, link = upload_youtube_unlisted(video_path, title, description, tags)
@@ -444,6 +448,7 @@ def safe_main():
         except Exception:
             pass
         options = list(dict.fromkeys([s.title() for s in found + seeds]))[:3]
+        # Update metadata JSON topics as well to keep everything consistent
         try:
             meta = get_metadata_from_issue_body(body) or {}
         except Exception:
@@ -452,6 +457,11 @@ def safe_main():
         new_body = set_metadata_in_issue_body(body, meta)
         new_body += "\n\nNew topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3)."
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
+        # Ensure labels reflect we're waiting for a topic
+        add_label(owner, repo, number, "await-topic-approval")
+        remove_label(owner, repo, number, "await-video-approval")
+        # Also post a comment with the options so it's visible in the thread
+        post_comment(owner, repo, number, "New topic options:\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3).")
         return
 
     if comment.lower().startswith("/approve-topic"):
@@ -471,13 +481,35 @@ def safe_main():
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
-        post_comment(owner, repo, number, f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\nReply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n- /reject-video (pick a new topic)")
+        post_comment(owner, repo, number, f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\nReply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n- /reject-video (delete preview and pick a new topic)")
         return
 
     if comment.lower().startswith("/reject-video"):
+        # Try to delete the unlisted preview from YouTube if present
+        deletion_msg = ""
+        try:
+            meta = get_metadata_from_issue_body(body) or {}
+            vid_id = meta.get("preview_video_id")
+            if vid_id:
+                try:
+                    yt_delete_video(vid_id)
+                    deletion_msg = f"Deleted unlisted preview video (ID: {vid_id})."
+                except Exception as de:
+                    deletion_msg = f"Couldn't delete preview on YouTube (ID: {vid_id}): {de}"
+            else:
+                deletion_msg = "No preview video ID found in metadata."
+            # Clean preview-related metadata
+            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic"]:
+                if k in meta:
+                    del meta[k]
+            new_body = set_metadata_in_issue_body(body, meta)
+            gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
+        except Exception as e2:
+            deletion_msg = f"Cleanup encountered an error: {e2}"
+        # Reset labels and prompt for new topics
         add_label(owner, repo, number, "await-topic-approval")
         remove_label(owner, repo, number, "await-video-approval")
-        post_comment(owner, repo, number, "OK. Reply /new-topic for fresh options.")
+        post_comment(owner, repo, number, f"{deletion_msg}\nOK. Reply /new-topic for fresh options.")
         return
 
     if comment.lower().startswith("/regenerate-video"):
