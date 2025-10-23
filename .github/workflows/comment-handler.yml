@@ -16,7 +16,8 @@ jobs:
             contains(github.event.comment.body, '/approve-video') ||
             contains(github.event.comment.body, '/reject-video')  ||
             contains(github.event.comment.body, '/regenerate-video') ||
-            contains(github.event.comment.body, '/new-topic') }}
+            contains(github.event.comment.body, '/new-topic') ||
+            contains(github.event.comment.body, '/custom-topic') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -47,7 +48,8 @@ jobs:
         if: ${{ contains(github.event.comment.body, '/approve-topic') ||
                 contains(github.event.comment.body, '/approve-video') ||
                 contains(github.event.comment.body, '/regenerate-video') ||
-                contains(github.event.comment.body, '/reject-video') }}
+                contains(github.event.comment.body, '/reject-video') ||
+                contains(github.event.comment.body, '/custom-topic') }}
         shell: bash
         run: |
           missing=0
