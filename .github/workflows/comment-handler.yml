@@ -42,7 +42,12 @@ jobs:
           print("Imports OK")
           PY
 
+      # Only check heavy secrets for actions that actually need them
       - name: Check required secrets
+        if: ${{ contains(github.event.comment.body, '/approve-topic') ||
+                contains(github.event.comment.body, '/approve-video') ||
+                contains(github.event.comment.body, '/regenerate-video') ||
+                contains(github.event.comment.body, '/reject-video') }}
         shell: bash
         run: |
           missing=0
@@ -73,7 +78,6 @@ jobs:
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           TTS_LANG: en
-          # Use one of the available models your key supports (from your list)
           GROQ_MODEL: qwen/qwen3-32b
           GROQ_FALLBACK_MODELS: llama-3.3-70b-versatile,llama-3.1-8b-instant,openai/gpt-oss-20b,openai/gpt-oss-120b,groq/compound-mini,groq/compound,moonshotai/kimi-k2-instruct
         run: python handle_comment.py
