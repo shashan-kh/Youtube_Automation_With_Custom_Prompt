@@ -1,0 +1,14 @@
+name: smoke
+
+on:
+  workflow_dispatch:    # allows manual runs from the Actions tab
+  push:
+    branches:
+      - master          # also runs on pushes to master
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print confirmation
+        run: echo "GitHub Actions are working ✅"
