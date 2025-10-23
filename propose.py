@@ -31,7 +31,7 @@ def gh(method, url, **kwargs):
     if DEBUG:
         log("HTTP", method, url, "->", r.status_code)
         if r.status_code >= 400:
-            log("Response body:", r.text[:1000])
+            log("Response body:", r.text[:2000])
     r.raise_for_status()
     return r
 
@@ -80,7 +80,7 @@ def open_issues_with_labels(owner, repo, labels):
     issues = []
     for it in items:
         if "pull_request" in it:
-            continue  # we only care about issues, not PRs
+            continue  # only issues, not PRs
         names = {lbl.get("name","") for lbl in it.get("labels", []) if isinstance(lbl, dict)}
         if wanted.issubset(names):
             issues.append(it)
@@ -151,25 +151,47 @@ Metadata:
 {json.dumps({"slot": SLOT, "scheduled_ist": scheduled_ist.strftime('%Y-%m-%d %H:%M'), "topics": topics[:3]}, indent=2)}
 ```"""
     log("Creating issue:", title)
-    gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
-       json={"title": title, "body": body, "labels": ["await-topic-approval", slot_label]})
+    resp = gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
+              json={"title": title, "body": body, "labels": ["await-topic-approval", slot_label]})
+    data = resp.json()
+    url = data.get("html_url")
+    number = data.get("number")
+    log("Created issue:", number, url)
+    print(f"Created topic approval issue for {SLOT}: {url}")
 
 def main():
     log("Region:", REGION, "| Slot:", SLOT, "| Repo:", REPO)
     if not REPO or "/" not in REPO:
         print("GITHUB_REPOSITORY not set. This workflow must run on GitHub Actions.")
-        return
+        sys.exit(2)
     if not GITHUB_TOKEN:
-        print("GITHUB_TOKEN not available. Ensure the workflow has 'issues: write' permission.")
-        return
+        print("GITHUB_TOKEN not available. Ensure the workflow maps GITHUB_TOKEN: ${{ github.token }} and has 'issues: write' permission.")
+        sys.exit(2)
 
     owner, repo = REPO.split("/")
+
+    # Inspect repo, issues availability, and token permissions
+    try:
+        info = gh("GET", f"https://api.github.com/repos/{owner}/{repo}").json()
+        has_issues = bool(info.get("has_issues", True))
+        perms = info.get("permissions", {})
+        log("Repo has_issues:", has_issues, "| token permissions:", perms)
+        if not has_issues:
+            print("Issues are disabled on this repository. Enable Issues in Settings.")
+            sys.exit(3)
+        if perms and not perms.get("issues", False):
+            print("This GITHUB_TOKEN does not have 'issues' permission. Check Actions → Workflow permissions and this job's 'permissions: issues: write'.")
+            sys.exit(3)
+    except requests.HTTPError as e:
+        print("Failed to read repo info:", e)
+        # Continue; sometimes permissions field not returned for app tokens
+
     # Skip if an approval issue for this slot is already open (ISSUES ONLY; PRs ignored)
     try:
         open_slot = open_issues_with_labels(owner, repo, [f"slot:{SLOT}","await-topic-approval"])
     except requests.HTTPError as e:
         print("Failed to query issues:", e)
-        return
+        sys.exit(4)
     if isinstance(open_slot, list) and open_slot:
         print("An approval issue for this slot is already open. Skipping.")
         return
@@ -178,9 +200,10 @@ def main():
     scheduled_ist = next_slot_ist()
     try:
         create_topic_issue(owner, repo, topics, scheduled_ist)
-        print("Created topic approval issue for", SLOT)
     except requests.HTTPError as e:
-        print("Failed to create issue:", e.response.text if e.response is not None else str(e))
+        body = e.response.text if e.response is not None else str(e)
+        print("Failed to create issue:", body)
+        sys.exit(5)
 
 if __name__ == "__main__":
     main()
