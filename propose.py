@@ -9,8 +9,8 @@ REPO = os.getenv("GITHUB_REPOSITORY")  # owner/repo
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 IST = timezone(timedelta(hours=5, minutes=30))
-MORNING_IST = (9, 0)    # 09:00
-AFTERNOON_IST = (16, 0) # 16:00
+MORNING_IST = (9, 0)
+AFTERNOON_IST = (16, 0)
 
 def log(*args):
     if DEBUG:
@@ -36,7 +36,6 @@ def gh(method, url, **kwargs):
     return r
 
 def ensure_labels(owner, repo, labels):
-    # labels: dict of name -> (color, description)
     try:
         existing = []
         page = 1
@@ -51,7 +50,7 @@ def ensure_labels(owner, repo, labels):
             page += 1
         log("Existing labels:", existing)
     except Exception as e:
-        log("Failed to list labels (will try creating anyway):", e)
+        log("Failed to list labels:", e)
         existing = []
     for name, (color, desc) in labels.items():
         if name in existing:
@@ -62,24 +61,23 @@ def ensure_labels(owner, repo, labels):
             log("Created label:", name)
         except requests.HTTPError as e:
             code = e.response.status_code if e.response is not None else None
-            # If we can't create labels (permissions) we'll still try creating the issue below.
-            log("Failed to create label:", name, code, e.response.text[:500] if e.response is not None else "")
-            continue
+            if code in (409, 422):
+                log("Label exists/validation (ok):", name)
+                continue
+            raise
 
 def open_issues_with_labels(owner, repo, labels):
-    # Use params to ensure proper URL encoding (labels like "slot:morning")
     r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues",
            params={"state": "open", "labels": ",".join(labels), "per_page": 100})
     items = r.json()
     if not isinstance(items, list):
         log("Unexpected issues response:", items)
         return []
-    # Filter out PRs and double-check label inclusion
     wanted = set(labels)
     issues = []
     for it in items:
         if "pull_request" in it:
-            continue  # only issues, not PRs
+            continue
         names = {lbl.get("name","") for lbl in it.get("labels", []) if isinstance(lbl, dict)}
         if wanted.issubset(names):
             issues.append(it)
@@ -125,7 +123,6 @@ def fetch_trending_candidates(region="IN", max_items=12):
 
 def create_topic_issue(owner, repo, topics, scheduled_ist):
     slot_label = f"slot:{SLOT}"
-    # Try to ensure labels (ignore failures; we'll fall back if needed)
     ensure_labels(owner, repo, {
         "await-topic-approval": ("ededed", "Awaiting topic approval"),
         slot_label: ("bfd4f2" if SLOT == "morning" else "c2e0c6", f"Issue for {SLOT} slot")
@@ -142,6 +139,7 @@ Choose one:
 Reply with:
 - /approve-topic 1   (or 2/3)
 - /reject-topic      (I’ll propose new topics)
+- /custom-topic Your Topic   (use your own safe wellness topic)
 
 /regenerate-video (rebuild same topic under 58s) and /approve-video (schedule upload) are used after preview is ready.
 
@@ -149,50 +147,19 @@ Metadata:
 ```json
 {json.dumps({"slot": SLOT, "scheduled_ist": scheduled_ist.strftime('%Y-%m-%d %H:%M'), "topics": topics[:3]}, indent=2)}
 ```"""
-    payload = {"title": title, "body": body, "labels": ["await-topic-approval", slot_label]}
-    log("Creating issue (with labels):", title)
-    try:
-        resp = gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues", json=payload)
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else None
-        text = e.response.text if e.response is not None else str(e)
-        # If labels cause 422 (labels don't exist), retry without labels
-        if code == 422 and "label" in text.lower():
-            log("Label validation failed (422). Retrying without labels.")
-            resp = gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
-                      json={"title": title, "body": body})
-        else:
-            raise
-    data = resp.json()
-    url = data.get("html_url")
-    number = data.get("number")
-    log("Created issue:", number, url)
-    print(f"Created topic approval issue for {SLOT}: {url}")
+    log("Creating issue:", title)
+    gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
+       json={"title": title, "body": body, "labels": ["await-topic-approval", slot_label]})
 
 def main():
     log("Region:", REGION, "| Slot:", SLOT, "| Repo:", REPO)
     if not REPO or "/" not in REPO:
-        print("GITHUB_REPOSITORY not set. This workflow must run on GitHub Actions.")
+        print("GITHUB_REPOSITORY not set.")
         sys.exit(2)
     if not GITHUB_TOKEN:
-        print("GITHUB_TOKEN not available. Ensure the workflow maps GITHUB_TOKEN: ${{ github.token }} and has 'issues: write' permission.")
+        print("GITHUB_TOKEN not available.")
         sys.exit(2)
-
     owner, repo = REPO.split("/")
-
-    # Soft-check repository info (don't abort on missing granular permissions field)
-    try:
-        info = gh("GET", f"https://api.github.com/repos/{owner}/{repo}").json()
-        has_issues = bool(info.get("has_issues", True))
-        perms = info.get("permissions", {})
-        log("Repo has_issues:", has_issues, "| token permissions field:", perms)
-        if not has_issues:
-            print("Issues are disabled on this repository. Enable Issues in Settings.")
-            sys.exit(3)
-    except requests.HTTPError as e:
-        log("Failed to read repo info (continuing):", e)
-
-    # Skip if an approval issue for this slot is already open (ISSUES ONLY; PRs ignored)
     try:
         open_slot = open_issues_with_labels(owner, repo, [f"slot:{SLOT}","await-topic-approval"])
     except requests.HTTPError as e:
@@ -201,20 +168,13 @@ def main():
     if isinstance(open_slot, list) and open_slot:
         print("An approval issue for this slot is already open. Skipping.")
         return
-
     topics = fetch_trending_candidates(REGION, max_items=12)[:3]
     scheduled_ist = next_slot_ist()
     try:
         create_topic_issue(owner, repo, topics, scheduled_ist)
+        print("Created topic approval issue for", SLOT)
     except requests.HTTPError as e:
-        body = e.response.text if e.response is not None else str(e)
-        # Helpful hints for common 403 cases
-        if e.response is not None and e.response.status_code == 403:
-            print("Failed to create issue (403 Forbidden).")
-            print("Check: Actions → General → Workflow permissions set to 'Read and write',")
-            print("and that this workflow/job has 'permissions: issues: write'.")
-        else:
-            print("Failed to create issue:", body)
+        print("Failed to create issue:", e.response.text if e.response is not None else str(e))
         sys.exit(5)
 
 if __name__ == "__main__":
