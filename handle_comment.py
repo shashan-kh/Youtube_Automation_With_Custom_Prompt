@@ -1,8 +1,15 @@
-import os, re, json, tempfile, subprocess, requests, traceback, sys, math, random
+import os, re, json, tempfile, subprocess, requests, traceback, sys, math, random, time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip
 from gtts import gTTS
+
+# Optional: gTTS can raise its own error class
+try:
+    from gtts.tts import gTTSError
+except Exception:
+    gTTSError = Exception
+
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -31,10 +38,15 @@ PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
 
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
+# Duration limits (Shorts-compliant)
 PREVIEW_MIN = 50.0
-PREVIEW_MAX = 57.3   # headroom under 58s for Shorts
-TARGET_DUR  = 56.0
+PREVIEW_MAX = 57.3
+TARGET_DUR = 56.0
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# Speech rate (words per second) estimate to size script before TTS
+# Typical English narration ~2.4–3.0 WPS. We use 2.6 as a conservative default.
+WPS_EST = float(os.getenv("SCRIPT_WPS", "2.6"))
 
 def is_authorized_commenter(event):
     assoc = (event.get("comment", {}).get("author_association") or "").upper()
@@ -79,8 +91,7 @@ def parse_topics_from_body(body):
     lines = body.splitlines()
     def collect_after_marker(marker):
         idxs = [i for i, l in enumerate(lines) if marker in l.lower()]
-        if not idxs:
-            return []
+        if not idxs: return []
         start = idxs[-1] + 1
         out = []
         for ln in lines[start:]:
@@ -108,8 +119,7 @@ def parse_topics_from_body(body):
     fallback = []
     for ln in lines:
         m = re.match(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])\s+(.*\S)", ln)
-        if m:
-            fallback.append(m.group(1).strip())
+        if m: fallback.append(m.group(1).strip())
     return fallback[:3]
 
 def get_slot_from_labels(labels):
@@ -167,7 +177,7 @@ def build_model_list():
             ordered.append(mid)
     return ordered[:10]
 
-def llm_script(trending_query, word_hint="120–135"):
+def llm_script(trending_query, word_hint="135–150"):
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret")
     prompt = f"""
@@ -176,9 +186,9 @@ You are a careful health educator. Create a strictly 50–58s YouTube Short base
 
 Rules:
 - General wellness only (sleep, hydration, movement, posture, stress, basic nutrition).
-- No disease claims, diagnoses, dosages, or supplement promises. Avoid COVID/vaccines.
-- If the topic is unsafe/specific (e.g., drugs/diseases), pivot to a safe, related habit.
-- Style: energetic, plain language, second-person; target {word_hint} words for ~55–57s speech.
+- No disease claims, diagnoses, dosages, or supplement promises. Avoid COVID/vaccines and specific diseases.
+- If the topic is unsafe/specific, pivot to a safe, related habit.
+- Style: energetic, plain language, second-person; target {word_hint} words for ~50–58s spoken length.
 
 Output pure JSON with:
 - voiceover: string (the exact narration; no stage directions)
@@ -218,73 +228,73 @@ Output pure JSON with:
         raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS to one of the above.")
     raise last_err or RuntimeError("Groq call failed; no models available to try")
 
-# ---------- Voice timing helpers (never slow voice) ----------
+# ---------- Duration and TTS helpers (minimize TTS usage) ----------
+def words_in(text):
+    return len(re.findall(r"[A-Za-z']+", text or ""))
+
+def estimate_seconds_from_text(text, wps=WPS_EST):
+    return words_in(text) / max(0.5, float(wps))
+
+def compute_word_target_for_window(min_s=PREVIEW_MIN, max_s=PREVIEW_MAX, wps=WPS_EST):
+    low = int(math.ceil(min_s * wps))
+    high = int(math.floor(max_s * wps))
+    # keep a little buffer
+    return max(100, low), min(200, high + 4)
+
+def script_for_target_duration(topic, max_rounds=6, wps=WPS_EST):
+    # Size script BEFORE TTS: loop LLM until estimated duration is in [50,58]
+    word_low, word_high = compute_word_target_for_window(PREVIEW_MIN, PREVIEW_MAX, wps)
+    hint = f"{word_low}–{word_high}"
+    last = None
+    for _ in range(max_rounds):
+        s = llm_script(topic, word_hint=hint)
+        v = (s.get("voiceover") or "").strip()
+        if not v:
+            continue
+        est = estimate_seconds_from_text(v, wps)
+        if PREVIEW_MIN <= est <= PREVIEW_MAX:
+            return s  # Good: estimated duration fits window
+        # Adjust hint for next round
+        if est < PREVIEW_MIN:
+            # too short -> ask for more words
+            need = int(math.ceil((PREVIEW_MIN - est) * wps * 1.05))
+            target = words_in(v) + max(20, need)
+        else:
+            # too long -> ask for fewer words
+            cut = int(math.ceil((est - PREVIEW_MAX) * wps * 1.05))
+            target = max(100, words_in(v) - max(20, cut))
+        hint = f"{max(90, target-10)}–{min(190, target+10)}"
+        last = s
+    # Fallback: return best-attempt script
+    return last
+
 def audio_duration(path):
     a = AudioFileClip(path); d = a.duration; a.close(); return d
 
-def maybe_speed_up_audio(voice_path, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, max_factor=1.2):
-    # Only speed up if too long, never slow down
+def tts_save_once(text, out_path="voice.mp3"):
+    # Single TTS call with light retry if transient; avoids 429 storms
+    try:
+        gTTS(text, lang=TTS_LANG).save(out_path)
+        return out_path, audio_duration(out_path)
+    except gTTSError as e:
+        # gTTS specific error, may include 429
+        raise RuntimeError(f"TTS error: {e}")
+    except Exception as e:
+        msg = str(e)
+        if "429" in msg or "Too Many Requests" in msg:
+            raise RuntimeError("TTS rate limited (429). Script prepared first to minimize TTS calls. Please retry in ~1–2 minutes.")
+        raise
+
+def maybe_speed_up_audio(voice_path, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, max_factor=1.15):
     if dur <= max_s:
         return voice_path, dur
     factor = max(1.02, min(max_factor, dur / max(target, max_s - 0.3)))
-    out = "voice_speed.mp3"
+    out = "voice_fast.mp3"
     subprocess.run(["ffmpeg","-y","-i",voice_path,"-filter:a",f"atempo={factor}","-vn",out], check=True)
     d2 = audio_duration(out)
     return out, d2
 
-def llm_append_words(topic, base_text, add_words):
-    # Ask LLM to append ~N words to extend narration (no stage directions)
-    prompt = f"""
-Topic: {topic}
-Current voiceover:
-\"\"\"{base_text}\"\"\"
-
-Append approximately {add_words} more words that naturally continue the narration with actionable, general wellness guidance.
-No medical claims, no dosages, no diseases. Keep the same tone. Output ONLY the additional lines (plain text).
-"""
-    models = build_model_list()
-    for model in models:
-        r = call_groq(prompt, model)
-        if r.status_code == 200:
-            content = (r.json().get("choices",[{}])[0].get("message",{}) or {}).get("content","").strip()
-            if content:
-                # strip accidental JSON/code blocks
-                content = re.sub(r"^```.*?\n|\n```$", "", content, flags=re.S).strip()
-                return content
-    return ""
-
-def expand_voiceover_to_target(topic, base_text, cur_dur, min_s=PREVIEW_MIN, target=TARGET_DUR, max_s=PREVIEW_MAX, max_rounds=3):
-    # Estimate speaking rate from current audio
-    words = len(re.findall(r"[A-Za-z']+", base_text))
-    wps = (words / cur_dur) if cur_dur > 0 else 2.7
-    wps = max(2.0, min(4.0, wps))  # clamp
-    text = base_text
-    dur = cur_dur
-    rounds = 0
-    while dur < min_s and rounds < max_rounds:
-        need_sec = max(min_s + 0.6 - dur, target - dur)
-        add_words = int(math.ceil(need_sec * wps * 1.05))
-        add_words = max(25, min(120, add_words))
-        extra = llm_append_words(topic, text, add_words)
-        if not extra:
-            # fallback extend
-            extra = " Keep showing up daily—small, consistent actions compound over time."
-        text = (text.rstrip() + " " + extra.strip()).strip()
-        # Resynthesize to measure real duration
-        tmp_voice = "voice_ext.mp3"
-        gTTS(text, lang=TTS_LANG).save(tmp_voice)
-        dur = audio_duration(tmp_voice)
-        rounds += 1
-        if dur <= max_s:
-            # accept extended version
-            os.replace(tmp_voice, "voice.mp3")
-        else:
-            # too long; discard this extension for now
-            os.remove(tmp_voice)
-            break
-    return text
-
-# ---------- Smart B-roll ----------
+# ---------- Smart B-roll based on narration ----------
 KEYWORD_QUERIES = [
     (["hydrate","hydration","water","sip","bottle","glass"], ["drinking water", "pouring water into glass", "water bottle"]),
     (["sleep","bed","night","screen","blue light","caffeine","bedtime","wind-down"], ["sleeping at night", "bedtime routine", "turning off screens"]),
@@ -373,12 +383,13 @@ def make_srt_from_transcript(transcript, duration, path):
     words = text.split()
     if not words:
         words = ["Simple", "wellness", "tip", "Move", "hydrate", "rest"]
-    n_lines = max(6, min(9, math.ceil(len(words) / 14)))
+    n_lines = max(6, min(9, math.ceil(len(words) / 14)))  # ~4–7 words per line
     chunk = max(4, min(7, math.ceil(len(words)/n_lines)))
     lines = []
     i = 0
     while i < len(words):
-        lines.append(" ".join(words[i:i+chunk])); i += chunk
+        lines.append(" ".join(words[i:i+chunk]))
+        i += chunk
     lines = lines[:n_lines]
     step = max(1.0, duration / len(lines))
     t = 0.4
@@ -392,6 +403,7 @@ def make_srt_from_transcript(transcript, duration, path):
         f.writelines(out)
 
 def burn_subs(in_mp4, srt_path, out_mp4):
+    # Bottom, small, stroked, bright
     vf = f"subtitles={srt_path}:force_style='Fontname=DejaVu Sans,Fontsize=34,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=3,Shadow=1,Alignment=2,MarginV=90'"
     subprocess.run(["ffmpeg","-y","-i",in_mp4,"-vf",vf,"-c:a","copy",out_mp4], check=True)
 
@@ -413,7 +425,7 @@ def render_segmented(broll_urls, segments_texts, voice_mp3, temp_mp4, final_mp4,
         src = local[i % len(local)]
         c = VideoFileClip(src)
         take = min(per, max(4.0, min(10.0, c.duration)))
-        sub = c.subclip(0, take).resize(height=1920)
+        sub = c.subclip(0, take).resize(height=target_h)
         if sub.w != target_w:
             sub = sub.crop(x_center=sub.w/2, width=target_w, height=target_h)
         clips.append(sub)
@@ -504,12 +516,12 @@ def get_metadata_from_issue_body(issue_body):
 def set_metadata_in_issue_body(issue_body, meta):
     block = "```json\n" + json.dumps(meta, indent=2) + "\n```"
     if "```json" in issue_body:
+        # Avoid interpreting backslashes (e.g. \u) in replacement
         return re.sub(r"```json\s*\{.*?\}\s*```", lambda m: block, issue_body, flags=re.S)
     return issue_body + "\n\nMetadata:\n" + block
 
 def extract_youtube_id(text):
-    if not text:
-        return None
+    if not text: return None
     m = re.search(r"<!--\s*preview_video_id:\s*([A-Za-z0-9_-]{11})\s*-->", text)
     if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]{11})", text)
@@ -553,7 +565,7 @@ def post_preview_comment(owner, repo, number, meta, slot):
     )
     post_comment(owner, repo, number, msg)
 
-# ---------- Used topics history (exclude only those previously approved for upload) ----------
+# ---------- Used topics history (exclude only topics previously approved for upload) ----------
 def norm_topic(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
@@ -567,7 +579,8 @@ def list_used_topics_uploaded_only(owner, repo, max_pages=5):
         if not isinstance(items, list) or not items:
             break
         for it in items:
-            if "pull_request" in it: continue
+            if "pull_request" in it:
+                continue
             body = it.get("body") or ""
             try:
                 meta = get_metadata_from_issue_body(body) or {}
@@ -577,69 +590,87 @@ def list_used_topics_uploaded_only(owner, repo, max_pages=5):
                 t = meta.get("topic")
                 if isinstance(t, str) and t.strip():
                     used.add(norm_topic(t))
-        if len(items) < 100: break
+        if len(items) < 100:
+            break
         page += 1
     return used
 
-# ---------- Main build loop (regenerate until fits without slowing voice) ----------
-def build_preview_until_under_58(topic, slot, issue_body, max_attempts=10):
-    word_targets = ["130–145","120–135","115–130","110–130","105–125","100–120","95–115","90–110","90–105","85–100"]
-    for attempt in range(1, max_attempts+1):
-        s = llm_script(topic, word_hint=word_targets[min(attempt-1, len(word_targets)-1)])
-        voice_text = (s.get("voiceover","") or "").strip()
-        if not voice_text: continue
+# ---------- Build preview with "script-first, TTS-last" strategy ----------
+def build_preview_until_under_58(topic, slot, issue_body, max_attempts=4):
+    """
+    1) Generate/adjust script until estimated duration (WPS-based) fits 50–58s.
+    2) Call TTS once (at most twice if small speed-up needed).
+    3) Build video and upload preview if final 50–58s achieved.
+    """
+    # Step 1: script-sized by estimation
+    script = script_for_target_duration(topic, max_rounds=max_attempts, wps=WPS_EST)
+    if not script or not (script.get("voiceover") or "").strip():
+        return None, issue_body
+    voice_text = script["voiceover"].strip()
 
-        # TTS initial
-        voice_raw = "voice.mp3"; gTTS(voice_text, lang=TTS_LANG).save(voice_raw)
-        dur = audio_duration(voice_raw)
+    # Step 2: single TTS (minimize API usage to avoid 429)
+    try:
+        voice_mp3, dur = tts_save_once(voice_text, out_path="voice.mp3")
+    except Exception as e:
+        # Bubble up; caller will post a friendly comment already
+        raise
 
-        # If narration too short, extend by appending content (never slow voice)
-        if dur < PREVIEW_MIN:
-            voice_text = expand_voiceover_to_target(topic, voice_text, dur, min_s=PREVIEW_MIN, target=TARGET_DUR, max_s=PREVIEW_MAX, max_rounds=3)
-            gTTS(voice_text, lang=TTS_LANG).save(voice_raw)
-            dur = audio_duration(voice_raw)
+    # If slightly over limit, we may speed up gently once (never slow)
+    sped_once = False
+    if dur > PREVIEW_MAX:
+        voice_mp3, dur2 = maybe_speed_up_audio(voice_mp3, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, max_factor=1.15)
+        sped_once = True
+        dur = dur2
 
-        # If still too long, speed up slightly (never slow down)
-        if dur > PREVIEW_MAX:
-            voice_adj, dur2 = maybe_speed_up_audio(voice_raw, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, max_factor=1.2)
-            if dur2 > PREVIEW_MAX:
-                # script still too long; try next attempt with different density
-                continue
-            voice_file = voice_adj; voice_dur = dur2
-        else:
-            voice_file = voice_raw; voice_dur = dur
+    # If still out of range, do one more script refinement pass then one more TTS
+    if not (PREVIEW_MIN <= dur <= PREVIEW_MAX):
+        adj_script = script_for_target_duration(topic, max_rounds=2, wps=WPS_EST)
+        if adj_script and (adj_script.get("voiceover") or "").strip():
+            voice_text = adj_script["voiceover"].strip()
+            # second and final TTS attempt (avoid 429)
+            voice_mp3, dur = tts_save_once(voice_text, out_path="voice.mp3")
+            if dur > PREVIEW_MAX and not sped_once:
+                voice_mp3, dur2 = maybe_speed_up_audio(voice_mp3, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, max_factor=1.12)
+                dur = dur2
+            # Replace script with adjusted for rest of pipeline
+            script = adj_script
 
-        # Build visuals matched to narration
-        queries, seg_texts = derive_queries_from_voice(voice_text, segments=8)
-        broll = fetch_broll_for_queries(queries)
-        if len(broll) < 3:
-            continue
+    # Enforce duration window
+    if not (PREVIEW_MIN <= dur <= PREVIEW_MAX):
+        return None, issue_body
 
-        temp, final = "temp.mp4", "short.mp4"
-        dur_final = render_segmented(broll, seg_texts, voice_file, temp, final)
+    # Step 3: visuals and captions exactly from narration
+    queries, seg_texts = derive_queries_from_voice(voice_text, segments=8)
+    broll = fetch_broll_for_queries(queries)
+    if len(broll) < 3:
+        return None, issue_body
 
-        if PREVIEW_MIN <= dur_final <= 58.0:
-            desc = f"""{s['description']}
+    temp, final = "temp.mp4", "short.mp4"
+    dur_final = render_segmented(broll, seg_texts, voice_mp3, temp, final)
+    if not (PREVIEW_MIN <= dur_final <= 58.0):
+        return None, issue_body
+
+    desc = f"""{script['description']}
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
 #Shorts #health #wellness"""
-            vid_id, link = upload_preview_youtube(final, s["title"], desc, s.get("tags",""))
-            meta = {
-                "topic": topic,
-                "title": s["title"],
-                "description": desc,
-                "tags": s.get("tags",""),
-                "preview_video_id": vid_id,
-                "preview_link": link,
-                "slot": slot,
-                "created_at": datetime.utcnow().isoformat(),
-                "duration_sec": round(dur_final,2),
-                "attempt": attempt
-            }
-            new_body = set_metadata_in_issue_body(issue_body, meta)
-            return meta, new_body
-    return None, issue_body
+    vid_id, link = upload_preview_youtube(final, script["title"], desc, script.get("tags",""))
+    meta = {
+        "topic": topic,
+        "title": script["title"],
+        "description": desc,
+        "tags": script.get("tags",""),
+        "preview_video_id": vid_id,
+        "preview_link": link,
+        "slot": slot,
+        "created_at": datetime.utcnow().isoformat(),
+        "duration_sec": round(dur_final,2),
+        "attempt": 1
+    }
+    new_body = set_metadata_in_issue_body(issue_body, meta)
+    return meta, new_body
 
+# ---------- Main handler ----------
 def safe_main():
     e = ev()
     owner, repo = REPO.split("/")
@@ -681,13 +712,14 @@ def safe_main():
             if norm_topic(f) not in used and norm_topic(f) not in seen_norm:
                 cleaned.append(f); seen_norm.add(norm_topic(f))
         options = cleaned[:3] if cleaned else ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine"]
+
         try:
             meta = get_metadata_from_issue_body(body) or {}
         except Exception:
             meta = {}
         meta["topics"] = options
         new_body = set_metadata_in_issue_body(body, meta)
-        new_body += "\n\nNew topic options (excluding topics previously approved for upload):\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3), or use:\n/custom-topic Your Topic"
+        new_body += "\n\nNew topic options (excluding topics previously approved for upload):\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3), or provide your own with:\n/custom-topic Your Topic"
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-topic-approval")
         remove_label(owner, repo, number, "await-video-approval")
@@ -697,10 +729,12 @@ def safe_main():
     if comment.lower().startswith("/custom-topic"):
         topic = comment[len("/custom-topic"):].strip()
         if not topic:
-            post_comment(owner, repo, number, "Please provide a topic. Example:\n/custom-topic Morning hydration habit"); return
-        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=10)
+            post_comment(owner, repo, number, "Please provide a topic. Example:\n/custom-topic Morning hydration habit")
+            return
+        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=6)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't meet 50–58s after several attempts. Try a simpler topic or /new-topic."); return
+            post_comment(owner, repo, number, "Couldn't meet 50–58s window after attempts (script-first sizing). Try /new-topic or a simpler /custom-topic.")
+            return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
         post_preview_comment(owner, repo, number, meta, slot)
@@ -715,17 +749,20 @@ def safe_main():
             if arg.isdigit():
                 idx = int(arg)
                 if not topics or not (1 <= idx <= len(topics)):
-                    post_comment(owner, repo, number, "Invalid index. Use 1/2/3, or:\n/custom-topic Your Topic"); return
+                    post_comment(owner, repo, number, "Invalid index. Use 1/2/3, or provide your own with:\n/custom-topic Your Topic")
+                    return
                 topic = topics[idx-1]
             else:
                 topic = arg
         else:
             if not topics:
-                post_comment(owner, repo, number, "Couldn't detect topics. Use /new-topic or /custom-topic Your Topic."); return
+                post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Use /new-topic or /custom-topic Your Topic.")
+                return
             topic = topics[0]
-        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=10)
+        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=6)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't meet 50–58s after several attempts. Reply /new-topic or /custom-topic Your Topic."); return
+            post_comment(owner, repo, number, "Couldn't meet 50–58s window after attempts (script-first sizing). Reply /new-topic or /custom-topic Your Topic.")
+            return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
         post_preview_comment(owner, repo, number, meta, slot)
@@ -736,15 +773,17 @@ def safe_main():
         deletion_msg = ""
         if vid_id:
             try:
-                yt_delete_video(vid_id); deletion_msg = f"Deleted unlisted preview video (ID: {vid_id})."
+                yt_delete_video(vid_id)
+                deletion_msg = f"Deleted unlisted preview video (ID: {vid_id})."
             except Exception as de:
                 deletion_msg = f"Couldn't delete preview on YouTube (ID: {vid_id}): {de}"
         else:
-            deletion_msg = "No preview video ID found (checked metadata, body, and comments)."
+            deletion_msg = "No preview video ID found (looked in metadata, body, and recent comments)."
         try:
             meta = get_metadata_from_issue_body(body) or {}
             for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic"]:
-                if k in meta: del meta[k]
+                if k in meta:
+                    del meta[k]
             new_body = set_metadata_in_issue_body(body, meta)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         except Exception as e2:
@@ -758,10 +797,12 @@ def safe_main():
         meta = get_metadata_from_issue_body(body)
         topic = meta["topic"] if meta and "topic" in meta else None
         if not topic:
-            post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic or /custom-topic first."); return
-        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=10)
+            post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic or /custom-topic first.")
+            return
+        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=6)
         if not meta2:
-            post_comment(owner, repo, number, "Couldn't meet 50–58s after several attempts. Use /new-topic or /custom-topic."); return
+            post_comment(owner, repo, number, "Couldn't meet 50–58s window after attempts. Use /new-topic or /custom-topic.")
+            return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval")
         post_preview_comment(owner, repo, number, meta2, slot)
@@ -770,16 +811,21 @@ def safe_main():
     if comment.lower().startswith("/approve-video"):
         vid_id = None
         meta = get_metadata_from_issue_body(body)
-        if meta and "preview_video_id" in meta: vid_id = meta["preview_video_id"]
-        if not vid_id: vid_id = find_preview_video_id(owner, repo, number, body)
+        if meta and "preview_video_id" in meta:
+            vid_id = meta["preview_video_id"]
         if not vid_id:
-            post_comment(owner, repo, number, "No preview video found. Please /regenerate-video."); return
+            vid_id = find_preview_video_id(owner, repo, number, body)
+        if not vid_id:
+            post_comment(owner, repo, number, "No preview video found. Please /regenerate-video.")
+            return
         publish_at_utc = schedule_existing_video(vid_id, (meta or {}).get("slot","morning"))
-        # Mark topic as upload-approved for future filtering
+        # Mark this topic as upload-approved for future filtering
         try:
-            latest = get_issue(owner, repo, number); latest_body = latest.get("body") or body
+            latest_issue = get_issue(owner, repo, number)
+            latest_body = latest_issue.get("body") or body
             meta2 = get_metadata_from_issue_body(latest_body) or {}
-            meta2["upload_approved"] = True; meta2["publish_at_utc"] = publish_at_utc
+            meta2["upload_approved"] = True
+            meta2["publish_at_utc"] = publish_at_utc
             new_body2 = set_metadata_in_issue_body(latest_body, meta2)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body2})
         except Exception:
@@ -802,11 +848,12 @@ def main():
             avail = list_groq_models()
             addendum = ""
             if avail:
-                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above."
+                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
-            print("FATAL:", e); print(traceback.format_exc())
+            print("FATAL:", e)
+            print(traceback.format_exc())
         return
 
 if __name__ == "__main__":
