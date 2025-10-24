@@ -172,7 +172,7 @@ def build_model_list():
             ordered.append(mid)
     return ordered[:10]
 
-def llm_script(trending_query, word_hint="110–130"):
+def llm_script(trending_query, word_hint="120–135"):
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret")
     prompt = f"""
@@ -223,18 +223,20 @@ Output pure JSON with:
         raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above.")
     raise last_err or RuntimeError("Groq call failed; no models available to try")
 
-# --------- Voice duration control ----------
-def ensure_voice_in_window(voice_path, target=TARGET_DUR, min_s=PREVIEW_MIN, max_s=PREVIEW_MAX):
-    a = AudioFileClip(voice_path); dur = a.duration; a.close()
-    if min_s <= dur <= max_s:
+# --------- Voice duration helpers (never slow down) ----------
+def audio_duration(path):
+    a = AudioFileClip(path); d = a.duration; a.close(); return d
+
+def maybe_speed_up_audio(voice_path, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, max_factor=1.2):
+    """
+    Only speed up if narration is too long. Never slow down.
+    """
+    if dur <= max_s:
         return voice_path, dur
-    desired = max(min_s + 1.0, min(target, max_s - 0.3))
-    factor = max(0.5, min(2.0, dur / desired))
-    if abs(factor - 1.0) < 0.02:
-        return voice_path, dur
-    out = "voice_retime.mp3"
+    factor = max(1.02, min(max_factor, dur / max(target, max_s - 0.3)))
+    out = "voice_speed.mp3"
     subprocess.run(["ffmpeg","-y","-i",voice_path,"-filter:a",f"atempo={factor}","-vn",out], check=True)
-    a2 = AudioFileClip(out); d2 = a2.duration; a2.close()
+    d2 = audio_duration(out)
     return out, d2
 
 # --------- Smart B-roll queries matched to narration ----------
@@ -251,14 +253,13 @@ KEYWORD_QUERIES = [
     (["stress","calm","mindful","mindfulness","meditate","meditation"], ["meditation calm", "relaxing yoga"]),
     (["stairs","steps","climb"], ["climbing stairs", "walking stairs"]),
 ]
-
 GENERIC_FALLBACKS = ["healthy lifestyle", "fitness", "stretching", "walking", "hydration", "posture", "yoga", "nutrition"]
 
 def derive_queries_from_voice(voice_text, segments=8):
     text = re.sub(r"[\r\n]+", " ", voice_text or "").lower()
     words = [w for w in re.findall(r"[A-Za-z']+", text) if w]
     if not words:
-        return [random.choice(GENERIC_FALLBACKS)] * 6, [""]
+        return [random.choice(GENERIC_FALLBACKS)] * 6, [""]*6
     segs = max(6, min(9, segments))
     chunk = math.ceil(len(words) / segs)
     seg_texts = []
@@ -324,6 +325,7 @@ def fmt_time(t):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def make_srt_from_transcript(transcript, duration, path):
+    # Captions are exactly the voiceover text, chunked small, bottom placement handled in burn_subs
     text = re.sub(r"\s+", " ", (transcript or "").strip())
     words = text.split()
     if not words:
@@ -349,10 +351,10 @@ def make_srt_from_transcript(transcript, duration, path):
 
 def burn_subs(in_mp4, srt_path, out_mp4):
     # Bottom, small, stroked, bright
-    vf = f"subtitles={srt_path}:force_style='Fontname=DejaVu Sans,Fontsize=36,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=3,Shadow=1,Alignment=2,MarginV=90'"
+    vf = f"subtitles={srt_path}:force_style='Fontname=DejaVu Sans,Fontsize=34,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=3,Shadow=1,Alignment=2,MarginV=90'"
     subprocess.run(["ffmpeg","-y","-i",in_mp4,"-vf",vf,"-c:a","copy",out_mp4], check=True)
 
-def render_segmented(broll_urls, segments_texts, voice_mp3, temp_mp4, final_mp4, target_h=1920, target_w=1080, target_dur=TARGET_DUR):
+def render_segmented(broll_urls, segments_texts, voice_mp3, temp_mp4, final_mp4, target_h=1920, target_w=1080):
     tmp = Path(tempfile.mkdtemp()); local = []
     for i,u in enumerate(broll_urls):
         p = tmp / f"b{i}.mp4"
@@ -380,6 +382,7 @@ def render_segmented(broll_urls, segments_texts, voice_mp3, temp_mp4, final_mp4,
     merged.write_videofile(temp_mp4, fps=30, codec="libx264", audio_codec="aac", threads=2, preset="fast", verbose=False, logger=None)
     voice.close(); [c.close() for c in clips]; merged.close()
     srt_path = "cap.srt"
+    # Captions from full voice text for exact match
     make_srt_from_transcript(" ".join(segments_texts), end, srt_path)
     burn_subs(temp_mp4, srt_path, final_mp4)
     v = VideoFileClip(final_mp4); d = v.duration; v.close()
@@ -461,7 +464,7 @@ def get_metadata_from_issue_body(issue_body):
 def set_metadata_in_issue_body(issue_body, meta):
     block = "```json\n" + json.dumps(meta, indent=2) + "\n```"
     if "```json" in issue_body:
-        # Use callable replacement to avoid interpreting backslashes like \u in JSON
+        # Avoid interpreting backslashes (e.g., \u) in replacement
         return re.sub(r"```json\s*\{.*?\}\s*```", lambda m: block, issue_body, flags=re.S)
     return issue_body + "\n\nMetadata:\n" + block
 
@@ -518,7 +521,7 @@ def post_preview_comment(owner, repo, number, meta, slot):
     )
     post_comment(owner, repo, number, msg)
 
-# ---------- Used topics history (only those previously approved for upload) ----------
+# ---------- Used topics history (exclude only those previously approved for upload) ----------
 def norm_topic(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
@@ -548,10 +551,10 @@ def list_used_topics_uploaded_only(owner, repo, max_pages=5):
         page += 1
     return used
 
-# ---------- Build preview and enforce rules ----------
+# ---------- Build preview and enforce rules (no slow-down) ----------
 def build_preview_until_under_58(topic, slot, issue_body, max_attempts=6):
-    # Try progressively denser scripts to reach >=50s without crossing 58s
-    word_targets = ["120–135","110–130","105–125","100–120","95–115","90–110"]
+    # Increase or decrease word targets to fit 50–58s without slowing audio
+    word_targets = ["130–145","120–135","110–130","105–125","100–120","95–115"]
     for attempt in range(1, max_attempts+1):
         s = llm_script(topic, word_hint=word_targets[min(attempt-1, len(word_targets)-1)])
         voice_text = s.get("voiceover","").strip()
@@ -559,18 +562,28 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=6):
             continue
         # TTS
         voice_raw = "voice.mp3"; gTTS(voice_text, lang=TTS_LANG).save(voice_raw)
-        # Retiming voice to hit 50–57.3s window
-        voice, voice_dur = ensure_voice_in_window(voice_raw, target=TARGET_DUR, min_s=PREVIEW_MIN, max_s=PREVIEW_MAX)
-        if not (PREVIEW_MIN <= voice_dur <= PREVIEW_MAX):
+        dur = audio_duration(voice_raw)
+        # If narration is too short, regenerate a longer script (do NOT slow voice)
+        if dur < PREVIEW_MIN:
             continue
+        # If narration is too long, speed up slightly (never slow down)
+        if dur > PREVIEW_MAX:
+            voice_adj, dur2 = maybe_speed_up_audio(voice_raw, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, max_factor=1.2)
+            if dur2 > PREVIEW_MAX:
+                # still too long, try a shorter script next attempt
+                continue
+            voice = voice_adj; voice_dur = dur2
+        else:
+            voice = voice_raw; voice_dur = dur
         # Derive smart queries that match narration segments
         queries, seg_texts = derive_queries_from_voice(voice_text, segments=8)
         broll = fetch_broll_for_queries(queries)
         if len(broll) < 3:
             continue
         temp, final = "temp.mp4", "short.mp4"
-        dur = render_segmented(broll, seg_texts, voice, temp, final, target_h=1920, target_w=1080, target_dur=voice_dur)
-        if PREVIEW_MIN <= dur <= 58.0:
+        dur_final = render_segmented(broll, seg_texts, voice, temp, final, target_h=1920, target_w=1080)
+        # Enforce strictly between 50 and 58 seconds
+        if PREVIEW_MIN <= dur_final <= 58.0:
             desc = f"""{s['description']}
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
@@ -585,7 +598,7 @@ Educational only, not medical advice. Consult a qualified professional for perso
                 "preview_link": link,
                 "slot": slot,
                 "created_at": datetime.utcnow().isoformat(),
-                "duration_sec": round(dur,2),
+                "duration_sec": round(dur_final,2),
                 "attempt": attempt
             }
             new_body = set_metadata_in_issue_body(issue_body, meta)
@@ -638,7 +651,7 @@ def safe_main():
             if norm_topic(f) not in used and norm_topic(f) not in seen_norm:
                 cleaned.append(f); seen_norm.add(norm_topic(f))
         options = cleaned[:3] if cleaned else ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine"]
-        # Update metadata JSON topics as well to keep everything consistent
+        # Update metadata JSON topics
         try:
             meta = get_metadata_from_issue_body(body) or {}
         except Exception:
