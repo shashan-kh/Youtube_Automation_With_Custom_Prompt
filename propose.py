@@ -84,52 +84,7 @@ def open_issues_with_labels(owner, repo, labels):
     log(f"Open issues with labels {labels}:", [(i.get('number'), i.get('title')) for i in issues])
     return issues
 
-def extract_json_block(text):
-    m = re.search(r"```json\s*(\{.*?\})\s*```", text or "", re.S)
-    if m: return m.group(1)
-    m = re.search(r"```\s*(\{.*?\})\s*```", text or "", re.S)
-    if m: return m.group(1)
-    m = re.search(r"\{.*\}", text or "", re.S)
-    return m.group(0) if m else None
-
-def get_metadata_from_issue_body(issue_body):
-    blk = extract_json_block(issue_body or "")
-    if not blk:
-        return None
-    try:
-        return json.loads(blk)
-    except Exception:
-        return None
-
-def norm_topic(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
-
-def list_used_topics_uploaded_only(owner, repo, max_pages=5):
-    used = set()
-    page = 1
-    while page <= max_pages:
-        r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues",
-               params={"state": "all", "per_page": 100, "page": page})
-        items = r.json()
-        if not isinstance(items, list) or not items:
-            break
-        for it in items:
-            if "pull_request" in it:
-                continue
-            body = it.get("body") or ""
-            meta = get_metadata_from_issue_body(body) or {}
-            # Only count topics that were actually approved for upload
-            if meta.get("upload_approved") is True:
-                t = meta.get("topic")
-                if isinstance(t, str) and t.strip():
-                    used.add(norm_topic(t))
-        if len(items) < 100:
-            break
-        page += 1
-    log("Used topics (approved for upload):", list(sorted(used))[:10], "...")
-    return used
-
-def fetch_trending_candidates(region="IN", max_items=24):
+def fetch_trending_candidates(region="IN", max_items=12):
     pt = TrendReq(hl="en-IN", tz=330)
     seeds = ["sleep","hydration","walking","steps","posture","stretching","mobility","stress","breathing","morning sunlight","protein","fiber","yoga","desk ergonomics","screen time","healthy snacks"]
     banned = re.compile(r"(covid|vaccine|cancer|diabetes|ozempic|semaglutide|hiv|flu|tumor|depress|adhd|autism|arthritis|ibd|crohn|pcos|pregnan|detox|steroid|pill|drug|supplement|dosage|cure|therapy)", re.I)
@@ -150,21 +105,20 @@ def fetch_trending_candidates(region="IN", max_items=24):
             for k in ("rising","top"):
                 df2 = rq_s.get(k)
                 if df2 is not None and "query" in df2.columns:
-                    for q in df2.head(12)["query"].tolist():
+                    for q in df2.head(10)["query"].tolist():
                         if isinstance(q, str) and not banned.search(q):
                             found.append(q)
         except Exception as e:
             log(f"pytrends related_queries error for seed '{s}':", e)
             continue
     out, seen = [], set()
-    for q in found + seeds:
-        key = str(q).strip()
-        n = norm_topic(key)
-        if n and n not in seen:
-            seen.add(n); out.append(key)
+    for q in found:
+        key = q.lower().strip()
+        if key not in seen:
+            seen.add(key); out.append(q.strip())
         if len(out) >= max_items: break
     final = out or ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine","Take more walking breaks","Easy stretch flow"]
-    log("Candidate topics:", final[:6])
+    log("Candidate topics:", final[:3])
     return final
 
 def create_topic_issue(owner, repo, topics, scheduled_ist):
@@ -176,8 +130,6 @@ def create_topic_issue(owner, repo, topics, scheduled_ist):
     title = f"Topic approval for {SLOT} slot ({scheduled_ist.strftime('%Y-%m-%d')} {scheduled_ist.strftime('%H:%M')} IST)"
     body = f"""Proposed topics for tomorrow's {SLOT} slot.
 Scheduled publish (IST): {scheduled_ist.strftime('%Y-%m-%d %H:%M')}.
-
-(Excluding topics previously approved for upload.)
 
 Choose one:
 1) {topics[0]}
@@ -207,7 +159,6 @@ def main():
     if not GITHUB_TOKEN:
         print("GITHUB_TOKEN not available.")
         sys.exit(2)
-
     owner, repo = REPO.split("/")
     try:
         open_slot = open_issues_with_labels(owner, repo, [f"slot:{SLOT}","await-topic-approval"])
@@ -217,39 +168,7 @@ def main():
     if isinstance(open_slot, list) and open_slot:
         print("An approval issue for this slot is already open. Skipping.")
         return
-
-    # Exclude only topics previously approved for upload
-    used = list_used_topics_uploaded_only(owner, repo)
-    candidates = fetch_trending_candidates(REGION, max_items=30)
-    fresh = []
-    seen = set()
-    for t in candidates:
-        n = norm_topic(t)
-        if n in used or n in seen:
-            continue
-        seen.add(n); fresh.append(t)
-        if len(fresh) >= 3:
-            break
-    # Fallbacks if needed
-    if len(fresh) < 3:
-        fallbacks = [
-            "Desk posture routine","Breath to reduce stress","Get morning sunlight",
-            "Protein with every meal","High-fiber snack ideas","Simple mobility flow",
-            "Screen-time wind-down","Take more walking breaks","Wind-down sleep ritual"
-        ]
-        for f in fallbacks:
-            if len(fresh) >= 3: break
-            if norm_topic(f) not in used and norm_topic(f) not in seen:
-                fresh.append(f); seen.add(norm_topic(f))
-
-    if len(fresh) < 3:
-        base = ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine","Take more walking breaks","Easy stretch flow"]
-        for b in base:
-            if len(fresh) >= 3: break
-            if norm_topic(b) not in used and norm_topic(b) not in seen:
-                fresh.append(b); seen.add(norm_topic(b))
-
-    topics = fresh[:3]
+    topics = fetch_trending_candidates(REGION, max_items=12)[:3]
     scheduled_ist = next_slot_ist()
     try:
         create_topic_issue(owner, repo, topics, scheduled_ist)
