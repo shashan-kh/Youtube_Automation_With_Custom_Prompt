@@ -32,12 +32,11 @@ TTS_LANG = os.getenv("TTS_LANG", "en")
 
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
 PREVIEW_MIN = 50.0
-PREVIEW_MAX = 57.3   # keep headroom under 58s
-TARGET_DUR  = 56.5
+PREVIEW_MAX = 57.3   # headroom under 58s for Shorts
+TARGET_DUR  = 56.0
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def is_authorized_commenter(event):
-    # Allow OWNER, MEMBER, COLLABORATOR or the repo owner login
     assoc = (event.get("comment", {}).get("author_association") or "").upper()
     commenter = event.get("comment", {}).get("user", {}).get("login", "")
     repo_owner = event.get("repository", {}).get("owner", {}).get("login", "")
@@ -77,7 +76,6 @@ def extract_json_block(text):
     return m.group(0) if m else None
 
 def parse_topics_from_body(body):
-    # Prefer latest "New topic options:" or "Choose one:" block, else metadata JSON, else any numbered lines
     lines = body.splitlines()
     def collect_after_marker(marker):
         idxs = [i for i, l in enumerate(lines) if marker in l.lower()]
@@ -87,14 +85,11 @@ def parse_topics_from_body(body):
         out = []
         for ln in lines[start:]:
             s = ln.strip()
-            if not s:
-                break
-            if "reply with" in s.lower():
-                break
+            if not s: break
+            if "reply with" in s.lower(): break
             m = re.match(r"^\s*(?:[-*•]\s*)?(?:\d+[\)\.\-:])\s+(.*\S)", s)
             if not m:
-                if re.match(r"^[A-Z].*:$", s) or s.startswith("/"):
-                    break
+                if re.match(r"^[A-Z].*:$", s) or s.startswith("/"): break
                 continue
             out.append(m.group(1).strip())
         return out[:3]
@@ -220,17 +215,15 @@ Output pure JSON with:
             continue
     avail = list_groq_models()
     if avail:
-        raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above.")
+        raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS to one of the above.")
     raise last_err or RuntimeError("Groq call failed; no models available to try")
 
-# --------- Voice duration helpers (never slow down) ----------
+# ---------- Voice timing helpers (never slow voice) ----------
 def audio_duration(path):
     a = AudioFileClip(path); d = a.duration; a.close(); return d
 
 def maybe_speed_up_audio(voice_path, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, max_factor=1.2):
-    """
-    Only speed up if narration is too long. Never slow down.
-    """
+    # Only speed up if too long, never slow down
     if dur <= max_s:
         return voice_path, dur
     factor = max(1.02, min(max_factor, dur / max(target, max_s - 0.3)))
@@ -239,7 +232,59 @@ def maybe_speed_up_audio(voice_path, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, 
     d2 = audio_duration(out)
     return out, d2
 
-# --------- Smart B-roll queries matched to narration ----------
+def llm_append_words(topic, base_text, add_words):
+    # Ask LLM to append ~N words to extend narration (no stage directions)
+    prompt = f"""
+Topic: {topic}
+Current voiceover:
+\"\"\"{base_text}\"\"\"
+
+Append approximately {add_words} more words that naturally continue the narration with actionable, general wellness guidance.
+No medical claims, no dosages, no diseases. Keep the same tone. Output ONLY the additional lines (plain text).
+"""
+    models = build_model_list()
+    for model in models:
+        r = call_groq(prompt, model)
+        if r.status_code == 200:
+            content = (r.json().get("choices",[{}])[0].get("message",{}) or {}).get("content","").strip()
+            if content:
+                # strip accidental JSON/code blocks
+                content = re.sub(r"^```.*?\n|\n```$", "", content, flags=re.S).strip()
+                return content
+    return ""
+
+def expand_voiceover_to_target(topic, base_text, cur_dur, min_s=PREVIEW_MIN, target=TARGET_DUR, max_s=PREVIEW_MAX, max_rounds=3):
+    # Estimate speaking rate from current audio
+    words = len(re.findall(r"[A-Za-z']+", base_text))
+    wps = (words / cur_dur) if cur_dur > 0 else 2.7
+    wps = max(2.0, min(4.0, wps))  # clamp
+    text = base_text
+    dur = cur_dur
+    rounds = 0
+    while dur < min_s and rounds < max_rounds:
+        need_sec = max(min_s + 0.6 - dur, target - dur)
+        add_words = int(math.ceil(need_sec * wps * 1.05))
+        add_words = max(25, min(120, add_words))
+        extra = llm_append_words(topic, text, add_words)
+        if not extra:
+            # fallback extend
+            extra = " Keep showing up daily—small, consistent actions compound over time."
+        text = (text.rstrip() + " " + extra.strip()).strip()
+        # Resynthesize to measure real duration
+        tmp_voice = "voice_ext.mp3"
+        gTTS(text, lang=TTS_LANG).save(tmp_voice)
+        dur = audio_duration(tmp_voice)
+        rounds += 1
+        if dur <= max_s:
+            # accept extended version
+            os.replace(tmp_voice, "voice.mp3")
+        else:
+            # too long; discard this extension for now
+            os.remove(tmp_voice)
+            break
+    return text
+
+# ---------- Smart B-roll ----------
 KEYWORD_QUERIES = [
     (["hydrate","hydration","water","sip","bottle","glass"], ["drinking water", "pouring water into glass", "water bottle"]),
     (["sleep","bed","night","screen","blue light","caffeine","bedtime","wind-down"], ["sleeping at night", "bedtime routine", "turning off screens"]),
@@ -297,8 +342,7 @@ def fetch_broll_for_queries(queries):
                 for f in files:
                     h, w = f.get("height",0), f.get("width",0)
                     if h >= 1080 and w <= h:
-                        candidates.append((h, w, f.get("link")))
-                        break
+                        candidates.append((h, w, f.get("link"))); break
             random.shuffle(candidates)
             if candidates:
                 urls.append(candidates[0][2])
@@ -325,18 +369,16 @@ def fmt_time(t):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def make_srt_from_transcript(transcript, duration, path):
-    # Captions are exactly the voiceover text, chunked small, bottom placement handled in burn_subs
     text = re.sub(r"\s+", " ", (transcript or "").strip())
     words = text.split()
     if not words:
         words = ["Simple", "wellness", "tip", "Move", "hydrate", "rest"]
-    n_lines = max(6, min(9, math.ceil(len(words) / 14)))  # ~4–7 words per line
+    n_lines = max(6, min(9, math.ceil(len(words) / 14)))
     chunk = max(4, min(7, math.ceil(len(words)/n_lines)))
     lines = []
     i = 0
     while i < len(words):
-        lines.append(" ".join(words[i:i+chunk]))
-        i += chunk
+        lines.append(" ".join(words[i:i+chunk])); i += chunk
     lines = lines[:n_lines]
     step = max(1.0, duration / len(lines))
     t = 0.4
@@ -350,7 +392,6 @@ def make_srt_from_transcript(transcript, duration, path):
         f.writelines(out)
 
 def burn_subs(in_mp4, srt_path, out_mp4):
-    # Bottom, small, stroked, bright
     vf = f"subtitles={srt_path}:force_style='Fontname=DejaVu Sans,Fontsize=34,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=3,Shadow=1,Alignment=2,MarginV=90'"
     subprocess.run(["ffmpeg","-y","-i",in_mp4,"-vf",vf,"-c:a","copy",out_mp4], check=True)
 
@@ -372,7 +413,7 @@ def render_segmented(broll_urls, segments_texts, voice_mp3, temp_mp4, final_mp4,
         src = local[i % len(local)]
         c = VideoFileClip(src)
         take = min(per, max(4.0, min(10.0, c.duration)))
-        sub = c.subclip(0, take).resize(height=target_h)
+        sub = c.subclip(0, take).resize(height=1920)
         if sub.w != target_w:
             sub = sub.crop(x_center=sub.w/2, width=target_w, height=target_h)
         clips.append(sub)
@@ -382,7 +423,6 @@ def render_segmented(broll_urls, segments_texts, voice_mp3, temp_mp4, final_mp4,
     merged.write_videofile(temp_mp4, fps=30, codec="libx264", audio_codec="aac", threads=2, preset="fast", verbose=False, logger=None)
     voice.close(); [c.close() for c in clips]; merged.close()
     srt_path = "cap.srt"
-    # Captions from full voice text for exact match
     make_srt_from_transcript(" ".join(segments_texts), end, srt_path)
     burn_subs(temp_mp4, srt_path, final_mp4)
     v = VideoFileClip(final_mp4); d = v.duration; v.close()
@@ -464,7 +504,6 @@ def get_metadata_from_issue_body(issue_body):
 def set_metadata_in_issue_body(issue_body, meta):
     block = "```json\n" + json.dumps(meta, indent=2) + "\n```"
     if "```json" in issue_body:
-        # Avoid interpreting backslashes (e.g., \u) in replacement
         return re.sub(r"```json\s*\{.*?\}\s*```", lambda m: block, issue_body, flags=re.S)
     return issue_body + "\n\nMetadata:\n" + block
 
@@ -472,17 +511,13 @@ def extract_youtube_id(text):
     if not text:
         return None
     m = re.search(r"<!--\s*preview_video_id:\s*([A-Za-z0-9_-]{11})\s*-->", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]{11})", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?[^ \n\r]*v=([A-Za-z0-9_-]{11})", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     return None
 
 def find_preview_video_id(owner, repo, number, issue_body):
@@ -492,13 +527,11 @@ def find_preview_video_id(owner, repo, number, issue_body):
             return meta["preview_video_id"]
         if "preview_link" in meta and meta["preview_link"]:
             vid = extract_youtube_id(meta["preview_link"])
-            if vid:
-                return vid
+            if vid: return vid
     except Exception:
         pass
     vid = extract_youtube_id(issue_body)
-    if vid:
-        return vid
+    if vid: return vid
     try:
         r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments", params={"per_page": 100})
         comments = r.json()
@@ -506,8 +539,7 @@ def find_preview_video_id(owner, repo, number, issue_body):
             for c in reversed(comments):
                 body = c.get("body", "") or ""
                 vid = extract_youtube_id(body)
-                if vid:
-                    return vid
+                if vid: return vid
     except Exception:
         pass
     return None
@@ -535,8 +567,7 @@ def list_used_topics_uploaded_only(owner, repo, max_pages=5):
         if not isinstance(items, list) or not items:
             break
         for it in items:
-            if "pull_request" in it:
-                continue
+            if "pull_request" in it: continue
             body = it.get("body") or ""
             try:
                 meta = get_metadata_from_issue_body(body) or {}
@@ -546,43 +577,47 @@ def list_used_topics_uploaded_only(owner, repo, max_pages=5):
                 t = meta.get("topic")
                 if isinstance(t, str) and t.strip():
                     used.add(norm_topic(t))
-        if len(items) < 100:
-            break
+        if len(items) < 100: break
         page += 1
     return used
 
-# ---------- Build preview and enforce rules (no slow-down) ----------
-def build_preview_until_under_58(topic, slot, issue_body, max_attempts=6):
-    # Increase or decrease word targets to fit 50–58s without slowing audio
-    word_targets = ["130–145","120–135","110–130","105–125","100–120","95–115"]
+# ---------- Main build loop (regenerate until fits without slowing voice) ----------
+def build_preview_until_under_58(topic, slot, issue_body, max_attempts=10):
+    word_targets = ["130–145","120–135","115–130","110–130","105–125","100–120","95–115","90–110","90–105","85–100"]
     for attempt in range(1, max_attempts+1):
         s = llm_script(topic, word_hint=word_targets[min(attempt-1, len(word_targets)-1)])
-        voice_text = s.get("voiceover","").strip()
-        if not voice_text:
-            continue
-        # TTS
+        voice_text = (s.get("voiceover","") or "").strip()
+        if not voice_text: continue
+
+        # TTS initial
         voice_raw = "voice.mp3"; gTTS(voice_text, lang=TTS_LANG).save(voice_raw)
         dur = audio_duration(voice_raw)
-        # If narration is too short, regenerate a longer script (do NOT slow voice)
+
+        # If narration too short, extend by appending content (never slow voice)
         if dur < PREVIEW_MIN:
-            continue
-        # If narration is too long, speed up slightly (never slow down)
+            voice_text = expand_voiceover_to_target(topic, voice_text, dur, min_s=PREVIEW_MIN, target=TARGET_DUR, max_s=PREVIEW_MAX, max_rounds=3)
+            gTTS(voice_text, lang=TTS_LANG).save(voice_raw)
+            dur = audio_duration(voice_raw)
+
+        # If still too long, speed up slightly (never slow down)
         if dur > PREVIEW_MAX:
             voice_adj, dur2 = maybe_speed_up_audio(voice_raw, dur, target=TARGET_DUR, max_s=PREVIEW_MAX, max_factor=1.2)
             if dur2 > PREVIEW_MAX:
-                # still too long, try a shorter script next attempt
+                # script still too long; try next attempt with different density
                 continue
-            voice = voice_adj; voice_dur = dur2
+            voice_file = voice_adj; voice_dur = dur2
         else:
-            voice = voice_raw; voice_dur = dur
-        # Derive smart queries that match narration segments
+            voice_file = voice_raw; voice_dur = dur
+
+        # Build visuals matched to narration
         queries, seg_texts = derive_queries_from_voice(voice_text, segments=8)
         broll = fetch_broll_for_queries(queries)
         if len(broll) < 3:
             continue
+
         temp, final = "temp.mp4", "short.mp4"
-        dur_final = render_segmented(broll, seg_texts, voice, temp, final, target_h=1920, target_w=1080)
-        # Enforce strictly between 50 and 58 seconds
+        dur_final = render_segmented(broll, seg_texts, voice_file, temp, final)
+
         if PREVIEW_MIN <= dur_final <= 58.0:
             desc = f"""{s['description']}
 
@@ -610,8 +645,8 @@ def safe_main():
     owner, repo = REPO.split("/")
     issue = e["issue"]; number = issue["number"]
     if not is_authorized_commenter(e):
-        print("Ignoring comment from non-collaborator/owner")
-        return
+        print("Ignoring comment from non-collaborator/owner"); return
+
     comment = e["comment"]["body"].strip()
     body = issue["body"]
     labels = issue.get("labels", [])
@@ -628,19 +663,14 @@ def safe_main():
                 found += df["title"].tolist()[:10]
         except Exception:
             pass
-        # Exclude topics that were previously approved for upload (not just previewed)
         used = list_used_topics_uploaded_only(owner, repo)
-        cleaned = []
-        seen_norm = set()
-        for s in (found + seeds):
-            t = str(s).strip()
-            if not t:
-                continue
-            norm = norm_topic(t)
-            if norm in used or norm in seen_norm:
-                continue
-            seen_norm.add(norm); cleaned.append(t.title())
-        # Fallback pool if not enough after filtering
+        cleaned, seen_norm = [], set()
+        for s_ in (found + seeds):
+            t = str(s_).strip()
+            if not t: continue
+            n = norm_topic(t)
+            if n in used or n in seen_norm: continue
+            seen_norm.add(n); cleaned.append(t.title())
         fallbacks = [
             "Desk posture routine","Breath to reduce stress","Get morning sunlight",
             "Protein with every meal","High-fiber snack ideas","Simple mobility flow",
@@ -651,14 +681,13 @@ def safe_main():
             if norm_topic(f) not in used and norm_topic(f) not in seen_norm:
                 cleaned.append(f); seen_norm.add(norm_topic(f))
         options = cleaned[:3] if cleaned else ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine"]
-        # Update metadata JSON topics
         try:
             meta = get_metadata_from_issue_body(body) or {}
         except Exception:
             meta = {}
         meta["topics"] = options
         new_body = set_metadata_in_issue_body(body, meta)
-        new_body += "\n\nNew topic options (excluding topics previously approved for upload):\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3), or provide your own with:\n/custom-topic Your Topic"
+        new_body += "\n\nNew topic options (excluding topics previously approved for upload):\n" + "\n".join([f"{i+1}) {t}" for i,t in enumerate(options, 1)]) + "\n\nReply with /approve-topic 1 (or 2/3), or use:\n/custom-topic Your Topic"
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-topic-approval")
         remove_label(owner, repo, number, "await-video-approval")
@@ -668,12 +697,10 @@ def safe_main():
     if comment.lower().startswith("/custom-topic"):
         topic = comment[len("/custom-topic"):].strip()
         if not topic:
-            post_comment(owner, repo, number, "Please provide a topic. Example:\n/custom-topic Morning hydration habit")
-            return
-        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=6)
+            post_comment(owner, repo, number, "Please provide a topic. Example:\n/custom-topic Morning hydration habit"); return
+        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=10)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't meet 50–58s window after several attempts. Try a simpler topic or /new-topic.")
-            return
+            post_comment(owner, repo, number, "Couldn't meet 50–58s after several attempts. Try a simpler topic or /new-topic."); return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
         post_preview_comment(owner, repo, number, meta, slot)
@@ -688,20 +715,17 @@ def safe_main():
             if arg.isdigit():
                 idx = int(arg)
                 if not topics or not (1 <= idx <= len(topics)):
-                    post_comment(owner, repo, number, "Invalid index. Use 1/2/3, or provide your own with:\n/custom-topic Your Topic")
-                    return
+                    post_comment(owner, repo, number, "Invalid index. Use 1/2/3, or:\n/custom-topic Your Topic"); return
                 topic = topics[idx-1]
             else:
                 topic = arg
         else:
             if not topics:
-                post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Use /new-topic or /custom-topic Your Topic.")
-                return
+                post_comment(owner, repo, number, "Couldn't detect topics. Use /new-topic or /custom-topic Your Topic."); return
             topic = topics[0]
-        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=6)
+        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=10)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't meet 50–58s window after several attempts. Reply /new-topic or /custom-topic Your Topic.")
-            return
+            post_comment(owner, repo, number, "Couldn't meet 50–58s after several attempts. Reply /new-topic or /custom-topic Your Topic."); return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
         post_preview_comment(owner, repo, number, meta, slot)
@@ -712,17 +736,15 @@ def safe_main():
         deletion_msg = ""
         if vid_id:
             try:
-                yt_delete_video(vid_id)
-                deletion_msg = f"Deleted unlisted preview video (ID: {vid_id})."
+                yt_delete_video(vid_id); deletion_msg = f"Deleted unlisted preview video (ID: {vid_id})."
             except Exception as de:
                 deletion_msg = f"Couldn't delete preview on YouTube (ID: {vid_id}): {de}"
         else:
-            deletion_msg = "No preview video ID found (looked in metadata, body, and recent comments)."
+            deletion_msg = "No preview video ID found (checked metadata, body, and comments)."
         try:
             meta = get_metadata_from_issue_body(body) or {}
             for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic"]:
-                if k in meta:
-                    del meta[k]
+                if k in meta: del meta[k]
             new_body = set_metadata_in_issue_body(body, meta)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         except Exception as e2:
@@ -736,12 +758,10 @@ def safe_main():
         meta = get_metadata_from_issue_body(body)
         topic = meta["topic"] if meta and "topic" in meta else None
         if not topic:
-            post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic or /custom-topic first.")
-            return
-        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=6)
+            post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic or /custom-topic first."); return
+        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=10)
         if not meta2:
-            post_comment(owner, repo, number, "Couldn't meet 50–58s window after several attempts. Use /new-topic or /custom-topic.")
-            return
+            post_comment(owner, repo, number, "Couldn't meet 50–58s after several attempts. Use /new-topic or /custom-topic."); return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval")
         post_preview_comment(owner, repo, number, meta2, slot)
@@ -750,21 +770,16 @@ def safe_main():
     if comment.lower().startswith("/approve-video"):
         vid_id = None
         meta = get_metadata_from_issue_body(body)
-        if meta and "preview_video_id" in meta:
-            vid_id = meta["preview_video_id"]
+        if meta and "preview_video_id" in meta: vid_id = meta["preview_video_id"]
+        if not vid_id: vid_id = find_preview_video_id(owner, repo, number, body)
         if not vid_id:
-            vid_id = find_preview_video_id(owner, repo, number, body)
-        if not vid_id:
-            post_comment(owner, repo, number, "No preview video found. Please /regenerate-video.")
-            return
+            post_comment(owner, repo, number, "No preview video found. Please /regenerate-video."); return
         publish_at_utc = schedule_existing_video(vid_id, (meta or {}).get("slot","morning"))
-        # Mark this topic as approved for upload in metadata so future suggestions exclude it
+        # Mark topic as upload-approved for future filtering
         try:
-            latest_issue = get_issue(owner, repo, number)
-            latest_body = latest_issue.get("body") or body
+            latest = get_issue(owner, repo, number); latest_body = latest.get("body") or body
             meta2 = get_metadata_from_issue_body(latest_body) or {}
-            meta2["upload_approved"] = True
-            meta2["publish_at_utc"] = publish_at_utc
+            meta2["upload_approved"] = True; meta2["publish_at_utc"] = publish_at_utc
             new_body2 = set_metadata_in_issue_body(latest_body, meta2)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body2})
         except Exception:
@@ -787,12 +802,11 @@ def main():
             avail = list_groq_models()
             addendum = ""
             if avail:
-                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
+                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
-            print("FATAL:", e)
-            print(traceback.format_exc())
+            print("FATAL:", e); print(traceback.format_exc())
         return
 
 if __name__ == "__main__":
