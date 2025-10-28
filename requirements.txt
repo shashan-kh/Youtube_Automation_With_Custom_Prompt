@@ -5,6 +5,7 @@ wheel>=0.41
 # Core
 requests
 gTTS
+packaging>=23.1
 
 # YouTube + Google auth
 google-api-python-client
