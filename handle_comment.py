@@ -3,9 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip
 from gtts import gTTS
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+# Lazy-import Google API client libs later to avoid hard failure if 'packaging' isn't present yet.
 
 # Env
 REGION = os.getenv("REGION", "IN")
@@ -318,11 +316,34 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
             return d2
     return d
 
+# ---------- Ensure Google API client (lazy import with fallback) ----------
+def ensure_google_client():
+    try:
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+        return Credentials, build, MediaFileUpload
+    except Exception:
+        # Install missing deps (especially 'packaging') at runtime if needed
+        pkgs = []
+        try:
+            import packaging  # noqa: F401
+        except Exception:
+            pkgs.append("packaging>=23.1")
+        # Ensure Google client libs present
+        pkgs += ["google-api-python-client", "google-auth", "google-auth-oauthlib"]
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "-q"] + pkgs, check=True)
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+        return Credentials, build, MediaFileUpload
+
 # ---------- YouTube helpers ----------
 def yt_client():
     for v in ["YT_CLIENT_ID","YT_CLIENT_SECRET","YT_REFRESH_TOKEN"]:
         if not os.getenv(v):
             raise RuntimeError(f"Missing {v} secret")
+    Credentials, build, _ = ensure_google_client()
     creds = Credentials(
         token=None,
         refresh_token=os.getenv("YT_REFRESH_TOKEN"),
@@ -334,6 +355,7 @@ def yt_client():
     return build("youtube", "v3", credentials=creds)
 
 def upload_youtube_unlisted(video_path, title, description, tags):
+    _, _, MediaFileUpload = ensure_google_client()
     yt = yt_client()
     body = {
         "snippet": {
