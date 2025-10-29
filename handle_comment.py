@@ -3,10 +3,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from moviepy.editor import (
     VideoFileClip, concatenate_videoclips, AudioFileClip,
-    ColorClip, CompositeVideoClip
+    CompositeVideoClip
 )
-from moviepy.video.fx import all as vfx  # use colorx; no blur in moviepy 1.0.3
 from gtts import gTTS
+import cv2  # for simple face detection to focus crop
 # Google client libs are lazy-imported later to avoid hard failures if 'packaging' missing.
 
 # Env
@@ -315,10 +315,10 @@ def _ffmpeg_escape(s):
     )
 
 def burn_captions(in_mp4, srt_path, out_mp4):
-    # Smaller, yellow with black stroke, bottom-center, no filled box
+    # Even smaller, yellow with black stroke, bottom-center, no filled box
     # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
     style = (
-        "Fontname=DejaVu Sans,Fontsize=18,Bold=1,"
+        "Fontname=DejaVu Sans,Fontsize=8,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
         "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110"
     )
@@ -373,41 +373,58 @@ def add_bgm_to_video(in_mp4, out_mp4, duration):
         "-c:v","copy","-c:a","aac","-shortest", out_mp4
     ], check=True)
 
-# ---------- Visual composition (cover with blurred background; no stretching of foreground) ----------
-def _soft_blur(clip, downscale=0.2):
-    """Approximate blur by downscaling and upscaling (works on moviepy 1.0.3 without blur fx)."""
-    downscale = max(0.05, min(0.5, float(downscale)))
-    tw, th = clip.w, clip.h
-    return clip.resize(downscale).resize((tw, th))
+# ---------- Visual composition (cover using subject-focused crop; no stretching) ----------
+_cascade = None
+def _get_face_cascade():
+    global _cascade
+    if _cascade is None:
+        try:
+            _cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        except Exception:
+            _cascade = None
+    return _cascade
 
-def cover_with_blur_bg(clip, target_w=1080, target_h=1920):
-    """Foreground: fit inside 1080x1920 with AR preserved.
-       Background: same clip scaled to cover, cropped, blurred and darkened to fill 1080x1920."""
-    # Foreground fit
-    s_fit = min(target_w / clip.w, target_h / clip.h)
-    fg = clip.resize(s_fit)
-
-    # Background cover (can crop background, never the foreground)
+def smart_cover_crop(clip, target_w=1080, target_h=1920):
+    """Scale-to-cover then crop to 1080x1920. Crop window centered on detected face if any, else center."""
+    # Scale to cover (no stretching)
     s_cover = max(target_w / clip.w, target_h / clip.h)
-    bg = clip.resize(s_cover)
-    # Center-crop background to exact 1080x1920
-    bg = bg.crop(x_center=bg.w/2, y_center=bg.h/2, width=target_w, height=target_h)
-    # Blur and darken background for readability
-    try:
-        bg = _soft_blur(bg, downscale=0.2)
-    except Exception:
-        pass
-    try:
-        bg = bg.fx(vfx.colorx, 0.6)  # darken slightly
-    except Exception:
-        pass
-    bg = bg.set_duration(fg.duration)
+    resized = clip.resize(s_cover)
 
-    comp = CompositeVideoClip([bg, fg.set_position(("center","center"))], size=(target_w, target_h))
-    return comp.set_duration(fg.duration).set_audio(None)
+    # Pick a frame to analyze
+    t = min(max(0.0, resized.duration * 0.5), max(0.0, resized.duration - 0.05)) if resized.duration else 0.0
+    try:
+        frame = resized.get_frame(t)  # RGB
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        cascade = _get_face_cascade()
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)) if cascade is not None else []
+        if isinstance(faces, (list, tuple)) or getattr(faces, "shape", None) is not None:
+            # Choose the largest face
+            best = None; best_area = 0
+            for (x,y,w,h) in faces:
+                area = w*h
+                if area > best_area:
+                    best = (x,y,w,h); best_area = area
+            if best:
+                x,y,w,h = best
+                cx = x + w/2
+                cy = y + h/2
+            else:
+                cx, cy = resized.w/2, resized.h/2
+        else:
+            cx, cy = resized.w/2, resized.h/2
+    except Exception:
+        cx, cy = resized.w/2, resized.h/2
+
+    # Clamp crop center so the window stays within bounds
+    half_w = target_w/2; half_h = target_h/2
+    cx = max(half_w, min(resized.w - half_w, cx))
+    cy = max(half_h, min(resized.h - half_h, cy))
+
+    cropped = resized.crop(x_center=cx, y_center=cy, width=target_w, height=target_h)
+    return cropped.set_audio(None)
 
 def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, target_h=1920, target_w=1080):
-    """Build a 1080x1920 video, fully covered by blurred background; never exceed voice duration."""
+    """Build a 1080x1920 video, subject-focused cover crop; never exceed voice duration."""
     # Download b-roll
     tmp = Path(tempfile.mkdtemp()); local = []
     for i,u in enumerate(broll_urls):
@@ -423,7 +440,7 @@ def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, t
         c = VideoFileClip(p)
         take = min(8, max(4, int(c.duration)))
         c = c.subclip(0, take)
-        comp = cover_with_blur_bg(c, target_w=target_w, target_h=target_h)
+        comp = smart_cover_crop(c, target_w=target_w, target_h=target_h)
         unit_clips.append(comp)
     if not unit_clips:
         raise RuntimeError("No valid b-roll clips to render")
@@ -579,17 +596,13 @@ def extract_youtube_id(text):
     if not text:
         return None
     m = re.search(r"<!--\s*preview_video_id:\s*([A-Za-z0-9_-]{11})\s*-->", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]{11})", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?[^ \n\r]*v=([A-Za-z0-9_-]{11})", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     return None
 
 def find_preview_video_id(owner, repo, number, issue_body):
