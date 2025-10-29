@@ -1,4 +1,4 @@
-import os, re, json, tempfile, subprocess, requests, traceback, sys
+import os, re, json, tempfile, subprocess, requests, traceback, sys, shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from moviepy.editor import (
@@ -43,9 +43,10 @@ except Exception:
     BGM_VOL = 0.07
 
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
-PREVIEW_MIN = 35.0         # Accept videos >= 35s
-PREVIEW_TARGET_MIN = 50.0  # Aim to hit 50–58s first
-PREVIEW_MAX = 57.3
+PREVIEW_MIN = 35.0         # Accept videos >= 35s (target is 50–58s, but previews below 35s now permitted)
+TARGET_LOW = 35.0
+TARGET_HIGH = 58.0
+PREVIEW_MAX = 57.3         # render cap
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def is_authorized_commenter(event):
@@ -238,7 +239,7 @@ Output pure JSON with:
     raise last_err or RuntimeError("Groq call failed; no models available to try")
 
 # ---------- Audio and captions ----------
-def ensure_voice_in_range(voice_path, min_sec=PREVIEW_MIN, max_sec=PREVIEW_MAX):
+def ensure_voice_in_range(voice_path, min_sec=TARGET_LOW, max_sec=PREVIEW_MAX):
     """Normalize voice length into target band using ffmpeg atempo when feasible."""
     a = AudioFileClip(voice_path); dur = a.duration; a.close()
     if min_sec <= dur <= max_sec:
@@ -691,7 +692,7 @@ def upload_preview_fallback(video_path):
     except Exception:
         path_to_send = video_path
 
-    # 1) 0x0.st (simple and reliable)
+    # 1) 0x0.st
     try:
         with open(path_to_send, "rb") as f:
             r = requests.post("https://0x0.st", files={"file": (os.path.basename(path_to_send), f, "video/mp4")}, timeout=120)
@@ -711,7 +712,7 @@ def upload_preview_fallback(video_path):
     except Exception:
         pass
 
-    # 3) file.io (expires 1 day, sometimes rate-limited)
+    # 3) file.io
     try:
         with open(path_to_send, "rb") as f:
             r = requests.post("https://file.io", files={"file": (os.path.basename(path_to_send), f, "video/mp4")}, data={"expires": "1d"}, timeout=300)
@@ -732,16 +733,13 @@ def upload_preview_youtube_or_fallback(video_path, title, description, tags):
     except Exception as e:
         msg = str(e)
         blocked = ("uploadLimitExceeded" in msg) or ("exceeded the number of videos" in msg)
-        # For preview convenience, also fallback for other upload errors
         link, host = upload_preview_fallback(video_path)
         if link:
             return {"preview_video_id": None, "preview_link": link, "yt_upload_blocked": bool(blocked), "fallback": host or "fallback"}
-        # Could not fallback; return explicit error info
         return {"preview_video_id": None, "preview_link": None, "yt_upload_blocked": bool(blocked), "fallback": None, "error": msg}
 
 def upload_preview_youtube(video_path, title, description, tags):
     info = upload_preview_youtube_or_fallback(video_path, title, description, tags)
-    # Do not raise here; let caller handle info/error
     return info.get("preview_video_id"), info.get("preview_link"), info
 
 def schedule_existing_video(video_id, slot):
@@ -829,8 +827,11 @@ def post_preview_comment(owner, repo, number, meta, slot, prefix_msg=""):
     if meta.get("yt_upload_blocked"):
         blocked_note = ("\nNote: YouTube upload limit was reached. The preview is hosted temporarily here. "
                         "Approving upload will work once the limit resets (typically within 24 hours).")
+    target_note = ""
+    if meta.get("outside_target"):
+        target_note = f"\nNote: Length is outside target 35–58s, but you can still approve upload."
     msg = (
-        f"{prefix}Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}{blocked_note}\n"
+        f"{prefix}Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}{blocked_note}{target_note}\n"
         f"Reply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n"
         f"- /reject-video (delete preview and pick a new topic)\n\n"
         f"<!-- preview_video_id: {meta.get('preview_video_id','')} -->"
@@ -838,9 +839,21 @@ def post_preview_comment(owner, repo, number, meta, slot, prefix_msg=""):
     post_comment(owner, repo, number, msg)
 
 # ---------- Build preview and schedule ----------
+def _duration_score(d):
+    if TARGET_LOW <= d < TARGET_HIGH:
+        return 0.0
+    if d < TARGET_LOW:
+        return TARGET_LOW - d
+    return d - TARGET_HIGH
+
 def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
-    # Aim for 50–58s from the first attempt, but accept 35–58s
+    # Aim for 50–58s from the first attempt, but accept any length (we’ll prefer closest to 35–58 range)
     word_hint = "130–160"
+    best_path = None
+    best_dur = None
+    best_score = float("inf")
+    best_attempt = 0
+
     for attempt in range(1, max_attempts+1):
         s = llm_script(topic, word_hint=word_hint)
         text = s["voiceover"].strip()
@@ -850,20 +863,29 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
                 text += "."
             text += " Thank you for watching."
         voice = "voice.mp3"; gTTS(text, lang=TTS_LANG).save(voice)
-        voice, vdur = ensure_voice_in_range(voice, min_sec=PREVIEW_MIN, max_sec=PREVIEW_MAX)
+        voice, vdur = ensure_voice_in_range(voice, min_sec=TARGET_LOW, max_sec=PREVIEW_MAX)
         broll = fetch_broll(topic, need=6)
         if not broll:
             continue
-        temp, final = "temp.mp4", "short.mp4"
+        temp, final = "temp.mp4", f"short_{attempt}.mp4"
         dur = render_and_cap(broll, voice, vdur, temp, final)
-        if PREVIEW_MIN <= dur < 58.0:
+        # Track best candidate by closeness to target range
+        sc = _duration_score(dur)
+        if sc < best_score:
+            best_score = sc
+            best_dur = round(dur, 2)
+            best_attempt = attempt
+            best_path = f"best.mp4"
+            shutil.copyfile(final, best_path)
+
+        # If within [35,58), we upload now and return
+        if TARGET_LOW <= dur < TARGET_HIGH:
             desc = f"""{s['description']}
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
 #Shorts #health #wellness"""
             vid_id, link, info = upload_preview_youtube_wrapper(final, s["title"], desc, s.get("tags",""))
             if not link:
-                # Could not provide a preview link; embed error and bail gracefully
                 raise RuntimeError(f"Preview upload failed and fallback unavailable: {info.get('error','unknown error')}")
             meta = {
                 "topic": topic,
@@ -877,11 +899,47 @@ Educational only, not medical advice. Consult a qualified professional for perso
                 "slot": slot,
                 "created_at": datetime.utcnow().isoformat(),
                 "duration_sec": round(dur,2),
-                "attempt": attempt
+                "attempt": attempt,
+                "outside_target": False
             }
             new_body = set_metadata_in_issue_body(issue_body, meta)
             return meta, new_body
+
+        # Prepare next attempt slightly longer if too short
         word_hint = "145–170"
+
+    # If we reach here, we didn’t hit the 35–58s window. Upload the best we have.
+    if best_path and os.path.exists(best_path):
+        # Prepare metadata and upload preview for best candidate
+        # Use the last script’s fields if available; otherwise, generic
+        title = s["title"] if "title" in s else "Preview"
+        tags = s.get("tags","") if isinstance(s, dict) else ""
+        desc_body = s["description"] if isinstance(s, dict) and "description" in s else "Preview video."
+        desc = f"""{desc_body}
+
+Educational only, not medical advice. Consult a qualified professional for personal guidance.
+#Shorts #health #wellness"""
+        vid_id, link, info = upload_preview_youtube_wrapper(best_path, title, desc, tags)
+        if not link:
+            raise RuntimeError(f"Preview upload failed and fallback unavailable: {info.get('error','unknown error')}")
+        meta = {
+            "topic": topic,
+            "title": title,
+            "description": desc,
+            "tags": tags,
+            "preview_video_id": vid_id,
+            "preview_link": link,
+            "yt_upload_blocked": bool(info.get("yt_upload_blocked")),
+            "fallback_host": info.get("fallback"),
+            "slot": slot,
+            "created_at": datetime.utcnow().isoformat(),
+            "duration_sec": best_dur if best_dur is not None else 0.0,
+            "attempt": best_attempt if best_attempt else max_attempts,
+            "outside_target": True
+        }
+        new_body = set_metadata_in_issue_body(issue_body, meta)
+        return meta, new_body
+
     return None, issue_body
 
 def safe_main():
@@ -928,7 +986,7 @@ def safe_main():
             return
         meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't get to 35–58s after attempts. Try a simpler topic or /new-topic.")
+            post_comment(owner, repo, number, "Tried several times but couldn’t render a preview. Please /new-topic or try /custom-topic Another Topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
@@ -951,7 +1009,7 @@ def safe_main():
             topic = topics[idx-1]
         meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't get to 35–58s after attempts. Reply /new-topic or /custom-topic Your Topic.")
+            post_comment(owner, repo, number, "Tried several times but couldn’t render a preview. Please /new-topic or /custom-topic Another Topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
@@ -970,7 +1028,7 @@ def safe_main():
             deletion_msg = "No preview video ID found (looked in metadata, body, recent comments)."
         try:
             meta = get_metadata_from_issue_body(body) or {}
-            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic","yt_upload_blocked","fallback_host"]:
+            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic","yt_upload_blocked","fallback_host","outside_target"]:
                 if k in meta: del meta[k]
             new_body = set_metadata_in_issue_body(body, meta)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
@@ -1001,7 +1059,7 @@ def safe_main():
                 deleted_msg = f"Couldn't delete previous preview on YouTube (ID: {prev_vid}): {de}"
         # Clear preview fields in metadata before regenerating
         try:
-            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","yt_upload_blocked","fallback_host"]:
+            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","yt_upload_blocked","fallback_host","outside_target"]:
                 if k in meta_old: del meta_old[k]
             new_body_clear = set_metadata_in_issue_body(body, meta_old)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body_clear})
@@ -1011,7 +1069,7 @@ def safe_main():
 
         meta2, new_body2 = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta2:
-            post_comment(owner, repo, number, f"{deleted_msg}\nCouldn't get to 35–58s after attempts. Use /new-topic or /custom-topic.")
+            post_comment(owner, repo, number, f"{deleted_msg}\nTried several times but couldn’t render a preview. Use /new-topic or /custom-topic Another Topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body2})
         add_label(owner, repo, number, "await-video-approval")
@@ -1029,7 +1087,7 @@ def safe_main():
         if not vid_id:
             vid_id = find_preview_video_id(owner, repo, number, body)
         if not vid_id:
-            post_comment(owner, repo, number, "No preview video found on YouTube. Please /regenerate-video.")
+            post_comment(owner, repo, number, "No YouTube preview found. Please /regenerate-video.")
             return
         publish_at_utc = schedule_existing_video(vid_id, (meta or {}).get("slot","morning"))
         ist_time = datetime.fromisoformat(publish_at_utc.replace("Z","")).astimezone(IST).strftime("%Y-%m-%d %H:%M")
@@ -1048,9 +1106,9 @@ def main():
             owner, repo = REPO.split("/")
             issue = e_json["issue"]; number = issue["number"]
             avail = list_groq_models()
-            addendum = "\n\nIf YouTube upload limit is reached, I now auto-host the preview temporarily (0x0.st/transfer.sh/file.io)."
+            addendum = "\n\nIf YouTube upload limit is reached, I auto-host the preview temporarily (0x0.st / transfer.sh / file.io)."
             if avail:
-                addendum += "\nAvailable Groq models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above."
+                addendum += "\nAvailable Groq models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
