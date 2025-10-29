@@ -5,7 +5,7 @@ from moviepy.editor import (
     VideoFileClip, concatenate_videoclips, AudioFileClip,
     ColorClip, CompositeVideoClip
 )
-from moviepy.video.fx.all import blur, colorx
+from moviepy.video.fx import all as vfx  # use colorx; no blur in moviepy 1.0.3
 from gtts import gTTS
 # Google client libs are lazy-imported later to avoid hard failures if 'packaging' missing.
 
@@ -48,7 +48,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def is_authorized_commenter(event):
     assoc = (event.get("comment", {}).get("author_association") or "").upper()
     commenter = event.get("comment", {}).get("user", {}).get("login", "")
-    repo_owner = event.get("repository", {}).get("owner", "").get("login", "")
+    repo_owner = (event.get("repository", {}).get("owner", {}) or {}).get("login", "")
     return assoc in {"OWNER", "MEMBER", "COLLABORATOR"} or commenter == repo_owner
 
 def gh(method, url, **kwargs):
@@ -318,7 +318,7 @@ def burn_captions(in_mp4, srt_path, out_mp4):
     # Smaller, yellow with black stroke, bottom-center, no filled box
     # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
     style = (
-        "Fontname=DejaVu Sans,Fontsize=20,Bold=1,"
+        "Fontname=DejaVu Sans,Fontsize=18,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
         "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110"
     )
@@ -374,6 +374,12 @@ def add_bgm_to_video(in_mp4, out_mp4, duration):
     ], check=True)
 
 # ---------- Visual composition (cover with blurred background; no stretching of foreground) ----------
+def _soft_blur(clip, downscale=0.2):
+    """Approximate blur by downscaling and upscaling (works on moviepy 1.0.3 without blur fx)."""
+    downscale = max(0.05, min(0.5, float(downscale)))
+    tw, th = clip.w, clip.h
+    return clip.resize(downscale).resize((tw, th))
+
 def cover_with_blur_bg(clip, target_w=1080, target_h=1920):
     """Foreground: fit inside 1080x1920 with AR preserved.
        Background: same clip scaled to cover, cropped, blurred and darkened to fill 1080x1920."""
@@ -388,11 +394,11 @@ def cover_with_blur_bg(clip, target_w=1080, target_h=1920):
     bg = bg.crop(x_center=bg.w/2, y_center=bg.h/2, width=target_w, height=target_h)
     # Blur and darken background for readability
     try:
-        bg = bg.fx(blur, size=15)
+        bg = _soft_blur(bg, downscale=0.2)
     except Exception:
         pass
     try:
-        bg = bg.fx(colorx, 0.6)  # darken slightly
+        bg = bg.fx(vfx.colorx, 0.6)  # darken slightly
     except Exception:
         pass
     bg = bg.set_duration(fg.duration)
@@ -573,13 +579,17 @@ def extract_youtube_id(text):
     if not text:
         return None
     m = re.search(r"<!--\s*preview_video_id:\s*([A-Za-z0-9_-]{11})\s*-->", text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]{11})", text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?[^ \n\r]*v=([A-Za-z0-9_-]{11})", text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     return None
 
 def find_preview_video_id(owner, repo, number, issue_body):
@@ -743,7 +753,7 @@ def safe_main():
         try:
             meta = get_metadata_from_issue_body(body) or {}
             for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic"]:
-                if k in meta: del k
+                if k in meta: del meta[k]
             new_body = set_metadata_in_issue_body(body, meta)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         except Exception as e2:
