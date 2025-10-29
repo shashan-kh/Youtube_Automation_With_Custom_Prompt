@@ -424,12 +424,13 @@ def _ffmpeg_escape(s):
     )
 
 def burn_captions(in_mp4, srt_path, out_mp4):
-    # Small (12pt), yellow with black stroke, bottom-center, no filled box
+    # Small (12pt), yellow with black stroke, center-middle, no filled box
     # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
+    # Alignment=5 (center-middle)
     style = (
         "Fontname=DejaVu Sans,Fontsize=12,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
-        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110"
+        "BorderStyle=1,Outline=3,Shadow=0,Alignment=5,MarginV=10"
     )
     vf = f"subtitles={_ffmpeg_escape(srt_path)}:force_style={_ffmpeg_escape(style)}"
     subprocess.run([
@@ -592,7 +593,7 @@ def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, t
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(f"1\n{fmt_time(0.0)} --> {fmt_time(end)}\n\n")
 
-    # Burn captions bottom-center
+    # Burn captions center-middle
     subbed = "subbed.mp4"
     burn_captions(temp_mp4, srt_path, subbed)
 
@@ -750,9 +751,10 @@ def find_preview_video_id(owner, repo, number, issue_body):
         pass
     return None
 
-def post_preview_comment(owner, repo, number, meta, slot):
+def post_preview_comment(owner, repo, number, meta, slot, prefix_msg=""):
+    prefix = (prefix_msg + "\n\n") if prefix_msg else ""
     msg = (
-        f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\n"
+        f"{prefix}Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\n"
         f"Reply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n"
         f"- /reject-video (delete preview and pick a new topic)\n\n"
         f"<!-- preview_video_id: {meta['preview_video_id']} -->"
@@ -766,6 +768,11 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
     for attempt in range(1, max_attempts+1):
         s = llm_script(topic, word_hint=word_hint)
         text = s["voiceover"].strip()
+        # Ensure the outro phrase is spoken
+        if "thank you for watching" not in text.lower():
+            if not text.endswith((".", "!", "?")):
+                text += "."
+            text += " Thank you for watching."
         voice = "voice.mp3"; gTTS(text, lang=TTS_LANG).save(voice)
         voice, vdur = ensure_voice_in_range(voice, min_sec=PREVIEW_MIN, max_sec=PREVIEW_MAX)
         broll = fetch_broll(topic, need=6)
@@ -889,30 +896,57 @@ def safe_main():
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         except Exception as e2:
             deletion_msg += f"\nMetadata cleanup error: {e2}"
-        add_label(owner, repo, number, "await-topic-approval"); remove_label(owner, repo, number, "await-video-approval")
+        add_label(owner, repo, number, "await-topic-approval")
+        remove_label(owner, repo, number, "await-video-approval")
         post_comment(owner, repo, number, f"{deletion_msg}\nOK. Reply /new-topic for fresh options or /custom-topic Your Topic.")
         return
 
     if comment.lower().startswith("/regenerate-video"):
-        meta = get_metadata_from_issue_body(body)
-        topic = meta["topic"] if meta and "topic" in meta else None
+        # Delete previously unlisted (not yet approved) preview first
+        prev_vid = None
+        meta_old = get_metadata_from_issue_body(body) or {}
+        topic = meta_old["topic"] if "topic" in meta_old else None
         if not topic:
             post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic or /custom-topic first.")
             return
-        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=3)
+        if "preview_video_id" in meta_old and meta_old["preview_video_id"]:
+            prev_vid = meta_old["preview_video_id"]
+        if not prev_vid:
+            prev_vid = find_preview_video_id(owner, repo, number, body)
+        deleted_msg = ""
+        if prev_vid:
+            try:
+                yt_delete_video(prev_vid)
+                deleted_msg = f"Deleted previous unlisted preview (ID: {prev_vid})."
+            except Exception as de:
+                deleted_msg = f"Couldn't delete previous preview on YouTube (ID: {prev_vid}): {de}"
+        # Clear preview fields in metadata before regenerating
+        try:
+            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec"]:
+                if k in meta_old: del meta_old[k]
+            new_body_clear = set_metadata_in_issue_body(body, meta_old)
+            gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body_clear})
+            body = new_body_clear  # continue with cleared body
+        except Exception:
+            pass
+
+        # Regenerate (with outro phrase included)
+        meta2, new_body2 = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta2:
-            post_comment(owner, repo, number, "Couldn't get to 35–58s after attempts. Use /new-topic or /custom-topic.")
+            post_comment(owner, repo, number, f"{deleted_msg}\nCouldn't get to 35–58s after attempts. Use /new-topic or /custom-topic.")
             return
-        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
+        gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body2})
         add_label(owner, repo, number, "await-video-approval")
-        post_preview_comment(owner, repo, number, meta2, slot)
+        post_preview_comment(owner, repo, number, meta2, slot, prefix_msg=deleted_msg or "")
         return
 
     if comment.lower().startswith("/approve-video"):
         vid_id = None
         meta = get_metadata_from_issue_body(body)
-        if meta and "preview_video_id" in meta: vid_id = meta["preview_video_id"]
-        if not vid_id: vid_id = find_preview_video_id(owner, repo, number, body)
+        if meta and "preview_video_id" in meta:
+            vid_id = meta["preview_video_id"]
+        if not vid_id:
+            vid_id = find_preview_video_id(owner, repo, number, body)
         if not vid_id:
             post_comment(owner, repo, number, "No preview video found. Please /regenerate-video.")
             return
