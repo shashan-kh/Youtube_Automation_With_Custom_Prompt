@@ -6,7 +6,7 @@ from moviepy.editor import (
     ColorClip, CompositeVideoClip
 )
 from gtts import gTTS
-# Lazy-import Google API client libs later to avoid hard failure if 'packaging' isn't present yet.
+# Google client libs are lazy-imported later to avoid hard failures if 'packaging' missing.
 
 # Env
 REGION = os.getenv("REGION", "IN")
@@ -31,10 +31,10 @@ GROQ_FALLBACK_MODELS_ENV = os.getenv("GROQ_FALLBACK_MODELS", ",".join(DEFAULT_FA
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
 
-# Background music controls
-BGM_URL = os.getenv("BGM_URL", "").strip()  # Optional: URL to CC0/royalty-free music file
+# Optional background music source (royalty-free/CC0 URL). If not set, we synthesize a gentle bed.
+BGM_URL = os.getenv("BGM_URL", "").strip()
 try:
-    BGM_VOL = float(os.getenv("BGM_VOL", "0.07"))  # Background music volume multiplier
+    BGM_VOL = float(os.getenv("BGM_VOL", "0.07"))
 except Exception:
     BGM_VOL = 0.07
 
@@ -43,7 +43,6 @@ PREVIEW_MAX = 57.3
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def is_authorized_commenter(event):
-    # Allow OWNER, MEMBER, COLLABORATOR or the repo owner login
     assoc = (event.get("comment", {}).get("author_association") or "").upper()
     commenter = event.get("comment", {}).get("user", {}).get("login", "")
     repo_owner = event.get("repository", {}).get("owner", {}).get("login", "")
@@ -83,7 +82,6 @@ def extract_json_block(text):
     return m.group(0) if m else None
 
 def parse_topics_from_body(body):
-    # Prefer latest "New topic options:" or "Choose one:" block, else metadata JSON, else any numbered lines
     lines = body.splitlines()
 
     def collect_after_marker(marker):
@@ -134,6 +132,7 @@ def get_slot_from_labels(labels):
             return name.split(":", 1)[1].strip() or "morning"
     return "morning"
 
+# ---------- LLM ----------
 def call_groq(prompt, model):
     return requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -183,7 +182,7 @@ def build_model_list():
             ordered.append(mid)
     return ordered[:10]
 
-def llm_script(trending_query, word_hint="90–105"):
+def llm_script(trending_query, word_hint="115–135"):
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret")
     prompt = f"""
@@ -194,11 +193,11 @@ Rules:
 - General wellness only (sleep, hydration, movement, posture, stress, basic nutrition).
 - No disease claims, diagnoses, dosages, or supplement promises. Avoid COVID/vaccines.
 - If the query is unsafe/specific (e.g., drugs/diseases), pivot to a safe, related habit.
-- Style: energetic, plain language, second-person; target {word_hint} words.
+- Style: energetic, plain language, second-person; target {word_hint} words so the final video is 50–58 seconds.
 
 Output pure JSON with:
 - voiceover: string
-- overlay_lines: array of 7–9 short lines (4–7 words each) for captions
+- overlay_lines: array (ignored for captions; we will use exact voiceover words)
 - title: catchy, <=90 chars, include #Shorts
 - description: 2–3 sentences + “Educational only, not medical advice.” + 1 credible source (WHO/CDC/NIH/NHS)
 - tags: 6–10 comma-separated general tags
@@ -234,6 +233,7 @@ Output pure JSON with:
         raise RuntimeError(f"{last_err}\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL/GROQ_FALLBACK_MODELS to one of the above.")
     raise last_err or RuntimeError("Groq call failed; no models available to try")
 
+# ---------- Audio and captions ----------
 def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
     a = AudioFileClip(voice_path); dur = a.duration; a.close()
     if dur <= target:
@@ -252,13 +252,13 @@ def fetch_broll(query, need=4):
     vids = []
     for q in [query, "healthy lifestyle", "fitness", "sleep", "hydration", "walking", "stretching", "posture", "nutrition", "yoga"]:
         try:
-            r = requests.get(url, headers=headers, params={"query": q, "per_page": 20, "min_height": 1080}, timeout=60)
+            r = requests.get(url, headers=headers, params={"query": q, "per_page": 30, "min_height": 1080}, timeout=60)
             if r.status_code in (401, 403):
                 raise RuntimeError(f"Pexels API auth error {r.status_code}: {r.text}")
             for v in r.json().get("videos", []):
                 files = sorted(v.get("video_files", []), key=lambda f: f.get("height",0), reverse=True)
                 for f in files:
-                    if f.get("height",0) >= 1080 and f.get("width",0) <= f.get("height",0):
+                    if f.get("height",0) >= 1080:
                         vids.append(f["link"]); break
             if len(vids) >= need: break
         except Exception:
@@ -271,49 +271,36 @@ def fmt_time(t):
     h = int(t // 3600); m = int((t % 3600)//60); s = int(t % 60); ms = int((t - int(t))*1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def split_text_to_chunks(text, max_words=7):
-    # Use punctuation first, then break long sentences into chunks
-    clean = re.sub(r"\s+", " ", (text or "").strip())
-    if not clean:
-        return []
-    sentences = re.split(r"(?<=[\.\!\?])\s+", clean)
-    chunks = []
-    for s in sentences:
-        words = s.split()
-        while len(words) > 0:
-            chunk_words = words[:max_words]
-            chunks.append(" ".join(chunk_words))
-            words = words[max_words:]
-    # limit excessive chunks (prefer fewer)
-    if len(chunks) > 16:
-        # merge to reduce
-        merged = []
-        buf = []
-        for i, c in enumerate(chunks):
-            buf.append(c)
-            if len(buf) >= 2:
-                merged.append(" ".join(buf)); buf=[]
-        if buf: merged.append(" ".join(buf))
-        chunks = merged
-    return [c.strip() for c in chunks if c.strip()]
-
-def make_srt_from_voiceover(voiceover_text, duration, path):
-    chunks = split_text_to_chunks(voiceover_text, max_words=7)
-    if not chunks:
-        chunks = ["Keep it simple", "Move, hydrate, rest", "Small steps add up"]
-    n = len(chunks)
-    min_step = 0.8
-    step = max(min_step, duration / n)
-    t = 0.5
-    out = []
-    for i, line in enumerate(chunks, 1):
-        start = min(t, max(0, duration-0.2))
-        end = min(start + step, duration)
-        out.append(f"{i}\n{fmt_time(start)} --> {fmt_time(end)}\n{line}\n\n")
-        t = end - 0.08
-        if end >= duration: break
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(out)
+def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en"):
+    try:
+        from faster_whisper import WhisperModel
+        model_name = os.getenv("WHISPER_MODEL", "tiny.en").strip() or "tiny.en"
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        segments, _info = model.transcribe(
+            audio_path,
+            language=lang,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 200}
+        )
+        out = []
+        idx = 1
+        for seg in segments:
+            text = (seg.text or "").strip()
+            if not text:
+                continue
+            out.append(f"{idx}\n{fmt_time(seg.start)} --> {fmt_time(seg.end)}\n{text}\n\n")
+            idx += 1
+        if not out:
+            # fallback single block
+            a = AudioFileClip(audio_path); d = a.duration; a.close()
+            out.append(f"1\n{fmt_time(0.0)} --> {fmt_time(d)}\n\n")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.writelines(out)
+        return True
+    except Exception as e:
+        print("Whisper transcription failed, falling back to naive captions:", e)
+        return False
 
 def _ffmpeg_escape(s):
     return (
@@ -323,22 +310,21 @@ def _ffmpeg_escape(s):
          .replace("'", "\\'")
     )
 
-def burn_subs(in_mp4, srt_path, out_mp4):
-    # ASS color format: &HAABBGGRR& (AA alpha, BB blue, GG green, RR red)
-    # Bottom-center alignment = 2
+def burn_captions(in_mp4, srt_path, out_mp4):
+    # Small, yellow with black stroke, bottom-center, no filled box (BorderStyle=1)
+    # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
     style = (
-        "Fontname=DejaVu Sans,"
-        "Fontsize=36,"
-        "PrimaryColour=&H00FFFFFF&,"
-        "OutlineColour=&H00000000&,"
-        "BorderStyle=3,Outline=3,Shadow=1,"
-        "Alignment=2,MarginV=80,Spacing=0"
+        "Fontname=DejaVu Sans,Fontsize=28,Bold=1,"
+        "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
+        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=90"
     )
     vf = f"subtitles={_ffmpeg_escape(srt_path)}:force_style={_ffmpeg_escape(style)}"
-    subprocess.run(["ffmpeg","-y","-i",in_mp4,"-vf",vf,"-c:a","copy",out_mp4], check=True)
+    subprocess.run([
+        "ffmpeg","-y","-i",in_mp4,"-vf",vf,"-c:a","copy","-pix_fmt","yuv420p",out_mp4
+    ], check=True)
 
 def ensure_bgm_track(duration, out_path="bgm_src.m4a"):
-    # If BGM_URL provided, download and loop/trim; else synthesize a gentle tone bed
+    # Download provided CC0/royalty-free track or synthesize a gentle tone bed
     if BGM_URL:
         raw = "bgm_raw"
         ext = ".mp3"
@@ -349,35 +335,32 @@ def ensure_bgm_track(duration, out_path="bgm_src.m4a"):
                 if "mpeg" in ct or BGM_URL.lower().endswith(".mp3"): ext = ".mp3"
                 elif "aac" in ct or BGM_URL.lower().endswith(".m4a"): ext = ".m4a"
                 elif "ogg" in ct or BGM_URL.lower().endswith(".ogg"): ext = ".ogg"
-                else: ext = ".mp3"
                 with open(raw+ext, "wb") as f:
                     for ch in r.iter_content(1024*256):
                         f.write(ch)
         except Exception:
-            # fallback to generated
-            return ensure_bgm_track(duration, out_path)
-        # Loop or trim to match duration
-        subprocess.run([
-            "ffmpeg","-y",
-            "-stream_loop","-1","-i", raw+ext,
-            "-t", f"{duration+0.5:.2f}",
-            "-af", f"afade=t=in:st=0:d=0.8,afade=t=out:st={max(0.0, duration-0.8):.2f}:d=0.8",
-            "-c:a","aac","-b:a","128k", out_path
-        ], check=True)
-        return out_path
-    # Generate soft dual-sine ambient bed
+            pass
+        else:
+            subprocess.run([
+                "ffmpeg","-y","-stream_loop","-1","-i",raw+ext,
+                "-t", f"{duration+0.5:.2f}",
+                "-af", f"afade=t=in:st=0:d=0.8,afade=t=out:st={max(0.0, duration-0.8):.2f}:d=0.8",
+                "-c:a","aac","-b:a","128k", out_path
+            ], check=True)
+            return out_path
+    # synthesize soft dual-sine bed
     subprocess.run([
         "ffmpeg","-y",
         "-f","lavfi","-t", f"{duration+0.3:.2f}", "-i","sine=frequency=432:sample_rate=44100",
         "-f","lavfi","-t", f"{duration+0.3:.2f}", "-i","sine=frequency=528:sample_rate=44100",
-        "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,lowpass=f=1200,afade=t=in:st=0:d=0.8,afade=t=out:st={max(0.0, duration-0.8):.2f}:d=0.8",
+        "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,lowpass=f=1200,"
+                           f"afade=t=in:st=0:d=0.8,afade=t=out:st={max(0.0, duration-0.8):.2f}:d=0.8",
         "-c:a","aac","-b:a","128k", out_path
     ], check=True)
     return out_path
 
 def add_bgm_to_video(in_mp4, out_mp4, duration):
     bgm = ensure_bgm_track(duration)
-    # Mix narration (stream 0:a) with low-volume background (stream 1:a)
     subprocess.run([
         "ffmpeg","-y",
         "-i", in_mp4, "-i", bgm,
@@ -386,8 +369,18 @@ def add_bgm_to_video(in_mp4, out_mp4, duration):
         "-c:v","copy","-c:a","aac","-shortest", out_mp4
     ], check=True)
 
-def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, voiceover_text, target_h=1920, target_w=1080):
-    # Download b-roll locally
+# ---------- Rendering (no cropping; pad to 1080x1920) ----------
+def letterbox_clip(clip, target_w=1080, target_h=1920, bg_color=(0,0,0)):
+    scale = min(target_w / clip.w, target_h / clip.h)
+    new_w = max(1, int(round(clip.w * scale)))
+    new_h = max(1, int(round(clip.h * scale)))
+    c2 = clip.resize((new_w, new_h))
+    bg = ColorClip(size=(target_w, target_h), color=bg_color).set_duration(c2.duration)
+    comp = CompositeVideoClip([bg, c2.set_position(("center","center"))], size=(target_w, target_h))
+    return comp.set_duration(c2.duration)
+
+def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, target_h=1920, target_w=1080):
+    # Download b-roll
     tmp = Path(tempfile.mkdtemp()); local = []
     for i,u in enumerate(broll_urls):
         p = tmp / f"b{i}.mp4"
@@ -397,40 +390,46 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, voiceover_text, t
                 for ch in r.iter_content(1024*256): f.write(ch)
         local.append(str(p))
 
-    # Prepare letterboxed clips (no cropping) to exactly 1080x1920
+    # Letterbox clips (no cropping) to 1080x1920
     clips = []
     for p in local:
         c = VideoFileClip(p)
         take = min(8, max(4, int(c.duration)))
         c = c.subclip(0, take)
-        scale = min(target_w / c.w, target_h / c.h)
-        new_w, new_h = int(c.w * scale), int(c.h * scale)
-        resized = c.resize((new_w, new_h))
-        bg = ColorClip(size=(target_w, target_h), color=(0,0,0)).set_duration(resized.duration)
-        letterboxed = CompositeVideoClip([bg, resized.set_position(("center","center"))]).set_duration(resized.duration)
-        # Remove any original clip audio to keep things clean
-        letterboxed = letterboxed.set_audio(None)
-        clips.append(letterboxed)
+        c = letterbox_clip(c, target_w=target_w, target_h=target_h)
+        # remove original clip audio to keep only narration + BGM
+        c = c.set_audio(None)
+        clips.append(c)
 
-    # Concatenate and set narration audio
     merged = concatenate_videoclips(clips, method="compose")
+
+    # Set narration audio track
     voice = AudioFileClip(voice_mp3)
     end = min(merged.duration, voice.duration + 0.3, PREVIEW_MAX)
     merged = merged.subclip(0, end).set_audio(voice)
-    merged.write_videofile(temp_mp4, fps=30, codec="libx264", audio_codec="aac", threads=2, preset="fast", verbose=False, logger=None)
+    merged.write_videofile(
+        temp_mp4, fps=30, codec="libx264", audio_codec="aac",
+        threads=2, preset="fast", verbose=False, logger=None, ffmpeg_params=["-pix_fmt","yuv420p"]
+    )
     voice.close(); [c.close() for c in clips]; merged.close()
 
-    # Burn captions (exactly from voiceover)
+    # Generate perfectly synced captions from actual narration (exact words)
     srt_path = "cap.srt"
-    make_srt_from_voiceover(voiceover_text, end, srt_path)
-    subbed = "subbed.mp4"
-    burn_subs(temp_mp4, srt_path, subbed)
+    ok = transcribe_to_srt_faster_whisper(voice_mp3, srt_path, lang="en")
+    if not ok:
+        # As a fallback, display one block for the full duration (empty or generic)
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(f"1\n{fmt_time(0.0)} --> {fmt_time(end)}\n\n")
 
-    # Add soft background music under narration
+    # Burn yellow stroked captions at bottom
+    subbed = "subbed.mp4"
+    burn_captions(temp_mp4, srt_path, subbed)
+
+    # Add low-volume background music under narration
     with_bgm = "with_bgm.mp4"
     add_bgm_to_video(subbed, with_bgm, end)
 
-    # Enforce safety trim if needed
+    # Final safety trim if needed
     vtmp = VideoFileClip(with_bgm); d = vtmp.duration; vtmp.close()
     out_path = with_bgm
     if d >= 58.0 or d > PREVIEW_MAX + 0.2:
@@ -449,13 +448,11 @@ def ensure_google_client():
         from googleapiclient.http import MediaFileUpload
         return Credentials, build, MediaFileUpload
     except Exception:
-        # Install missing deps (especially 'packaging') at runtime if needed
         pkgs = []
         try:
             import packaging  # noqa: F401
         except Exception:
             pkgs.append("packaging>=23.1")
-        # Ensure Google client libs present
         pkgs += ["google-api-python-client", "google-auth", "google-auth-oauthlib"]
         subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "-q"] + pkgs, check=True)
         from google.oauth2.credentials import Credentials
@@ -535,33 +532,27 @@ def get_metadata_from_issue_body(issue_body):
 def set_metadata_in_issue_body(issue_body, meta):
     block = "```json\n" + json.dumps(meta, indent=2) + "\n```"
     if "```json" in issue_body:
-        # Use callable replacement to avoid interpreting backslashes like \u in JSON
         return re.sub(r"```json\s*\{.*?\}\s*```", lambda m: block, issue_body, flags=re.S)
     return issue_body + "\n\nMetadata:\n" + block
 
 def extract_youtube_id(text):
     if not text:
         return None
-    # Hidden marker takes precedence
     m = re.search(r"<!--\s*preview_video_id:\s*([A-Za-z0-9_-]{11})\s*-->", text)
     if m:
         return m.group(1)
-    # youtu.be/<id>
     m = re.search(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]{11})", text)
     if m:
         return m.group(1)
-    # youtube.com/watch?v=<id>
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?[^ \n\r]*v=([A-Za-z0-9_-]{11})", text)
     if m:
         return m.group(1)
-    # youtube.com/shorts/<id>
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", text)
     if m:
         return m.group(1)
     return None
 
 def find_preview_video_id(owner, repo, number, issue_body):
-    # 1) Metadata block
     try:
         meta = get_metadata_from_issue_body(issue_body) or {}
         if "preview_video_id" in meta and meta["preview_video_id"]:
@@ -572,11 +563,9 @@ def find_preview_video_id(owner, repo, number, issue_body):
                 return vid
     except Exception:
         pass
-    # 2) Scan body text for hidden marker or YouTube links
     vid = extract_youtube_id(issue_body)
     if vid:
         return vid
-    # 3) Scan recent comments (latest first)
     try:
         r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments", params={"per_page": 100})
         comments = r.json()
@@ -591,7 +580,6 @@ def find_preview_video_id(owner, repo, number, issue_body):
     return None
 
 def post_preview_comment(owner, repo, number, meta, slot):
-    # Include a hidden marker so we can always retrieve the ID later
     msg = (
         f"Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\n"
         f"Reply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n"
@@ -602,16 +590,18 @@ def post_preview_comment(owner, repo, number, meta, slot):
 
 # ---------- Build preview and schedule ----------
 def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
-    word_targets = ["90–105","75–90","60–75","55–65","50–60"]
+    # Aim for 50–58s right from the first attempt
+    word_targets = ["115–135","110–130","105–125","100–120","95–115"]
     for attempt in range(1, max_attempts+1):
         s = llm_script(topic, word_hint=word_targets[min(attempt-1, len(word_targets)-1)])
-        voice = "voice.mp3"; gTTS(s["voiceover"], lang=TTS_LANG).save(voice)
+        text = s["voiceover"].strip()
+        voice = "voice.mp3"; gTTS(text, lang=TTS_LANG).save(voice)
         voice, _ = ensure_voice_under_target(voice, target=PREVIEW_MAX)
         broll = fetch_broll(topic, need=4)
         if not broll:
             continue
         temp, final = "temp.mp4", "short.mp4"
-        dur = render_and_cap(broll, voice, temp, final, s.get("voiceover",""))
+        dur = render_and_cap(broll, voice, temp, final)
         if dur < 58.0:
             desc = f"""{s['description']}
 
@@ -689,7 +679,6 @@ def safe_main():
         topics = parse_topics_from_body(body)
         parts = comment.split(maxsplit=1)
         topic = None
-        # If second argument is a number, use indexed topic; otherwise treat the remainder as custom topic
         if len(parts) > 1:
             arg = parts[1].strip()
             if arg.isdigit():
@@ -699,10 +688,8 @@ def safe_main():
                     return
                 topic = topics[idx-1]
             else:
-                # custom topic via /approve-topic Your Topic
                 topic = arg
         else:
-            # default to 1 if available
             if not topics:
                 post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Use /new-topic or /custom-topic Your Topic.")
                 return
