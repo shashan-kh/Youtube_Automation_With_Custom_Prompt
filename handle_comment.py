@@ -424,12 +424,12 @@ def _ffmpeg_escape(s):
     )
 
 def burn_captions(in_mp4, srt_path, out_mp4):
-    # EXACT CENTER: Alignment=5 (middle-center), zero margins. Small (12pt), yellow + black stroke.
+    # Bottom-center (Alignment=2). Small (12pt), yellow with black stroke, no filled box.
     # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
     style = (
         "Fontname=DejaVu Sans,Fontsize=12,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
-        "BorderStyle=1,Outline=3,Shadow=0,Alignment=5,MarginV=0,MarginL=0,MarginR=0,Spacing=0"
+        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=100,Spacing=0"
     )
     vf = f"subtitles={_ffmpeg_escape(srt_path)}:force_style={_ffmpeg_escape(style)}"
     subprocess.run([
@@ -592,7 +592,7 @@ def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, t
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(f"1\n{fmt_time(0.0)} --> {fmt_time(end)}\n\n")
 
-    # Burn captions EXACTLY center (Alignment=5, zero margins)
+    # Burn captions bottom-center
     subbed = "subbed.mp4"
     burn_captions(temp_mp4, srt_path, subbed)
 
