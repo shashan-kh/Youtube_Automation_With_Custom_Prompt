@@ -1,7 +1,10 @@
 import os, re, json, tempfile, subprocess, requests, traceback, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip
+from moviepy.editor import (
+    VideoFileClip, concatenate_videoclips, AudioFileClip,
+    ColorClip, CompositeVideoClip
+)
 from gtts import gTTS
 # Lazy-import Google API client libs later to avoid hard failure if 'packaging' isn't present yet.
 
@@ -27,6 +30,13 @@ GROQ_FALLBACK_MODELS_ENV = os.getenv("GROQ_FALLBACK_MODELS", ",".join(DEFAULT_FA
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
+
+# Background music controls
+BGM_URL = os.getenv("BGM_URL", "").strip()  # Optional: URL to CC0/royalty-free music file
+try:
+    BGM_VOL = float(os.getenv("BGM_VOL", "0.07"))  # Background music volume multiplier
+except Exception:
+    BGM_VOL = 0.07
 
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
 PREVIEW_MAX = 57.3
@@ -242,7 +252,7 @@ def fetch_broll(query, need=4):
     vids = []
     for q in [query, "healthy lifestyle", "fitness", "sleep", "hydration", "walking", "stretching", "posture", "nutrition", "yoga"]:
         try:
-            r = requests.get(url, headers=headers, params={"query": q, "per_page": 20, "orientation": "portrait"}, timeout=60)
+            r = requests.get(url, headers=headers, params={"query": q, "per_page": 20, "min_height": 1080}, timeout=60)
             if r.status_code in (401, 403):
                 raise RuntimeError(f"Pexels API auth error {r.status_code}: {r.text}")
             for v in r.json().get("videos", []):
@@ -261,27 +271,123 @@ def fmt_time(t):
     h = int(t // 3600); m = int((t % 3600)//60); s = int(t % 60); ms = int((t - int(t))*1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def make_srt(lines, duration, path):
-    lines = [l.strip() for l in (lines or []) if str(l).strip()]
-    if not lines:
-        lines = ["Simple wellness tip", "Small steps add up", "Move, hydrate, rest", "You’ve got this!"]
-    n = max(1, min(9, len(lines)))
-    step = max(1.2, duration / n)
+def split_text_to_chunks(text, max_words=7):
+    # Use punctuation first, then break long sentences into chunks
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    if not clean:
+        return []
+    sentences = re.split(r"(?<=[\.\!\?])\s+", clean)
+    chunks = []
+    for s in sentences:
+        words = s.split()
+        while len(words) > 0:
+            chunk_words = words[:max_words]
+            chunks.append(" ".join(chunk_words))
+            words = words[max_words:]
+    # limit excessive chunks (prefer fewer)
+    if len(chunks) > 16:
+        # merge to reduce
+        merged = []
+        buf = []
+        for i, c in enumerate(chunks):
+            buf.append(c)
+            if len(buf) >= 2:
+                merged.append(" ".join(buf)); buf=[]
+        if buf: merged.append(" ".join(buf))
+        chunks = merged
+    return [c.strip() for c in chunks if c.strip()]
+
+def make_srt_from_voiceover(voiceover_text, duration, path):
+    chunks = split_text_to_chunks(voiceover_text, max_words=7)
+    if not chunks:
+        chunks = ["Keep it simple", "Move, hydrate, rest", "Small steps add up"]
+    n = len(chunks)
+    min_step = 0.8
+    step = max(min_step, duration / n)
     t = 0.5
     out = []
-    for i in range(n):
-        start = min(t, duration-0.2)
+    for i, line in enumerate(chunks, 1):
+        start = min(t, max(0, duration-0.2))
         end = min(start + step, duration)
-        out.append(f"{i+1}\n{fmt_time(start)} --> {fmt_time(end)}\n{lines[i]}\n\n")
-        t = end - 0.1
+        out.append(f"{i}\n{fmt_time(start)} --> {fmt_time(end)}\n{line}\n\n")
+        t = end - 0.08
+        if end >= duration: break
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(out)
 
+def _ffmpeg_escape(s):
+    return (
+        s.replace("\\", "\\\\")
+         .replace(":", "\\:")
+         .replace(",", "\\,")
+         .replace("'", "\\'")
+    )
+
 def burn_subs(in_mp4, srt_path, out_mp4):
-    vf = f"subtitles={srt_path}:force_style='Fontname=DejaVu Sans,Fontsize=44,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BorderStyle=3,Outline=2,Shadow=1,Alignment=8,MarginV=80'"
+    # ASS color format: &HAABBGGRR& (AA alpha, BB blue, GG green, RR red)
+    # Bottom-center alignment = 2
+    style = (
+        "Fontname=DejaVu Sans,"
+        "Fontsize=36,"
+        "PrimaryColour=&H00FFFFFF&,"
+        "OutlineColour=&H00000000&,"
+        "BorderStyle=3,Outline=3,Shadow=1,"
+        "Alignment=2,MarginV=80,Spacing=0"
+    )
+    vf = f"subtitles={_ffmpeg_escape(srt_path)}:force_style={_ffmpeg_escape(style)}"
     subprocess.run(["ffmpeg","-y","-i",in_mp4,"-vf",vf,"-c:a","copy",out_mp4], check=True)
 
-def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, target_h=1920, target_w=1080):
+def ensure_bgm_track(duration, out_path="bgm_src.m4a"):
+    # If BGM_URL provided, download and loop/trim; else synthesize a gentle tone bed
+    if BGM_URL:
+        raw = "bgm_raw"
+        ext = ".mp3"
+        try:
+            with requests.get(BGM_URL, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                ct = r.headers.get("content-type","").lower()
+                if "mpeg" in ct or BGM_URL.lower().endswith(".mp3"): ext = ".mp3"
+                elif "aac" in ct or BGM_URL.lower().endswith(".m4a"): ext = ".m4a"
+                elif "ogg" in ct or BGM_URL.lower().endswith(".ogg"): ext = ".ogg"
+                else: ext = ".mp3"
+                with open(raw+ext, "wb") as f:
+                    for ch in r.iter_content(1024*256):
+                        f.write(ch)
+        except Exception:
+            # fallback to generated
+            return ensure_bgm_track(duration, out_path)
+        # Loop or trim to match duration
+        subprocess.run([
+            "ffmpeg","-y",
+            "-stream_loop","-1","-i", raw+ext,
+            "-t", f"{duration+0.5:.2f}",
+            "-af", f"afade=t=in:st=0:d=0.8,afade=t=out:st={max(0.0, duration-0.8):.2f}:d=0.8",
+            "-c:a","aac","-b:a","128k", out_path
+        ], check=True)
+        return out_path
+    # Generate soft dual-sine ambient bed
+    subprocess.run([
+        "ffmpeg","-y",
+        "-f","lavfi","-t", f"{duration+0.3:.2f}", "-i","sine=frequency=432:sample_rate=44100",
+        "-f","lavfi","-t", f"{duration+0.3:.2f}", "-i","sine=frequency=528:sample_rate=44100",
+        "-filter_complex", f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,lowpass=f=1200,afade=t=in:st=0:d=0.8,afade=t=out:st={max(0.0, duration-0.8):.2f}:d=0.8",
+        "-c:a","aac","-b:a","128k", out_path
+    ], check=True)
+    return out_path
+
+def add_bgm_to_video(in_mp4, out_mp4, duration):
+    bgm = ensure_bgm_track(duration)
+    # Mix narration (stream 0:a) with low-volume background (stream 1:a)
+    subprocess.run([
+        "ffmpeg","-y",
+        "-i", in_mp4, "-i", bgm,
+        "-filter_complex", f"[1:a]volume={BGM_VOL}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0,aresample=async=1[aout]",
+        "-map","0:v","-map","[aout]",
+        "-c:v","copy","-c:a","aac","-shortest", out_mp4
+    ], check=True)
+
+def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, voiceover_text, target_h=1920, target_w=1080):
+    # Download b-roll locally
     tmp = Path(tempfile.mkdtemp()); local = []
     for i,u in enumerate(broll_urls):
         p = tmp / f"b{i}.mp4"
@@ -290,31 +396,50 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, overlay_lines, ta
             with open(p, "wb") as f:
                 for ch in r.iter_content(1024*256): f.write(ch)
         local.append(str(p))
+
+    # Prepare letterboxed clips (no cropping) to exactly 1080x1920
     clips = []
     for p in local:
         c = VideoFileClip(p)
         take = min(8, max(4, int(c.duration)))
-        c = c.subclip(0, take).resize(height=target_h)
-        if c.w != target_w:
-            c = c.crop(x_center=c.w/2, width=target_w, height=target_h)
-        clips.append(c)
-    merged = concatenate_videoclips(clips)
+        c = c.subclip(0, take)
+        scale = min(target_w / c.w, target_h / c.h)
+        new_w, new_h = int(c.w * scale), int(c.h * scale)
+        resized = c.resize((new_w, new_h))
+        bg = ColorClip(size=(target_w, target_h), color=(0,0,0)).set_duration(resized.duration)
+        letterboxed = CompositeVideoClip([bg, resized.set_position(("center","center"))]).set_duration(resized.duration)
+        # Remove any original clip audio to keep things clean
+        letterboxed = letterboxed.set_audio(None)
+        clips.append(letterboxed)
+
+    # Concatenate and set narration audio
+    merged = concatenate_videoclips(clips, method="compose")
     voice = AudioFileClip(voice_mp3)
     end = min(merged.duration, voice.duration + 0.3, PREVIEW_MAX)
     merged = merged.subclip(0, end).set_audio(voice)
     merged.write_videofile(temp_mp4, fps=30, codec="libx264", audio_codec="aac", threads=2, preset="fast", verbose=False, logger=None)
     voice.close(); [c.close() for c in clips]; merged.close()
+
+    # Burn captions (exactly from voiceover)
     srt_path = "cap.srt"
-    make_srt(overlay_lines, end, srt_path)
-    burn_subs(temp_mp4, srt_path, final_mp4)
-    v = VideoFileClip(final_mp4); d = v.duration; v.close()
+    make_srt_from_voiceover(voiceover_text, end, srt_path)
+    subbed = "subbed.mp4"
+    burn_subs(temp_mp4, srt_path, subbed)
+
+    # Add soft background music under narration
+    with_bgm = "with_bgm.mp4"
+    add_bgm_to_video(subbed, with_bgm, end)
+
+    # Enforce safety trim if needed
+    vtmp = VideoFileClip(with_bgm); d = vtmp.duration; vtmp.close()
+    out_path = with_bgm
     if d >= 58.0 or d > PREVIEW_MAX + 0.2:
-        subprocess.run(["ffmpeg","-y","-i",final_mp4,"-t",str(PREVIEW_MAX),"-c","copy","short_trim.mp4"], check=False)
+        subprocess.run(["ffmpeg","-y","-i",with_bgm,"-t",str(PREVIEW_MAX),"-c","copy","short_trim.mp4"], check=False)
         if os.path.exists("short_trim.mp4"):
-            os.replace("short_trim.mp4", final_mp4)
-            v2 = VideoFileClip(final_mp4); d2 = v2.duration; v2.close()
-            return d2
-    return d
+            out_path = "short_trim.mp4"
+    os.replace(out_path, final_mp4)
+    v = VideoFileClip(final_mp4); d2 = v.duration; v.close()
+    return d2
 
 # ---------- Ensure Google API client (lazy import with fallback) ----------
 def ensure_google_client():
@@ -486,7 +611,7 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
         if not broll:
             continue
         temp, final = "temp.mp4", "short.mp4"
-        dur = render_and_cap(broll, voice, temp, final, s.get("overlay_lines", []))
+        dur = render_and_cap(broll, voice, temp, final, s.get("voiceover",""))
         if dur < 58.0:
             desc = f"""{s['description']}
 
