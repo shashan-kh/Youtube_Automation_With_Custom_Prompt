@@ -10,6 +10,9 @@ packaging>=23.1
 # Accurate, lightweight CPU transcription for exact captions
 faster-whisper>=1.0.0,<2
 
+# Face detection for subject-focused cropping (headless build)
+opencv-python-headless>=4.8,<5
+
 # YouTube + Google auth
 google-api-python-client
 google-auth
