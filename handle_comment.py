@@ -5,6 +5,7 @@ from moviepy.editor import (
     VideoFileClip, concatenate_videoclips, AudioFileClip,
     ColorClip, CompositeVideoClip
 )
+from moviepy.video.fx.all import blur, colorx
 from gtts import gTTS
 # Google client libs are lazy-imported later to avoid hard failures if 'packaging' missing.
 
@@ -39,14 +40,15 @@ except Exception:
     BGM_VOL = 0.07
 
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
-PREVIEW_MIN = 50.0
+PREVIEW_MIN = 35.0         # Accept videos >= 35s
+PREVIEW_TARGET_MIN = 50.0  # Aim to hit 50–58s first
 PREVIEW_MAX = 57.3
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def is_authorized_commenter(event):
     assoc = (event.get("comment", {}).get("author_association") or "").upper()
     commenter = event.get("comment", {}).get("user", {}).get("login", "")
-    repo_owner = event.get("repository", {}).get("owner", {}).get("login", "")
+    repo_owner = event.get("repository", {}).get("owner", "").get("login", "")
     return assoc in {"OWNER", "MEMBER", "COLLABORATOR"} or commenter == repo_owner
 
 def gh(method, url, **kwargs):
@@ -235,13 +237,10 @@ Output pure JSON with:
 
 # ---------- Audio and captions ----------
 def ensure_voice_in_range(voice_path, min_sec=PREVIEW_MIN, max_sec=PREVIEW_MAX):
-    """Try to normalize voice length into the target band using ffmpeg atempo.
-       Will not exceed 2x slow/fast; returns path and new duration."""
+    """Normalize voice length into target band using ffmpeg atempo when feasible."""
     a = AudioFileClip(voice_path); dur = a.duration; a.close()
-    # If already within range, do nothing
     if min_sec <= dur <= max_sec:
         return voice_path, dur
-    # Compute desired scaling factor but clamp to [0.5, 2.0]
     target = max(min_sec, min(max_sec, dur))
     factor = max(0.5, min(2.0, (target / dur) if dur else 1.0))
     if abs(factor - 1.0) < 1e-3:
@@ -279,7 +278,7 @@ def fmt_time(t):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en"):
-    """Transcribe exact spoken words from voice audio to SRT (for perfect caption sync)."""
+    """Transcribe exact spoken words from voice audio to SRT (perfect caption sync)."""
     try:
         from faster_whisper import WhisperModel
         model_name = os.getenv("WHISPER_MODEL", "tiny.en").strip() or "tiny.en"
@@ -316,12 +315,12 @@ def _ffmpeg_escape(s):
     )
 
 def burn_captions(in_mp4, srt_path, out_mp4):
-    # Small, yellow with black stroke, bottom-center, no filled box
+    # Smaller, yellow with black stroke, bottom-center, no filled box
     # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
     style = (
-        "Fontname=DejaVu Sans,Fontsize=22,Bold=1,"
+        "Fontname=DejaVu Sans,Fontsize=20,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
-        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=105"
+        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110"
     )
     vf = f"subtitles={_ffmpeg_escape(srt_path)}:force_style={_ffmpeg_escape(style)}"
     subprocess.run([
@@ -329,6 +328,7 @@ def burn_captions(in_mp4, srt_path, out_mp4):
     ], check=True)
 
 def ensure_bgm_track(duration, out_path="bgm_src.m4a"):
+    # Download provided CC0/royalty-free track or synthesize a gentle tone bed
     if BGM_URL:
         raw = "bgm_raw"
         ext = ".mp3"
@@ -373,18 +373,35 @@ def add_bgm_to_video(in_mp4, out_mp4, duration):
         "-c:v","copy","-c:a","aac","-shortest", out_mp4
     ], check=True)
 
-# ---------- Rendering (no cropping; pad to 1080x1920) ----------
-def letterbox_clip(clip, target_w=1080, target_h=1920, bg_color=(0,0,0)):
-    scale = min(target_w / clip.w, target_h / clip.h)
-    new_w = max(1, int(round(clip.w * scale)))
-    new_h = max(1, int(round(clip.h * scale)))
-    c2 = clip.resize((new_w, new_h))
-    bg = ColorClip(size=(target_w, target_h), color=bg_color).set_duration(c2.duration)
-    comp = CompositeVideoClip([bg, c2.set_position(("center","center"))], size=(target_w, target_h))
-    return comp.set_duration(c2.duration)
+# ---------- Visual composition (cover with blurred background; no stretching of foreground) ----------
+def cover_with_blur_bg(clip, target_w=1080, target_h=1920):
+    """Foreground: fit inside 1080x1920 with AR preserved.
+       Background: same clip scaled to cover, cropped, blurred and darkened to fill 1080x1920."""
+    # Foreground fit
+    s_fit = min(target_w / clip.w, target_h / clip.h)
+    fg = clip.resize(s_fit)
+
+    # Background cover (can crop background, never the foreground)
+    s_cover = max(target_w / clip.w, target_h / clip.h)
+    bg = clip.resize(s_cover)
+    # Center-crop background to exact 1080x1920
+    bg = bg.crop(x_center=bg.w/2, y_center=bg.h/2, width=target_w, height=target_h)
+    # Blur and darken background for readability
+    try:
+        bg = bg.fx(blur, size=15)
+    except Exception:
+        pass
+    try:
+        bg = bg.fx(colorx, 0.6)  # darken slightly
+    except Exception:
+        pass
+    bg = bg.set_duration(fg.duration)
+
+    comp = CompositeVideoClip([bg, fg.set_position(("center","center"))], size=(target_w, target_h))
+    return comp.set_duration(fg.duration).set_audio(None)
 
 def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, target_h=1920, target_w=1080):
-    """Build a letterboxed 1080x1920 video and NEVER exceed voice audio duration to avoid OOB access."""
+    """Build a 1080x1920 video, fully covered by blurred background; never exceed voice duration."""
     # Download b-roll
     tmp = Path(tempfile.mkdtemp()); local = []
     for i,u in enumerate(broll_urls):
@@ -395,18 +412,17 @@ def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, t
                 for ch in r.iter_content(1024*256): f.write(ch)
         local.append(str(p))
 
-    # Letterbox clips (no cropping)
     unit_clips = []
     for p in local:
         c = VideoFileClip(p)
         take = min(8, max(4, int(c.duration)))
         c = c.subclip(0, take)
-        c = letterbox_clip(c, target_w=target_w, target_h=target_h).set_audio(None)
-        unit_clips.append(c)
+        comp = cover_with_blur_bg(c, target_w=target_w, target_h=target_h)
+        unit_clips.append(comp)
     if not unit_clips:
         raise RuntimeError("No valid b-roll clips to render")
 
-    # Build timeline length to MIN(voice_duration, PREVIEW_MAX) and add small safety epsilon
+    # Build up to min(voice_duration, PREVIEW_MAX), with tiny epsilon safety
     epsilon = 1e-2
     target_end = max(0.2, min(PREVIEW_MAX, max(0.0, voice_duration) - epsilon))
     timeline, total, idx = [], 0.0, 0
@@ -418,11 +434,9 @@ def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, t
 
     merged = concatenate_videoclips(timeline, method="compose").subclip(0, target_end)
 
-    # Attach voice audio but DO NOT exceed its duration
+    # Attach voice audio (trimmed to 'end')
     voice = AudioFileClip(voice_mp3)
-    vdur = voice.duration
-    end = min(target_end, vdur)  # double-guard
-    # Trim merged to 'end' and the voice to 'end'
+    end = min(target_end, voice.duration)
     merged = merged.subclip(0, end)
     voice_trim = voice.subclip(0, end)
     merged = merged.set_audio(voice_trim)
@@ -606,7 +620,7 @@ def post_preview_comment(owner, repo, number, meta, slot):
 
 # ---------- Build preview and schedule ----------
 def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
-    # Aim for 50–58s right from the first attempt
+    # Aim for 50–58s from the first attempt, but accept 35–58s
     word_hint = "130–160"
     for attempt in range(1, max_attempts+1):
         s = llm_script(topic, word_hint=word_hint)
@@ -686,7 +700,7 @@ def safe_main():
             return
         meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't get to 50–58s after attempts. Try a simpler topic or /new-topic.")
+            post_comment(owner, repo, number, "Couldn't get to 35–58s after attempts. Try a simpler topic or /new-topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
@@ -709,7 +723,7 @@ def safe_main():
             topic = topics[idx-1]
         meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't get to 50–58s after attempts. Reply /new-topic or /custom-topic Your Topic.")
+            post_comment(owner, repo, number, "Couldn't get to 35–58s after attempts. Reply /new-topic or /custom-topic Your Topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
@@ -729,7 +743,7 @@ def safe_main():
         try:
             meta = get_metadata_from_issue_body(body) or {}
             for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic"]:
-                if k in meta: del meta[k]
+                if k in meta: del k
             new_body = set_metadata_in_issue_body(body, meta)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         except Exception as e2:
@@ -746,7 +760,7 @@ def safe_main():
             return
         meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta2:
-            post_comment(owner, repo, number, "Couldn't get to 50–58s after attempts. Use /new-topic or /custom-topic.")
+            post_comment(owner, repo, number, "Couldn't get to 35–58s after attempts. Use /new-topic or /custom-topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval")
