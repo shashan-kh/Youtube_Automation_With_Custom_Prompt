@@ -671,43 +671,78 @@ def upload_youtube_unlisted(video_path, title, description, tags):
     vid_id = resp.get("id")
     return vid_id, f"https://youtu.be/{vid_id}"
 
+def compress_for_preview(in_path, out_path="preview_small.mp4", target_w=720, target_h=1280):
+    # Scale-to-fit within 720x1280 and pad if needed (keep AR), lower bitrate for smaller size
+    vf = f"scale=w={target_w}:h={target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
+    subprocess.run([
+        "ffmpeg","-y","-i",in_path,
+        "-vf",vf,"-c:v","libx264","-preset","veryfast","-profile:v","high","-level","4.1",
+        "-crf","30","-pix_fmt","yuv420p","-r","30",
+        "-c:a","aac","-b:a","96k","-movflags","+faststart",
+        out_path
+    ], check=True)
+    return out_path
+
 def upload_preview_fallback(video_path):
-    # Try file.io first
+    # Try smaller preview first to improve success on free hosts
+    path_small = "preview_small.mp4"
     try:
-        with open(video_path, "rb") as f:
-            r = requests.post("https://file.io", files={"file": ("short.mp4", f, "video/mp4")}, data={"expires": "1d"}, timeout=120)
-        if r.status_code == 200:
-            j = r.json()
-            if j.get("success") and j.get("link"):
-                return j["link"], "file.io"
+        path_to_send = compress_for_preview(video_path, path_small)
+    except Exception:
+        path_to_send = video_path
+
+    # 1) 0x0.st (simple and reliable)
+    try:
+        with open(path_to_send, "rb") as f:
+            r = requests.post("https://0x0.st", files={"file": (os.path.basename(path_to_send), f, "video/mp4")}, timeout=120)
+        if r.status_code == 200 and r.text.strip().startswith("http"):
+            return r.text.strip(), "0x0.st"
     except Exception:
         pass
-    # Try transfer.sh
+
+    # 2) transfer.sh
     try:
-        name = os.path.basename(video_path) or "short.mp4"
-        with open(video_path, "rb") as f:
-            r = requests.put(f"https://transfer.sh/{name}", data=f, timeout=300)
+        with open(path_to_send, "rb") as f:
+            r = requests.put(f"https://transfer.sh/{os.path.basename(path_to_send)}", data=f, timeout=300)
         if r.status_code in (200, 201):
             link = r.text.strip()
             if link.startswith("http"):
                 return link, "transfer.sh"
     except Exception:
         pass
+
+    # 3) file.io (expires 1 day, sometimes rate-limited)
+    try:
+        with open(path_to_send, "rb") as f:
+            r = requests.post("https://file.io", files={"file": (os.path.basename(path_to_send), f, "video/mp4")}, data={"expires": "1d"}, timeout=300)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("success") and j.get("link"):
+                return j["link"], "file.io"
+    except Exception:
+        pass
+
     return None, None
 
 def upload_preview_youtube_or_fallback(video_path, title, description, tags):
+    # Try YouTube unlisted first
     try:
         vid_id, link = upload_youtube_unlisted(video_path, title, description, tags)
         return {"preview_video_id": vid_id, "preview_link": link, "yt_upload_blocked": False, "fallback": None}
     except Exception as e:
         msg = str(e)
         blocked = ("uploadLimitExceeded" in msg) or ("exceeded the number of videos" in msg)
-        if blocked:
-            link, host = upload_preview_fallback(video_path)
-            if link:
-                return {"preview_video_id": None, "preview_link": link, "yt_upload_blocked": True, "fallback": host or "fallback"}
-            # If fallback also failed, re-raise to surface the error
-        raise
+        # For preview convenience, also fallback for other upload errors
+        link, host = upload_preview_fallback(video_path)
+        if link:
+            return {"preview_video_id": None, "preview_link": link, "yt_upload_blocked": bool(blocked), "fallback": host or "fallback"}
+        # Could not fallback; return explicit error info
+        return {"preview_video_id": None, "preview_link": None, "yt_upload_blocked": bool(blocked), "fallback": None, "error": msg}
+
+def upload_preview_youtube(video_path, title, description, tags):
+    info = upload_preview_youtube_or_fallback(video_path, title, description, tags)
+    # Do not raise here; let caller handle info/error
+    return info.get("preview_video_id"), info.get("preview_link"), info
 
 def schedule_existing_video(video_id, slot):
     yt = yt_client()
@@ -730,10 +765,9 @@ def yt_delete_video(video_id):
     yt.videos().delete(id=video_id).execute()
 
 # ---------- Metadata helpers ----------
-def upload_preview_youtube(video_path, title, description, tags):
-    # Backward-compatible wrapper (kept name) that now uses fallback on YT limit
-    info = upload_preview_youtube_or_fallback(video_path, title, description, tags)
-    return info["preview_video_id"], info["preview_link"], info
+def upload_preview_youtube_wrapper(video_path, title, description, tags):
+    vid_id, link, info = upload_preview_youtube(video_path, title, description, tags)
+    return vid_id, link, info
 
 def get_metadata_from_issue_body(issue_body):
     m = re.search(r"```json\s*(\{.*?\})\s*```", issue_body, re.S)
@@ -793,8 +827,8 @@ def post_preview_comment(owner, repo, number, meta, slot, prefix_msg=""):
     prefix = (prefix_msg + "\n\n") if prefix_msg else ""
     blocked_note = ""
     if meta.get("yt_upload_blocked"):
-        blocked_note = ("\nNote: YouTube upload limit reached for this account today. "
-                        "The preview is hosted temporarily here. Approving upload will work once the limit resets (usually within 24 hours).")
+        blocked_note = ("\nNote: YouTube upload limit was reached. The preview is hosted temporarily here. "
+                        "Approving upload will work once the limit resets (typically within 24 hours).")
     msg = (
         f"{prefix}Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}{blocked_note}\n"
         f"Reply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n"
@@ -827,10 +861,10 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
 #Shorts #health #wellness"""
-            try:
-                vid_id, link, info = upload_preview_youtube(final, s["title"], desc, s.get("tags",""))
-            except Exception as e:
-                raise RuntimeError(f"Preview upload failed: {e}")
+            vid_id, link, info = upload_preview_youtube_wrapper(final, s["title"], desc, s.get("tags",""))
+            if not link:
+                # Could not provide a preview link; embed error and bail gracefully
+                raise RuntimeError(f"Preview upload failed and fallback unavailable: {info.get('error','unknown error')}")
             meta = {
                 "topic": topic,
                 "title": s["title"],
@@ -1014,9 +1048,9 @@ def main():
             owner, repo = REPO.split("/")
             issue = e_json["issue"]; number = issue["number"]
             avail = list_groq_models()
-            addendum = ""
+            addendum = "\n\nIf YouTube upload limit is reached, I now auto-host the preview temporarily (0x0.st/transfer.sh/file.io)."
             if avail:
-                addendum = "\n\nIf you hit YouTube upload limit, a temporary preview host was used.\nAvailable Groq models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
+                addendum += "\nAvailable Groq models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
