@@ -322,7 +322,7 @@ def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en", min_chunk_
         while i < len(words):
             remaining = len(words) - i
             take = max(min_chunk_words, min(max_chunk_words, remaining))
-            # Ensure not leaving a 1-word tail if avoidable
+            # Avoid leaving a 1-word tail
             if remaining - take == 1 and take > min_chunk_words:
                 take -= 1
             group = words[i:i+take]
@@ -424,13 +424,13 @@ def _ffmpeg_escape(s):
     )
 
 def burn_captions(in_mp4, srt_path, out_mp4):
-    # Small (12pt), yellow with black stroke, center-middle, no filled box
+    # Exactly center (middle of top/bottom and left/right): Alignment=5, zero margins
+    # Small (12pt), yellow with black stroke, no filled box
     # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
-    # Alignment=5 (center-middle)
     style = (
         "Fontname=DejaVu Sans,Fontsize=12,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
-        "BorderStyle=1,Outline=3,Shadow=0,Alignment=5,MarginV=10"
+        "BorderStyle=1,Outline=3,Shadow=0,Alignment=5,MarginV=0,MarginL=0,MarginR=0,Spacing=0"
     )
     vf = f"subtitles={_ffmpeg_escape(srt_path)}:force_style={_ffmpeg_escape(style)}"
     subprocess.run([
@@ -896,8 +896,7 @@ def safe_main():
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         except Exception as e2:
             deletion_msg += f"\nMetadata cleanup error: {e2}"
-        add_label(owner, repo, number, "await-topic-approval")
-        remove_label(owner, repo, number, "await-video-approval")
+        add_label(owner, repo, number, "await-topic-approval"); remove_label(owner, repo, number, "await-video-approval")
         post_comment(owner, repo, number, f"{deletion_msg}\nOK. Reply /new-topic for fresh options or /custom-topic Your Topic.")
         return
 
@@ -969,7 +968,7 @@ def main():
             avail = list_groq_models()
             addendum = ""
             if avail:
-                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
+                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
