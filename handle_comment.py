@@ -2,12 +2,15 @@ import os, re, json, tempfile, subprocess, requests, traceback, sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from moviepy.editor import (
-    VideoFileClip, concatenate_videoclips, AudioFileClip,
-    CompositeVideoClip
+    VideoFileClip, concatenate_videoclips, AudioFileClip
 )
 from gtts import gTTS
-import cv2  # for simple face detection to focus crop
-# Google client libs are lazy-imported later to avoid hard failures if 'packaging' missing.
+
+# Optional: OpenCV for simple face detection to focus crop (subject-aware cover)
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 # Env
 REGION = os.getenv("REGION", "IN")
@@ -135,7 +138,6 @@ def get_slot_from_labels(labels):
             return name.split(":", 1)[1].strip() or "morning"
     return "morning"
 
-# ---------- LLM ----------
 def call_groq(prompt, model):
     return requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
@@ -277,8 +279,19 @@ def fmt_time(t):
     h = int(t // 3600); m = int((t % 3600)//60); s = int(t % 60); ms = int((t - int(t))*1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en"):
-    """Transcribe exact spoken words from voice audio to SRT (perfect caption sync)."""
+def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en", min_chunk_words=2, max_chunk_words=3, min_dur=0.35, gap=0.02):
+    """
+    Transcribe the voice audio and write an SRT where each caption shows only 2–3 words,
+    tightly synced to the narration using word-level timestamps.
+    """
+    # Duration for clamping
+    try:
+        a = AudioFileClip(audio_path)
+        audio_dur = float(a.duration)
+        a.close()
+    except Exception:
+        audio_dur = None
+
     try:
         from faster_whisper import WhisperModel
         model_name = os.getenv("WHISPER_MODEL", "tiny.en").strip() or "tiny.en"
@@ -288,22 +301,118 @@ def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en"):
             language=lang,
             beam_size=5,
             vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 200}
+            vad_parameters={"min_silence_duration_ms": 200},
+            word_timestamps=True
         )
-        out = []; idx = 1
+
+        words = []
         for seg in segments:
-            text = (seg.text or "").strip()
-            if not text: continue
-            out.append(f"{idx}\n{fmt_time(seg.start)} --> {fmt_time(seg.end)}\n{text}\n\n")
+            for w in (seg.words or []):
+                txt = (w.word or "").strip()
+                if not txt:
+                    continue
+                words.append((txt, float(w.start), float(w.end)))
+
+        if not words:
+            raise RuntimeError("No word-level timestamps available")
+
+        # Group into 2–3 word chunks
+        chunks = []
+        i = 0
+        while i < len(words):
+            remaining = len(words) - i
+            take = max(min_chunk_words, min(max_chunk_words, remaining))
+            # Ensure not leaving a 1-word tail if avoidable
+            if remaining - take == 1 and take > min_chunk_words:
+                take -= 1
+            group = words[i:i+take]
+            start = group[0][1]
+            end = group[-1][2]
+            text = " ".join(w[0] for w in group)
+            chunks.append((text, start, end))
+            i += take
+
+        out = []
+        idx = 1
+        cur_t = chunks[0][1] if chunks else 0.0
+        if cur_t < 0:
+            cur_t = 0.0
+
+        for text, w_start, w_end in chunks:
+            start = max(cur_t, w_start)
+            end = max(start + min_dur, w_end)
+
+            if audio_dur is not None:
+                start = min(start, max(0.0, audio_dur - 0.01))
+                end = min(end, audio_dur)
+
+            if end <= start:
+                continue
+
+            out.append(f"{idx}\n{fmt_time(start)} --> {fmt_time(end)}\n{text}\n\n")
             idx += 1
+            cur_t = end + gap
+            if audio_dur is not None and cur_t >= audio_dur:
+                break
+
         if not out:
-            a = AudioFileClip(audio_path); d = a.duration; a.close()
-            out.append(f"1\n{fmt_time(0.0)} --> {fmt_time(d)}\n\n")
+            if audio_dur is None:
+                audio_dur = 1.0
+            out.append(f"1\n{fmt_time(0.0)} --> {fmt_time(max(0.8, audio_dur))}\n\n")
+
         with open(srt_path, "w", encoding="utf-8") as f:
             f.writelines(out)
         return True
+
     except Exception as e:
-        print("Whisper transcription failed:", e)
+        print("Word-level transcription failed; falling back to naive 2–3 word chunks:", e)
+        # Fallback: evenly distribute 2–3 word chunks across duration
+        try:
+            from faster_whisper import WhisperModel
+            model_name = os.getenv("WHISPER_MODEL", "tiny.en").strip() or "tiny.en"
+            model = WhisperModel(model_name, device="cpu", compute_type="int8")
+            segments, _info = model.transcribe(audio_path, language=lang, beam_size=5)
+            text = " ".join([(s.text or "").strip() for s in segments]).strip()
+        except Exception:
+            text = ""
+
+        if audio_dur is None:
+            audio_dur = 10.0
+
+        words = [w for w in re.split(r"\s+", text) if w]
+        if not words:
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(f"1\n{fmt_time(0.0)} --> {fmt_time(audio_dur)}\n\n")
+            return False
+
+        chunks = []
+        i = 0
+        while i < len(words):
+            remaining = len(words) - i
+            take = 3 if remaining >= 3 else remaining
+            if take == 1 and chunks:
+                last = chunks.pop()
+                chunks.append(last + " " + words[i])
+                i += 1
+                break
+            chunks.append(" ".join(words[i:i+take]))
+            i += take
+
+        per = max(min_dur, (audio_dur - 0.1) / max(1, len(chunks)))
+        out = []
+        t = 0.05
+        for idx, c in enumerate(chunks, 1):
+            start = min(t, max(0.0, audio_dur - 0.05))
+            end = min(start + per, audio_dur)
+            if end <= start:
+                break
+            out.append(f"{idx}\n{fmt_time(start)} --> {fmt_time(end)}\n{c}\n\n")
+            t = end + gap
+            if t >= audio_dur:
+                break
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.writelines(out)
         return False
 
 def _ffmpeg_escape(s):
@@ -315,10 +424,10 @@ def _ffmpeg_escape(s):
     )
 
 def burn_captions(in_mp4, srt_path, out_mp4):
-    # Even smaller, yellow with black stroke, bottom-center, no filled box
+    # Small (12pt), yellow with black stroke, bottom-center, no filled box
     # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
     style = (
-        "Fontname=DejaVu Sans,Fontsize=8,Bold=1,"
+        "Fontname=DejaVu Sans,Fontsize=12,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
         "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=110"
     )
@@ -377,7 +486,7 @@ def add_bgm_to_video(in_mp4, out_mp4, duration):
 _cascade = None
 def _get_face_cascade():
     global _cascade
-    if _cascade is None:
+    if _cascade is None and cv2 is not None:
         try:
             _cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         except Exception:
@@ -391,14 +500,16 @@ def smart_cover_crop(clip, target_w=1080, target_h=1920):
     resized = clip.resize(s_cover)
 
     # Pick a frame to analyze
-    t = min(max(0.0, resized.duration * 0.5), max(0.0, resized.duration - 0.05)) if resized.duration else 0.0
     try:
-        frame = resized.get_frame(t)  # RGB
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        cascade = _get_face_cascade()
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)) if cascade is not None else []
+        t = 0.5 * max(0.0, resized.duration)
+        frame = resized.get_frame(min(max(0.0, t), max(0.0, resized.duration - 0.05)))  # RGB
+        if cv2 is not None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            cascade = _get_face_cascade()
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)) if cascade is not None else []
+        else:
+            faces = []
         if isinstance(faces, (list, tuple)) or getattr(faces, "shape", None) is not None:
-            # Choose the largest face
             best = None; best_area = 0
             for (x,y,w,h) in faces:
                 area = w*h
@@ -415,7 +526,7 @@ def smart_cover_crop(clip, target_w=1080, target_h=1920):
     except Exception:
         cx, cy = resized.w/2, resized.h/2
 
-    # Clamp crop center so the window stays within bounds
+    # Clamp crop center so window stays within bounds
     half_w = target_w/2; half_h = target_h/2
     cx = max(half_w, min(resized.w - half_w, cx))
     cy = max(half_h, min(resized.h - half_h, cy))
@@ -469,9 +580,12 @@ def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, t
         temp_mp4, fps=30, codec="libx264", audio_codec="aac",
         threads=2, preset="fast", verbose=False, logger=None, ffmpeg_params=["-pix_fmt","yuv420p"]
     )
-    voice.close(); [c.close() for c in unit_clips]; merged.close()
+    voice.close()
+    for c in unit_clips:
+        c.close()
+    merged.close()
 
-    # Generate perfectly synced captions from actual narration (exact words)
+    # Generate perfectly synced captions from actual narration (2–3 words per chunk)
     srt_path = "cap.srt"
     ok = transcribe_to_srt_faster_whisper(voice_mp3, srt_path, lang="en")
     if not ok:
@@ -596,13 +710,17 @@ def extract_youtube_id(text):
     if not text:
         return None
     m = re.search(r"<!--\s*preview_video_id:\s*([A-Za-z0-9_-]{11})\s*-->", text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]{11})", text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?[^ \n\r]*v=([A-Za-z0-9_-]{11})", text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", text)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     return None
 
 def find_preview_video_id(owner, repo, number, issue_body):
@@ -817,7 +935,7 @@ def main():
             avail = list_groq_models()
             addendum = ""
             if avail:
-                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above."
+                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
