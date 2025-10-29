@@ -235,11 +235,17 @@ Output pure JSON with:
 
 # ---------- Audio and captions ----------
 def ensure_voice_in_range(voice_path, min_sec=PREVIEW_MIN, max_sec=PREVIEW_MAX):
+    """Try to normalize voice length into the target band using ffmpeg atempo.
+       Will not exceed 2x slow/fast; returns path and new duration."""
     a = AudioFileClip(voice_path); dur = a.duration; a.close()
-    target = max(min_sec, min(max_sec, dur))
+    # If already within range, do nothing
     if min_sec <= dur <= max_sec:
         return voice_path, dur
-    factor = max(0.5, min(2.0, dur and (target / dur) or 1.0))
+    # Compute desired scaling factor but clamp to [0.5, 2.0]
+    target = max(min_sec, min(max_sec, dur))
+    factor = max(0.5, min(2.0, (target / dur) if dur else 1.0))
+    if abs(factor - 1.0) < 1e-3:
+        return voice_path, dur
     out = "voice_adj.mp3"
     subprocess.run(["ffmpeg","-y","-i",voice_path,"-filter:a",f"atempo={factor}","-vn",out], check=True)
     a2 = AudioFileClip(out); d2 = a2.duration; a2.close()
@@ -273,6 +279,7 @@ def fmt_time(t):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en"):
+    """Transcribe exact spoken words from voice audio to SRT (for perfect caption sync)."""
     try:
         from faster_whisper import WhisperModel
         model_name = os.getenv("WHISPER_MODEL", "tiny.en").strip() or "tiny.en"
@@ -284,8 +291,7 @@ def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en"):
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 200}
         )
-        out = []
-        idx = 1
+        out = []; idx = 1
         for seg in segments:
             text = (seg.text or "").strip()
             if not text: continue
@@ -313,9 +319,9 @@ def burn_captions(in_mp4, srt_path, out_mp4):
     # Small, yellow with black stroke, bottom-center, no filled box
     # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
     style = (
-        "Fontname=DejaVu Sans,Fontsize=24,Bold=1,"
+        "Fontname=DejaVu Sans,Fontsize=22,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
-        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=100"
+        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=105"
     )
     vf = f"subtitles={_ffmpeg_escape(srt_path)}:force_style={_ffmpeg_escape(style)}"
     subprocess.run([
@@ -378,6 +384,7 @@ def letterbox_clip(clip, target_w=1080, target_h=1920, bg_color=(0,0,0)):
     return comp.set_duration(c2.duration)
 
 def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, target_h=1920, target_w=1080):
+    """Build a letterboxed 1080x1920 video and NEVER exceed voice audio duration to avoid OOB access."""
     # Download b-roll
     tmp = Path(tempfile.mkdtemp()); local = []
     for i,u in enumerate(broll_urls):
@@ -388,20 +395,20 @@ def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, t
                 for ch in r.iter_content(1024*256): f.write(ch)
         local.append(str(p))
 
-    # Build base letterboxed unit clips
+    # Letterbox clips (no cropping)
     unit_clips = []
     for p in local:
         c = VideoFileClip(p)
         take = min(8, max(4, int(c.duration)))
         c = c.subclip(0, take)
-        c = letterbox_clip(c, target_w=target_w, target_h=target_h)
-        c = c.set_audio(None)
+        c = letterbox_clip(c, target_w=target_w, target_h=target_h).set_audio(None)
         unit_clips.append(c)
     if not unit_clips:
         raise RuntimeError("No valid b-roll clips to render")
 
-    # Build timeline to at least voice length target (50–57.3)
-    target_end = min(PREVIEW_MAX, max(PREVIEW_MIN, voice_duration + 0.3))
+    # Build timeline length to MIN(voice_duration, PREVIEW_MAX) and add small safety epsilon
+    epsilon = 1e-2
+    target_end = max(0.2, min(PREVIEW_MAX, max(0.0, voice_duration) - epsilon))
     timeline, total, idx = [], 0.0, 0
     while total < target_end and unit_clips:
         clip = unit_clips[idx % len(unit_clips)]
@@ -411,21 +418,28 @@ def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, t
 
     merged = concatenate_videoclips(timeline, method="compose").subclip(0, target_end)
 
-    # Set narration audio
-    voice = AudioFileClip(voice_mp3).subclip(0, target_end)
-    merged = merged.set_audio(voice)
+    # Attach voice audio but DO NOT exceed its duration
+    voice = AudioFileClip(voice_mp3)
+    vdur = voice.duration
+    end = min(target_end, vdur)  # double-guard
+    # Trim merged to 'end' and the voice to 'end'
+    merged = merged.subclip(0, end)
+    voice_trim = voice.subclip(0, end)
+    merged = merged.set_audio(voice_trim)
+
+    # Write temp video with narration only
     merged.write_videofile(
         temp_mp4, fps=30, codec="libx264", audio_codec="aac",
         threads=2, preset="fast", verbose=False, logger=None, ffmpeg_params=["-pix_fmt","yuv420p"]
     )
     voice.close(); [c.close() for c in unit_clips]; merged.close()
 
-    # Generate captions from the actual narration (exact words, synced)
+    # Generate perfectly synced captions from actual narration (exact words)
     srt_path = "cap.srt"
     ok = transcribe_to_srt_faster_whisper(voice_mp3, srt_path, lang="en")
     if not ok:
         with open(srt_path, "w", encoding="utf-8") as f:
-            f.write(f"1\n{fmt_time(0.0)} --> {fmt_time(target_end)}\n\n")
+            f.write(f"1\n{fmt_time(0.0)} --> {fmt_time(end)}\n\n")
 
     # Burn captions bottom-center
     subbed = "subbed.mp4"
@@ -433,7 +447,7 @@ def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, t
 
     # Add low-volume background music under narration
     with_bgm = "with_bgm.mp4"
-    add_bgm_to_video(subbed, with_bgm, target_end)
+    add_bgm_to_video(subbed, with_bgm, end)
 
     # Final safety trim if needed
     vtmp = VideoFileClip(with_bgm); d = vtmp.duration; vtmp.close()
@@ -460,7 +474,6 @@ def ensure_google_client():
         except Exception:
             pkgs.append("packaging>=23.1")
         pkgs += ["google-api-python-client", "google-auth", "google-auth-oauthlib"]
-        subprocess.run([sys.executable, "-m", "pip", "pip", "--version"], check=False)
         subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "-q"] + pkgs, check=True)
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
@@ -625,7 +638,7 @@ Educational only, not medical advice. Consult a qualified professional for perso
             }
             new_body = set_metadata_in_issue_body(issue_body, meta)
             return meta, new_body
-        # If too short on attempt 1, slightly increase word target next
+        # If too short, request a little longer next attempt
         word_hint = "145–170"
     return None, issue_body
 
