@@ -48,6 +48,7 @@ jobs:
           print("Imports OK")
           PY
 
+      # Only check heavy secrets for actions that actually need them
       - name: Check required secrets
         if: ${{ contains(github.event.comment.body, '/approve-topic') ||
                 contains(github.event.comment.body, '/approve-video') ||
