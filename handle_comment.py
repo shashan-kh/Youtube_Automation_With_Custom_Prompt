@@ -31,7 +31,7 @@ GROQ_FALLBACK_MODELS_ENV = os.getenv("GROQ_FALLBACK_MODELS", ",".join(DEFAULT_FA
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 TTS_LANG = os.getenv("TTS_LANG", "en")
 
-# Optional background music source (royalty-free/CC0 URL). If not set, we synthesize a gentle bed.
+# Background music source (optional CC0/royalty-free URL). If not set, synthesize.
 BGM_URL = os.getenv("BGM_URL", "").strip()
 try:
     BGM_VOL = float(os.getenv("BGM_VOL", "0.07"))
@@ -39,6 +39,7 @@ except Exception:
     BGM_VOL = 0.07
 
 SAFE_TAGS = ["health","wellness","habits","selfcare","sleep","hydration","movement","posture","stress","nutrition"]
+PREVIEW_MIN = 50.0
 PREVIEW_MAX = 57.3
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -159,7 +160,6 @@ def build_model_list():
         env_models.append(GROQ_MODEL)
     if GROQ_FALLBACK_MODELS_ENV:
         env_models.extend([m.strip() for m in GROQ_FALLBACK_MODELS_ENV.split(",") if m.strip()])
-    # De-dup
     seen = set(); env_models = [m for m in env_models if not (m in seen or seen.add(m))]
     available = list_groq_models()
     if not available:
@@ -182,7 +182,7 @@ def build_model_list():
             ordered.append(mid)
     return ordered[:10]
 
-def llm_script(trending_query, word_hint="115–135"):
+def llm_script(trending_query, word_hint="130–160"):
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret")
     prompt = f"""
@@ -197,7 +197,7 @@ Rules:
 
 Output pure JSON with:
 - voiceover: string
-- overlay_lines: array (ignored for captions; we will use exact voiceover words)
+- overlay_lines: array (ignored for captions; we use exact voiceover words)
 - title: catchy, <=90 chars, include #Shorts
 - description: 2–3 sentences + “Educational only, not medical advice.” + 1 credible source (WHO/CDC/NIH/NHS)
 - tags: 6–10 comma-separated general tags
@@ -234,17 +234,18 @@ Output pure JSON with:
     raise last_err or RuntimeError("Groq call failed; no models available to try")
 
 # ---------- Audio and captions ----------
-def ensure_voice_under_target(voice_path, target=PREVIEW_MAX):
+def ensure_voice_in_range(voice_path, min_sec=PREVIEW_MIN, max_sec=PREVIEW_MAX):
     a = AudioFileClip(voice_path); dur = a.duration; a.close()
-    if dur <= target:
+    target = max(min_sec, min(max_sec, dur))
+    if min_sec <= dur <= max_sec:
         return voice_path, dur
-    factor = max(0.5, min(2.0, target / dur))
-    out = "voice_fast.mp3"
+    factor = max(0.5, min(2.0, dur and (target / dur) or 1.0))
+    out = "voice_adj.mp3"
     subprocess.run(["ffmpeg","-y","-i",voice_path,"-filter:a",f"atempo={factor}","-vn",out], check=True)
     a2 = AudioFileClip(out); d2 = a2.duration; a2.close()
     return out, d2
 
-def fetch_broll(query, need=4):
+def fetch_broll(query, need=6):
     if not PEXELS_API_KEY:
         raise RuntimeError("Missing PEXELS_API_KEY secret")
     url = "https://api.pexels.com/videos/search"
@@ -287,19 +288,17 @@ def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en"):
         idx = 1
         for seg in segments:
             text = (seg.text or "").strip()
-            if not text:
-                continue
+            if not text: continue
             out.append(f"{idx}\n{fmt_time(seg.start)} --> {fmt_time(seg.end)}\n{text}\n\n")
             idx += 1
         if not out:
-            # fallback single block
             a = AudioFileClip(audio_path); d = a.duration; a.close()
             out.append(f"1\n{fmt_time(0.0)} --> {fmt_time(d)}\n\n")
         with open(srt_path, "w", encoding="utf-8") as f:
             f.writelines(out)
         return True
     except Exception as e:
-        print("Whisper transcription failed, falling back to naive captions:", e)
+        print("Whisper transcription failed:", e)
         return False
 
 def _ffmpeg_escape(s):
@@ -311,12 +310,12 @@ def _ffmpeg_escape(s):
     )
 
 def burn_captions(in_mp4, srt_path, out_mp4):
-    # Small, yellow with black stroke, bottom-center, no filled box (BorderStyle=1)
+    # Small, yellow with black stroke, bottom-center, no filled box
     # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
     style = (
-        "Fontname=DejaVu Sans,Fontsize=28,Bold=1,"
+        "Fontname=DejaVu Sans,Fontsize=24,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
-        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=90"
+        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=100"
     )
     vf = f"subtitles={_ffmpeg_escape(srt_path)}:force_style={_ffmpeg_escape(style)}"
     subprocess.run([
@@ -324,7 +323,6 @@ def burn_captions(in_mp4, srt_path, out_mp4):
     ], check=True)
 
 def ensure_bgm_track(duration, out_path="bgm_src.m4a"):
-    # Download provided CC0/royalty-free track or synthesize a gentle tone bed
     if BGM_URL:
         raw = "bgm_raw"
         ext = ".mp3"
@@ -379,7 +377,7 @@ def letterbox_clip(clip, target_w=1080, target_h=1920, bg_color=(0,0,0)):
     comp = CompositeVideoClip([bg, c2.set_position(("center","center"))], size=(target_w, target_h))
     return comp.set_duration(c2.duration)
 
-def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, target_h=1920, target_w=1080):
+def render_and_cap(broll_urls, voice_mp3, voice_duration, temp_mp4, final_mp4, target_h=1920, target_w=1080):
     # Download b-roll
     tmp = Path(tempfile.mkdtemp()); local = []
     for i,u in enumerate(broll_urls):
@@ -390,44 +388,52 @@ def render_and_cap(broll_urls, voice_mp3, temp_mp4, final_mp4, target_h=1920, ta
                 for ch in r.iter_content(1024*256): f.write(ch)
         local.append(str(p))
 
-    # Letterbox clips (no cropping) to 1080x1920
-    clips = []
+    # Build base letterboxed unit clips
+    unit_clips = []
     for p in local:
         c = VideoFileClip(p)
         take = min(8, max(4, int(c.duration)))
         c = c.subclip(0, take)
         c = letterbox_clip(c, target_w=target_w, target_h=target_h)
-        # remove original clip audio to keep only narration + BGM
         c = c.set_audio(None)
-        clips.append(c)
+        unit_clips.append(c)
+    if not unit_clips:
+        raise RuntimeError("No valid b-roll clips to render")
 
-    merged = concatenate_videoclips(clips, method="compose")
+    # Build timeline to at least voice length target (50–57.3)
+    target_end = min(PREVIEW_MAX, max(PREVIEW_MIN, voice_duration + 0.3))
+    timeline, total, idx = [], 0.0, 0
+    while total < target_end and unit_clips:
+        clip = unit_clips[idx % len(unit_clips)]
+        timeline.append(clip)
+        total += clip.duration
+        idx += 1
 
-    # Set narration audio track
-    voice = AudioFileClip(voice_mp3)
-    end = min(merged.duration, voice.duration + 0.3, PREVIEW_MAX)
-    merged = merged.subclip(0, end).set_audio(voice)
+    merged = concatenate_videoclips(timeline, method="compose").subclip(0, target_end)
+
+    # Set narration audio
+    voice = AudioFileClip(voice_mp3).subclip(0, target_end)
+    merged = merged.set_audio(voice)
     merged.write_videofile(
         temp_mp4, fps=30, codec="libx264", audio_codec="aac",
         threads=2, preset="fast", verbose=False, logger=None, ffmpeg_params=["-pix_fmt","yuv420p"]
     )
-    voice.close(); [c.close() for c in clips]; merged.close()
+    voice.close(); [c.close() for c in unit_clips]; merged.close()
 
-    # Generate perfectly synced captions from actual narration (exact words)
+    # Generate captions from the actual narration (exact words, synced)
     srt_path = "cap.srt"
     ok = transcribe_to_srt_faster_whisper(voice_mp3, srt_path, lang="en")
     if not ok:
-        # As a fallback, display one block for the full duration (empty or generic)
         with open(srt_path, "w", encoding="utf-8") as f:
-            f.write(f"1\n{fmt_time(0.0)} --> {fmt_time(end)}\n\n")
+            f.write(f"1\n{fmt_time(0.0)} --> {fmt_time(target_end)}\n\n")
 
-    # Burn yellow stroked captions at bottom
+    # Burn captions bottom-center
     subbed = "subbed.mp4"
     burn_captions(temp_mp4, srt_path, subbed)
 
     # Add low-volume background music under narration
     with_bgm = "with_bgm.mp4"
-    add_bgm_to_video(subbed, with_bgm, end)
+    add_bgm_to_video(subbed, with_bgm, target_end)
 
     # Final safety trim if needed
     vtmp = VideoFileClip(with_bgm); d = vtmp.duration; vtmp.close()
@@ -454,6 +460,7 @@ def ensure_google_client():
         except Exception:
             pkgs.append("packaging>=23.1")
         pkgs += ["google-api-python-client", "google-auth", "google-auth-oauthlib"]
+        subprocess.run([sys.executable, "-m", "pip", "pip", "--version"], check=False)
         subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "-q"] + pkgs, check=True)
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
@@ -539,17 +546,13 @@ def extract_youtube_id(text):
     if not text:
         return None
     m = re.search(r"<!--\s*preview_video_id:\s*([A-Za-z0-9_-]{11})\s*-->", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]{11})", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?[^ \n\r]*v=([A-Za-z0-9_-]{11})", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     m = re.search(r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", text)
-    if m:
-        return m.group(1)
+    if m: return m.group(1)
     return None
 
 def find_preview_video_id(owner, repo, number, issue_body):
@@ -589,20 +592,20 @@ def post_preview_comment(owner, repo, number, meta, slot):
     post_comment(owner, repo, number, msg)
 
 # ---------- Build preview and schedule ----------
-def build_preview_until_under_58(topic, slot, issue_body, max_attempts=5):
+def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
     # Aim for 50–58s right from the first attempt
-    word_targets = ["115–135","110–130","105–125","100–120","95–115"]
+    word_hint = "130–160"
     for attempt in range(1, max_attempts+1):
-        s = llm_script(topic, word_hint=word_targets[min(attempt-1, len(word_targets)-1)])
+        s = llm_script(topic, word_hint=word_hint)
         text = s["voiceover"].strip()
         voice = "voice.mp3"; gTTS(text, lang=TTS_LANG).save(voice)
-        voice, _ = ensure_voice_under_target(voice, target=PREVIEW_MAX)
-        broll = fetch_broll(topic, need=4)
+        voice, vdur = ensure_voice_in_range(voice, min_sec=PREVIEW_MIN, max_sec=PREVIEW_MAX)
+        broll = fetch_broll(topic, need=6)
         if not broll:
             continue
         temp, final = "temp.mp4", "short.mp4"
-        dur = render_and_cap(broll, voice, temp, final)
-        if dur < 58.0:
+        dur = render_and_cap(broll, voice, vdur, temp, final)
+        if PREVIEW_MIN <= dur < 58.0:
             desc = f"""{s['description']}
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
@@ -622,6 +625,8 @@ Educational only, not medical advice. Consult a qualified professional for perso
             }
             new_body = set_metadata_in_issue_body(issue_body, meta)
             return meta, new_body
+        # If too short on attempt 1, slightly increase word target next
+        word_hint = "145–170"
     return None, issue_body
 
 def safe_main():
@@ -666,9 +671,9 @@ def safe_main():
         if not topic:
             post_comment(owner, repo, number, "Please provide a topic. Example:\n/custom-topic Morning hydration habit")
             return
-        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
+        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Try a simpler topic or /new-topic.")
+            post_comment(owner, repo, number, "Couldn't get to 50–58s after attempts. Try a simpler topic or /new-topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
@@ -678,26 +683,20 @@ def safe_main():
     if comment.lower().startswith("/approve-topic"):
         topics = parse_topics_from_body(body)
         parts = comment.split(maxsplit=1)
-        topic = None
-        if len(parts) > 1:
-            arg = parts[1].strip()
-            if arg.isdigit():
-                idx = int(arg)
-                if not topics or not (1 <= idx <= len(topics)):
-                    post_comment(owner, repo, number, "Invalid index. Use 1/2/3, or provide your own with:\n/custom-topic Your Topic")
-                    return
-                topic = topics[idx-1]
-            else:
-                topic = arg
+        if len(parts) > 1 and not parts[1].strip().isdigit():
+            topic = parts[1].strip()
         else:
             if not topics:
-                post_comment(owner, repo, number, "Couldn't detect topics in the Issue. Use /new-topic or /custom-topic Your Topic.")
+                post_comment(owner, repo, number, "Couldn't detect topics. Use /new-topic or /custom-topic Your Topic.")
                 return
-            topic = topics[0]
-
-        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
+            idx = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+            if idx < 1 or idx > len(topics):
+                post_comment(owner, repo, number, "Invalid index. Use 1/2/3 or /custom-topic Your Topic.")
+                return
+            topic = topics[idx-1]
+        meta, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta:
-            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Reply /new-topic or /custom-topic Your Topic.")
+            post_comment(owner, repo, number, "Couldn't get to 50–58s after attempts. Reply /new-topic or /custom-topic Your Topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval"); remove_label(owner, repo, number, "await-topic-approval")
@@ -709,23 +708,20 @@ def safe_main():
         deletion_msg = ""
         if vid_id:
             try:
-                yt_delete_video(vid_id)
-                deletion_msg = f"Deleted unlisted preview video (ID: {vid_id})."
+                yt_delete_video(vid_id); deletion_msg = f"Deleted unlisted preview video (ID: {vid_id})."
             except Exception as de:
                 deletion_msg = f"Couldn't delete preview on YouTube (ID: {vid_id}): {de}"
         else:
-            deletion_msg = "No preview video ID found (looked in metadata, body, and recent comments)."
+            deletion_msg = "No preview video ID found (looked in metadata, body, recent comments)."
         try:
             meta = get_metadata_from_issue_body(body) or {}
             for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic"]:
-                if k in meta:
-                    del meta[k]
+                if k in meta: del meta[k]
             new_body = set_metadata_in_issue_body(body, meta)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         except Exception as e2:
             deletion_msg += f"\nMetadata cleanup error: {e2}"
-        add_label(owner, repo, number, "await-topic-approval")
-        remove_label(owner, repo, number, "await-video-approval")
+        add_label(owner, repo, number, "await-topic-approval"); remove_label(owner, repo, number, "await-video-approval")
         post_comment(owner, repo, number, f"{deletion_msg}\nOK. Reply /new-topic for fresh options or /custom-topic Your Topic.")
         return
 
@@ -735,9 +731,9 @@ def safe_main():
         if not topic:
             post_comment(owner, repo, number, "No topic to regenerate. Use /approve-topic or /custom-topic first.")
             return
-        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=5)
+        meta2, new_body = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta2:
-            post_comment(owner, repo, number, "Couldn't get under 58s after several attempts. Use /new-topic or /custom-topic.")
+            post_comment(owner, repo, number, "Couldn't get to 50–58s after attempts. Use /new-topic or /custom-topic.")
             return
         gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
         add_label(owner, repo, number, "await-video-approval")
@@ -747,10 +743,8 @@ def safe_main():
     if comment.lower().startswith("/approve-video"):
         vid_id = None
         meta = get_metadata_from_issue_body(body)
-        if meta and "preview_video_id" in meta:
-            vid_id = meta["preview_video_id"]
-        if not vid_id:
-            vid_id = find_preview_video_id(owner, repo, number, body)
+        if meta and "preview_video_id" in meta: vid_id = meta["preview_video_id"]
+        if not vid_id: vid_id = find_preview_video_id(owner, repo, number, body)
         if not vid_id:
             post_comment(owner, repo, number, "No preview video found. Please /regenerate-video.")
             return
@@ -773,7 +767,7 @@ def main():
             avail = list_groq_models()
             addendum = ""
             if avail:
-                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
+                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
