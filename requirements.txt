@@ -7,6 +7,9 @@ requests
 gTTS
 packaging>=23.1
 
+# Accurate, lightweight CPU transcription for exact captions
+faster-whisper>=1.0.0,<2
+
 # YouTube + Google auth
 google-api-python-client
 google-auth
