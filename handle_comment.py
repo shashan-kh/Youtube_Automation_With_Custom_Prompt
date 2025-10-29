@@ -671,6 +671,44 @@ def upload_youtube_unlisted(video_path, title, description, tags):
     vid_id = resp.get("id")
     return vid_id, f"https://youtu.be/{vid_id}"
 
+def upload_preview_fallback(video_path):
+    # Try file.io first
+    try:
+        with open(video_path, "rb") as f:
+            r = requests.post("https://file.io", files={"file": ("short.mp4", f, "video/mp4")}, data={"expires": "1d"}, timeout=120)
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("success") and j.get("link"):
+                return j["link"], "file.io"
+    except Exception:
+        pass
+    # Try transfer.sh
+    try:
+        name = os.path.basename(video_path) or "short.mp4"
+        with open(video_path, "rb") as f:
+            r = requests.put(f"https://transfer.sh/{name}", data=f, timeout=300)
+        if r.status_code in (200, 201):
+            link = r.text.strip()
+            if link.startswith("http"):
+                return link, "transfer.sh"
+    except Exception:
+        pass
+    return None, None
+
+def upload_preview_youtube_or_fallback(video_path, title, description, tags):
+    try:
+        vid_id, link = upload_youtube_unlisted(video_path, title, description, tags)
+        return {"preview_video_id": vid_id, "preview_link": link, "yt_upload_blocked": False, "fallback": None}
+    except Exception as e:
+        msg = str(e)
+        blocked = ("uploadLimitExceeded" in msg) or ("exceeded the number of videos" in msg)
+        if blocked:
+            link, host = upload_preview_fallback(video_path)
+            if link:
+                return {"preview_video_id": None, "preview_link": link, "yt_upload_blocked": True, "fallback": host or "fallback"}
+            # If fallback also failed, re-raise to surface the error
+        raise
+
 def schedule_existing_video(video_id, slot):
     yt = yt_client()
     tomorrow_ist = datetime.now(IST).date() + timedelta(days=1)
@@ -693,8 +731,9 @@ def yt_delete_video(video_id):
 
 # ---------- Metadata helpers ----------
 def upload_preview_youtube(video_path, title, description, tags):
-    vid_id, link = upload_youtube_unlisted(video_path, title, description, tags)
-    return vid_id, link
+    # Backward-compatible wrapper (kept name) that now uses fallback on YT limit
+    info = upload_preview_youtube_or_fallback(video_path, title, description, tags)
+    return info["preview_video_id"], info["preview_link"], info
 
 def get_metadata_from_issue_body(issue_body):
     m = re.search(r"```json\s*(\{.*?\})\s*```", issue_body, re.S)
@@ -752,11 +791,15 @@ def find_preview_video_id(owner, repo, number, issue_body):
 
 def post_preview_comment(owner, repo, number, meta, slot, prefix_msg=""):
     prefix = (prefix_msg + "\n\n") if prefix_msg else ""
+    blocked_note = ""
+    if meta.get("yt_upload_blocked"):
+        blocked_note = ("\nNote: YouTube upload limit reached for this account today. "
+                        "The preview is hosted temporarily here. Approving upload will work once the limit resets (usually within 24 hours).")
     msg = (
-        f"{prefix}Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}\n"
+        f"{prefix}Preview ready (attempt {meta['attempt']}, {meta['duration_sec']}s): {meta['preview_link']}{blocked_note}\n"
         f"Reply:\n- /approve-video (schedule PRIVATE → auto-publish next day {slot})\n"
         f"- /reject-video (delete preview and pick a new topic)\n\n"
-        f"<!-- preview_video_id: {meta['preview_video_id']} -->"
+        f"<!-- preview_video_id: {meta.get('preview_video_id','')} -->"
     )
     post_comment(owner, repo, number, msg)
 
@@ -784,7 +827,10 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
 
 Educational only, not medical advice. Consult a qualified professional for personal guidance.
 #Shorts #health #wellness"""
-            vid_id, link = upload_preview_youtube(final, s["title"], desc, s.get("tags",""))
+            try:
+                vid_id, link, info = upload_preview_youtube(final, s["title"], desc, s.get("tags",""))
+            except Exception as e:
+                raise RuntimeError(f"Preview upload failed: {e}")
             meta = {
                 "topic": topic,
                 "title": s["title"],
@@ -792,6 +838,8 @@ Educational only, not medical advice. Consult a qualified professional for perso
                 "tags": s.get("tags",""),
                 "preview_video_id": vid_id,
                 "preview_link": link,
+                "yt_upload_blocked": bool(info.get("yt_upload_blocked")),
+                "fallback_host": info.get("fallback"),
                 "slot": slot,
                 "created_at": datetime.utcnow().isoformat(),
                 "duration_sec": round(dur,2),
@@ -799,7 +847,6 @@ Educational only, not medical advice. Consult a qualified professional for perso
             }
             new_body = set_metadata_in_issue_body(issue_body, meta)
             return meta, new_body
-        # If too short, request a little longer next attempt
         word_hint = "145–170"
     return None, issue_body
 
@@ -889,7 +936,7 @@ def safe_main():
             deletion_msg = "No preview video ID found (looked in metadata, body, recent comments)."
         try:
             meta = get_metadata_from_issue_body(body) or {}
-            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic"]:
+            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","topic","yt_upload_blocked","fallback_host"]:
                 if k in meta: del meta[k]
             new_body = set_metadata_in_issue_body(body, meta)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body})
@@ -920,15 +967,14 @@ def safe_main():
                 deleted_msg = f"Couldn't delete previous preview on YouTube (ID: {prev_vid}): {de}"
         # Clear preview fields in metadata before regenerating
         try:
-            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec"]:
+            for k in ["preview_video_id","preview_link","title","description","tags","attempt","duration_sec","yt_upload_blocked","fallback_host"]:
                 if k in meta_old: del meta_old[k]
             new_body_clear = set_metadata_in_issue_body(body, meta_old)
             gh("PATCH", f"https://api.github.com/repos/{owner}/{repo}/issues/{number}", json={"body": new_body_clear})
-            body = new_body_clear  # continue with cleared body
+            body = new_body_clear
         except Exception:
             pass
 
-        # Regenerate (with outro phrase included)
         meta2, new_body2 = build_preview_until_under_58(topic, slot, body, max_attempts=3)
         if not meta2:
             post_comment(owner, repo, number, f"{deleted_msg}\nCouldn't get to 35–58s after attempts. Use /new-topic or /custom-topic.")
@@ -939,14 +985,17 @@ def safe_main():
         return
 
     if comment.lower().startswith("/approve-video"):
+        meta = get_metadata_from_issue_body(body) or {}
+        if meta.get("yt_upload_blocked"):
+            post_comment(owner, repo, number, "YouTube upload limit was reached when generating this preview. Please try /regenerate-video after the limit resets (typically within 24 hours).")
+            return
         vid_id = None
-        meta = get_metadata_from_issue_body(body)
         if meta and "preview_video_id" in meta:
             vid_id = meta["preview_video_id"]
         if not vid_id:
             vid_id = find_preview_video_id(owner, repo, number, body)
         if not vid_id:
-            post_comment(owner, repo, number, "No preview video found. Please /regenerate-video.")
+            post_comment(owner, repo, number, "No preview video found on YouTube. Please /regenerate-video.")
             return
         publish_at_utc = schedule_existing_video(vid_id, (meta or {}).get("slot","morning"))
         ist_time = datetime.fromisoformat(publish_at_utc.replace("Z","")).astimezone(IST).strftime("%Y-%m-%d %H:%M")
@@ -967,7 +1016,7 @@ def main():
             avail = list_groq_models()
             addendum = ""
             if avail:
-                addendum = "\n\nAvailable models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS to one of the above."
+                addendum = "\n\nIf you hit YouTube upload limit, a temporary preview host was used.\nAvailable Groq models for your key:\n- " + "\n- ".join(avail[:30]) + "\nSet GROQ_MODEL / GROQ_FALLBACK_MODELS in the workflow env to one of the above."
             msg = f"❌ Error: {e}{addendum}\n```\n{traceback.format_exc()}\n```"
             post_comment(owner, repo, number, msg)
         except Exception:
