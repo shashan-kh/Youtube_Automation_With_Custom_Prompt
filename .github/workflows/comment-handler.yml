@@ -30,14 +30,14 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          # ffmpeg for rendering, libass for burning captions, fonts for DejaVu,
-          # fontconfig for font discovery, libgomp1 for faster-whisper CPU backend
+          # ffmpeg for rendering, libass + fonts for captions, fontconfig for font discovery, libgomp1 for faster-whisper
           sudo apt-get install -y ffmpeg libass9 fonts-dejavu-core libfontconfig1 libgomp1
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -r requirements.txt
+          # Ensure 'packaging' in case of Google client transitive issues
           python -m pip install --upgrade packaging
           python - << 'PY'
           import sys
@@ -48,7 +48,6 @@ jobs:
           print("Imports OK")
           PY
 
-      # Only check heavy secrets for actions that actually need them
       - name: Check required secrets
         if: ${{ contains(github.event.comment.body, '/approve-topic') ||
                 contains(github.event.comment.body, '/approve-video') ||
@@ -87,4 +86,7 @@ jobs:
           TTS_LANG: en
           GROQ_MODEL: qwen/qwen3-32b
           GROQ_FALLBACK_MODELS: llama-3.3-70b-versatile,llama-3.1-8b-instant,openai/gpt-oss-20b,openai/gpt-oss-120b,groq/compound-mini,groq/compound,moonshotai/kimi-k2-instruct
+          # Optional: your CC0/royalty-free background music URL
+          BGM_URL: ${{ secrets.BACKGROUND_MUSIC_URL }}
+          BGM_VOL: "0.07"
         run: python handle_comment.py
