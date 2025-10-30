@@ -84,19 +84,99 @@ def open_issues_with_labels(owner, repo, labels):
     log(f"Open issues with labels {labels}:", [(i.get('number'), i.get('title')) for i in issues])
     return issues
 
-def fetch_trending_candidates(region="IN", max_items=12):
+# ---------- Duplicate prevention helpers ----------
+def normalize_topic(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[\W_]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def jaccard(a: str, b: str) -> float:
+    sa = set(normalize_topic(a).split())
+    sb = set(normalize_topic(b).split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+def load_recent_approved_topics(owner, repo, max_issues=200, min_sim_threshold=0.8):
+    approved = set()
+    titles_seen = set()
+    page = 1
+    fetched = 0
+    while fetched < max_issues:
+        per_page = min(100, max_issues - fetched)
+        r = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues",
+               params={"state": "closed", "per_page": per_page, "page": page, "sort":"updated", "direction":"desc"})
+        arr = r.json()
+        if not isinstance(arr, list) or not arr:
+            break
+        for it in arr:
+            if "pull_request" in it:
+                continue
+            num = it.get("number")
+            # Quick scan: any comment saying "Scheduled ✅"?
+            try:
+                cr = gh("GET", f"https://api.github.com/repos/{owner}/{repo}/issues/{num}/comments", params={"per_page": 100})
+                comments = cr.json() if isinstance(cr.json(), list) else []
+                scheduled = any(("Scheduled ✅" in (c.get("body") or "")) for c in comments)
+            except Exception:
+                scheduled = False
+            if not scheduled:
+                continue
+            # Extract topic from metadata block if present
+            body = it.get("body") or ""
+            m = re.search(r"```json\s*(\{.*?\})\s*```", body, re.S)
+            topic = None
+            if m:
+                try:
+                    md = json.loads(m.group(1))
+                    if isinstance(md, dict) and md.get("topic"):
+                        topic = str(md.get("topic")).strip()
+                except Exception:
+                    pass
+            # If not found, fallback to title parsing
+            if not topic:
+                title = it.get("title","")
+                titles_seen.add(title)
+            if topic:
+                norm = normalize_topic(topic)
+                # Avoid almost duplicates by Jaccard similarity
+                duplicate = any(jaccard(topic, t2) >= min_sim_threshold for t2 in approved)
+                if not duplicate:
+                    approved.add(topic)
+        fetched += len(arr)
+        if len(arr) < per_page:
+            break
+        page += 1
+    log("Previously approved topics (normalized):", [normalize_topic(t) for t in list(approved)[:10]])
+    return approved
+
+# ---------- Trending fetch ----------
+def fetch_trending_candidates(region="IN", max_items=20, exclude_topics=None):
+    exclude_topics = exclude_topics or set()
+    exclude_norms = {normalize_topic(x) for x in exclude_topics}
     pt = TrendReq(hl="en-IN", tz=330)
-    seeds = ["sleep","hydration","walking","steps","posture","stretching","mobility","stress","breathing","morning sunlight","protein","fiber","yoga","desk ergonomics","screen time","healthy snacks"]
-    banned = re.compile(r"(covid|vaccine|cancer|diabetes|ozempic|semaglutide|hiv|flu|tumor|depress|adhd|autism|arthritis|ibd|crohn|pcos|pregnan|detox|steroid|pill|drug|supplement|dosage|cure|therapy)", re.I)
+    seeds = [
+        "sleep","hydration","walking","steps","posture","stretching","mobility","stress","breathing",
+        "morning sunlight","protein","fiber","yoga","desk ergonomics","screen time","healthy snacks",
+        "core strength","back pain relief","neck pain","mindfulness","step count","water intake","bedtime routine"
+    ]
+    banned = re.compile(r"(covid|vaccine|cancer|diabetes|ozempic|semaglutide|hiv|flu|tumor|depress|adhd|autism|arthritis|ibd|crohn|pcos|pregnan|detox|steroid|pill|drug|supplement|dosage|cure|therapy|weight loss drugs?)", re.I)
+    def is_ok(s):
+        return bool(s) and not banned.search(s) and len(normalize_topic(s)) >= 6
     found = []
+
+    # 1) realtime_trending_searches
     try:
         df = pt.realtime_trending_searches(pn=region)
         if df is not None and "title" in df.columns:
             for t in df["title"].tolist():
-                if isinstance(t, str) and not banned.search(t) and any(w in t.lower() for w in ["sleep","diet","workout","walk","steps","hydrate","posture","stress","breath","sunlight","healthy","fitness","yoga"]):
+                if isinstance(t, str) and is_ok(t):
                     found.append(t)
     except Exception as e:
         log("pytrends realtime_trending_searches error:", e)
+
+    # 2) related queries for seeds (rising first for freshness)
     for s in seeds:
         try:
             pt.build_payload([s], timeframe="now 1-d", geo=region)
@@ -105,20 +185,41 @@ def fetch_trending_candidates(region="IN", max_items=12):
             for k in ("rising","top"):
                 df2 = rq_s.get(k)
                 if df2 is not None and "query" in df2.columns:
-                    for q in df2.head(10)["query"].tolist():
-                        if isinstance(q, str) and not banned.search(q):
+                    for q in df2.head(15)["query"].tolist():
+                        if isinstance(q, str) and is_ok(q):
                             found.append(q)
         except Exception as e:
             log(f"pytrends related_queries error for seed '{s}':", e)
             continue
+
+    # Deduplicate while excluding previously approved
     out, seen = [], set()
     for q in found:
-        key = q.lower().strip()
-        if key not in seen:
-            seen.add(key); out.append(q.strip())
-        if len(out) >= max_items: break
-    final = out or ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine","Take more walking breaks","Easy stretch flow"]
-    log("Candidate topics:", final[:3])
+        nq = normalize_topic(q)
+        if nq in seen:
+            continue
+        # Skip if similar to any previously approved topic
+        too_close = any(jaccard(q, ex) >= 0.8 for ex in exclude_topics)
+        if too_close:
+            continue
+        seen.add(nq)
+        # Title-case lightly (but keep acronyms)
+        nice = q.strip()
+        nice = nice[0].upper() + nice[1:] if nice else q
+        out.append(nice)
+        if len(out) >= max_items:
+            break
+
+    # Ensure at least some safe fallback topics that are not previously approved
+    fallbacks = ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine","Take more walking breaks","Easy stretch flow"]
+    for f in fallbacks:
+        if len(out) >= max_items:
+            break
+        if all(jaccard(f, ex) < 0.8 for ex in exclude_topics):
+            out.append(f)
+
+    final = out[:max_items]
+    log("Candidate topics (filtered, fresh):", final[:5])
     return final
 
 def create_topic_issue(owner, repo, topics, scheduled_ist):
@@ -128,7 +229,7 @@ def create_topic_issue(owner, repo, topics, scheduled_ist):
         slot_label: ("bfd4f2" if SLOT == "morning" else "c2e0c6", f"Issue for {SLOT} slot")
     })
     title = f"Topic approval for {SLOT} slot ({scheduled_ist.strftime('%Y-%m-%d')} {scheduled_ist.strftime('%H:%M')} IST)"
-    body = f"""Proposed topics for tomorrow's {SLOT} slot.
+    body = f"""Proposed fresh topics for tomorrow's {SLOT} slot (older approved topics excluded).
 Scheduled publish (IST): {scheduled_ist.strftime('%Y-%m-%d %H:%M')}.
 
 Choose one:
@@ -138,7 +239,7 @@ Choose one:
 
 Reply with:
 - /approve-topic 1   (or 2/3)
-- /reject-topic      (I’ll propose new topics)
+- /reject-topic      (I’ll propose new fresh topics)
 - /custom-topic Your Topic   (use your own safe wellness topic)
 
 /regenerate-video (rebuild same topic under 58s) and /approve-video (schedule upload) are used after preview is ready.
@@ -168,7 +269,15 @@ def main():
     if isinstance(open_slot, list) and open_slot:
         print("An approval issue for this slot is already open. Skipping.")
         return
-    topics = fetch_trending_candidates(REGION, max_items=12)[:3]
+
+    # Load previously approved topics (from closed issues with Scheduled ✅)
+    try:
+        approved = load_recent_approved_topics(owner, repo, max_issues=200, min_sim_threshold=0.8)
+    except Exception as e:
+        log("Failed to load approved topics:", e)
+        approved = set()
+
+    topics = fetch_trending_candidates(REGION, max_items=12, exclude_topics=approved)[:3]
     scheduled_ist = next_slot_ist()
     try:
         create_topic_issue(owner, repo, topics, scheduled_ist)
