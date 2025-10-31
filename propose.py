@@ -1,3 +1,5 @@
+--- propose.py ---
+
 import os, re, json, requests, sys
 from datetime import datetime, timedelta, timezone
 from pytrends.request import TrendReq
@@ -151,6 +153,54 @@ def load_recent_approved_topics(owner, repo, max_issues=200, min_sim_threshold=0
     log("Previously approved topics (normalized):", [normalize_topic(t) for t in list(approved)[:10]])
     return approved
 
+# ---------- Helper: ensure we always have at least 3 safe topics ----------
+FALLBACK_POOL = [
+    "Desk posture checklist",
+    "Healthy snack swaps at work",
+    "Walking breaks every hour",
+    "Quick mobility routine for hips",
+    "Breathing reset for stress",
+    "Screen-time eye care tips",
+    "Core stability basics",
+    "Neck and shoulder stretch break",
+    "Morning sunlight routine",
+    "Water intake habit tracker",
+    "Simple bedtime wind-down",
+    "Gentle back mobility flow",
+]
+
+def pad_topics_to_three(topics, exclude_topics):
+    out = [t for t in topics if isinstance(t, str) and t.strip()]
+    if len(out) >= 3:
+        return out[:3]
+
+    # Try to add from pool avoiding near-duplicates with both out and previously approved
+    def can_add(cand, thr=0.8):
+        if any(jaccard(cand, t) >= thr for t in out):
+            return False
+        if any(jaccard(cand, ex) >= thr for ex in exclude_topics):
+            return False
+        return True
+
+    # Two passes with decreasing strictness
+    for thr in (0.8, 0.7):
+        for cand in FALLBACK_POOL:
+            if len(out) >= 3:
+                break
+            if can_add(cand, thr=thr):
+                out.append(cand)
+        if len(out) >= 3:
+            break
+
+    # Absolute fallback: generic uniques
+    i = 1
+    while len(out) < 3:
+        cand = f"Healthy daily habit idea {i}"
+        if can_add(cand, thr=0.5):
+            out.append(cand)
+        i += 1
+    return out[:3]
+
 # ---------- Trending fetch ----------
 def fetch_trending_candidates(region="IN", max_items=20, exclude_topics=None):
     exclude_topics = exclude_topics or set()
@@ -210,12 +260,12 @@ def fetch_trending_candidates(region="IN", max_items=20, exclude_topics=None):
         if len(out) >= max_items:
             break
 
-    # Ensure at least some safe fallback topics that are not previously approved
+    # Ensure at least some safe fallback topics that are not previously approved and not dupes
     fallbacks = ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine","Take more walking breaks","Easy stretch flow"]
     for f in fallbacks:
         if len(out) >= max_items:
             break
-        if all(jaccard(f, ex) < 0.8 for ex in exclude_topics):
+        if all(jaccard(f, ex) < 0.8 for ex in exclude_topics) and all(jaccard(f, q) < 0.8 for q in out):
             out.append(f)
 
     final = out[:max_items]
@@ -228,17 +278,18 @@ def create_topic_issue(owner, repo, topics, scheduled_ist):
         "await-topic-approval": ("ededed", "Awaiting topic approval"),
         slot_label: ("bfd4f2" if SLOT == "morning" else "c2e0c6", f"Issue for {SLOT} slot")
     })
+    # Dynamically render as many as we have (always padded to 3 upstream)
+    numbered = "\n".join([f"{i}) {t}" for i, t in enumerate(topics[:3], 1)])
+    opts_str = "/".join(str(i) for i in range(1, min(3, len(topics)) + 1))
     title = f"Topic approval for {SLOT} slot ({scheduled_ist.strftime('%Y-%m-%d')} {scheduled_ist.strftime('%H:%M')} IST)"
     body = f"""Proposed fresh topics for tomorrow's {SLOT} slot (older approved topics excluded).
 Scheduled publish (IST): {scheduled_ist.strftime('%Y-%m-%d %H:%M')}.
 
 Choose one:
-1) {topics[0]}
-2) {topics[1]}
-3) {topics[2]}
+{numbered}
 
 Reply with:
-- /approve-topic 1   (or 2/3)
+- /approve-topic 1   (or {opts_str})
 - /reject-topic      (I’ll propose new fresh topics)
 - /custom-topic Your Topic   (use your own safe wellness topic)
 
@@ -277,10 +328,12 @@ def main():
         log("Failed to load approved topics:", e)
         approved = set()
 
-    topics = fetch_trending_candidates(REGION, max_items=12, exclude_topics=approved)[:3]
+    candidates = fetch_trending_candidates(REGION, max_items=12, exclude_topics=approved)
+    topics = pad_topics_to_three(candidates, approved)  # ensure 3 safe options
     scheduled_ist = next_slot_ist()
     try:
         create_topic_issue(owner, repo, topics, scheduled_ist)
+        log("Using topics:", topics[:3])
         print("Created topic approval issue for", SLOT)
     except requests.HTTPError as e:
         print("Failed to create issue:", e.response.text if e.response is not None else str(e))
