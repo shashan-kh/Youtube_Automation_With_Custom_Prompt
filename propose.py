@@ -1,5 +1,3 @@
---- propose.py ---
-
 import os, re, json, requests, sys
 from datetime import datetime, timedelta, timezone
 from pytrends.request import TrendReq
