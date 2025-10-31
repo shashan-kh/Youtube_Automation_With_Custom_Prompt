@@ -1,4 +1,6 @@
-import os, re, json, tempfile, subprocess, requests, traceback, sys, shutil
+--- handle_comment.py ---
+
+import os, re, json, tempfile, subprocess, requests, traceback, sys, shutil, unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from moviepy.editor import (
@@ -47,6 +49,195 @@ TARGET_LOW = 35.0
 TARGET_HIGH = 58.0
 PREVIEW_MAX = 57.3
 IST = timezone(timedelta(hours=5, minutes=30))
+
+# ---------- SEO helpers (English-only + optimization) ----------
+SEO_DEFAULT_TAGS = [
+    "shorts","youtube shorts","health","wellness","healthy habits","daily routine",
+    "fitness","nutrition","sleep","hydration","posture","stress relief","india"
+]
+SEO_HASHTAGS = ["#Shorts", "#HealthTips", "#Wellness", "#HealthyHabits"]
+
+def _normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def _strip_emojis(s: str) -> str:
+    # Remove non-ASCII and common emoji ranges
+    if not s:
+        return s
+    return "".join(ch for ch in s if ord(ch) < 128)
+
+def _is_mostly_english(s: str, threshold=0.85) -> bool:
+    if not s:
+        return True
+    ascii_chars = sum(1 for ch in s if ord(ch) < 128)
+    return (ascii_chars / max(1, len(s))) >= threshold
+
+def _title_case_light(s: str) -> str:
+    # Title case but preserve ALL CAPS tokens (acronyms); avoid over-modifying
+    words = s.split()
+    out = []
+    for w in words:
+        if len(w) >= 2 and w.isupper():
+            out.append(w)
+        else:
+            out.append(w.capitalize())
+    return " ".join(out)
+
+def _ensure_hashtag_shorts_at_end(title: str) -> str:
+    if "#Shorts" not in title:
+        # Prefer adding at end; ensure no trailing punctuation issues
+        title = title.rstrip(" .!?,;:") + " #Shorts"
+    return title
+
+def build_seo_title(topic: str, raw_title: str) -> str:
+    base = _normalize_ws(raw_title or "")
+    if not base:
+        base = _normalize_ws(topic or "Wellness Tips")
+    base = _strip_emojis(base)
+    # Ensure English-like output
+    if not _is_mostly_english(base):
+        base = _strip_emojis(base)
+
+    # Put topic near the front if not already present (case-insensitive)
+    if topic and topic.lower() not in base.lower():
+        base = f"{topic}: {base}"
+
+    # Light title-case, then ensure #Shorts
+    base = _title_case_light(base)
+    base = _ensure_hashtag_shorts_at_end(base)
+
+    # Keep within 90 chars (hard limit in our prompt; YouTube allows more but we stick to target)
+    if len(base) > 90:
+        # Try to retain "#Shorts"
+        if "#Shorts" in base:
+            keep = 90 - len(" #Shorts")
+            base = base[:max(0, keep)].rstrip() + " #Shorts"
+        else:
+            base = base[:90].rstrip()
+    return base
+
+def _ensure_disclaimer_once(desc: str) -> str:
+    # Normalize and ensure one occurrence of disclaimer
+    disclaimer_variants = [
+        "Educational only, not medical advice.",
+        "Educational purposes only, not medical advice.",
+        "Educational purpose only, not medical advice.",
+    ]
+    norm = desc
+    if not any(v.lower() in norm.lower() for v in disclaimer_variants):
+        if norm and not norm.endswith("\n"):
+            norm += "\n"
+        norm += "Educational only, not medical advice."
+    # Prevent duplicates of common variants
+    for v in disclaimer_variants[1:]:
+        norm = re.sub(re.escape(v), "Educational only, not medical advice.", norm, flags=re.I)
+    return norm
+
+def _merge_hashtags(desc: str, extra_hashtags=None) -> str:
+    extra_hashtags = extra_hashtags or []
+    existing = set(m.group(0) for m in re.finditer(r"#\w[\w-]*", desc or ""))
+    ordered = []
+    for h in SEO_HASHTAGS + list(extra_hashtags):
+        if h not in existing:
+            ordered.append(h)
+    if ordered:
+        if desc and not desc.endswith("\n"):
+            desc += "\n"
+        desc += " ".join(ordered)
+    return desc
+
+def build_seo_description(topic: str, raw_desc: str) -> str:
+    desc = _normalize_ws(raw_desc or "")
+    desc = _strip_emojis(desc)
+    # If description is too short or missing, create a minimal SEO stub
+    if len(desc) < 40:
+        main_kw = _normalize_ws(topic or "Healthy habits")
+        desc = f"{main_kw} made simple. Quick, science-informed tips to help you build daily wellness habits."
+
+    # Ensure English-like output
+    if not _is_mostly_english(desc):
+        desc = _strip_emojis(desc)
+
+    # Front-load keywords: ensure the topic appears early
+    if topic and topic.lower() not in desc[:150].lower():
+        desc = f"{topic} — {desc}"
+
+    # Ensure disclaimer once
+    desc = _ensure_disclaimer_once(desc)
+
+    # CTA (avoid duplication)
+    if "Like & subscribe" not in desc and "Like and subscribe" not in desc:
+        if desc and not desc.endswith("\n"):
+            desc += "\n"
+        desc += "Like & subscribe for daily wellness tips."
+
+    # Add SEO hashtags (avoid duplicates)
+    desc = _merge_hashtags(desc)
+
+    # Keep reasonable length; YouTube supports long, but we keep concise
+    if len(desc) > 900:
+        desc = desc[:900].rstrip()
+    return desc
+
+def _split_tags(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        cand = raw
+    else:
+        cand = [t for t in str(raw).split(",")]
+    out = []
+    for t in cand:
+        t = _normalize_ws(t)
+        t = t.lstrip("#")  # tags should not include '#'
+        t = _strip_emojis(t)
+        if not t:
+            continue
+        out.append(t)
+    return out
+
+def _uniquify(seq, key=lambda x: x.lower().strip()):
+    seen = set()
+    out = []
+    for item in seq:
+        k = key(item)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(item)
+    return out
+
+def build_seo_tags(topic: str, raw_tags) -> str:
+    tags = _split_tags(raw_tags)
+
+    # Inject topic keywords
+    topic_kw = []
+    if topic:
+        topic_kw.append(topic)
+        # Add key tokens (short phrases only)
+        toks = [w for w in re.split(r"[\W_]+", topic) if w and len(w) > 2]
+        for w in toks[:3]:
+            if w.lower() not in [t.lower() for t in topic_kw]:
+                topic_kw.append(w)
+
+    # Combine, dedupe, English-only leaning
+    combined = topic_kw + tags + SEO_DEFAULT_TAGS
+    combined = [t for t in combined if _is_mostly_english(t)]
+    combined = _uniquify([t.lower() for t in combined])  # normalize to lowercase for tags
+
+    # Keep 6–12 tags
+    if len(combined) < 6:
+        combined += [t for t in SAFE_TAGS if t not in combined]
+    combined = combined[:12]
+    return ",".join(combined)
+
+def enforce_english_and_seo(topic: str, fields: dict) -> dict:
+    # fields expected to include: title, description, tags
+    title = build_seo_title(topic, fields.get("title") or "")
+    description = build_seo_description(topic, fields.get("description") or "")
+    tags_csv = build_seo_tags(topic, fields.get("tags", ""))
+
+    return {"title": title, "description": description, "tags": tags_csv}
 
 def is_authorized_commenter(event):
     assoc = (event.get("comment", {}).get("author_association") or "").upper()
@@ -199,12 +390,18 @@ Rules:
 - No disease claims, diagnoses, dosages, or supplement promises. Avoid COVID/vaccines.
 - If the query is unsafe/specific (e.g., drugs/diseases), pivot to a safe, related habit.
 - Style: energetic, plain language, second-person; target {word_hint} words so the final video is 50–58 seconds.
+- Output must be in clear English only (no emojis, no non-English text).
 
-Output pure JSON with:
+SEO requirements (English only):
+- Title: keyword-first, Title Case, <=90 chars, include #Shorts once, no emojis.
+- Description: 2–4 sentences. Put the main keyword in the first 150 characters. Add a simple CTA and keep it human. Include exactly one disclaimer (“Educational only, not medical advice.”). Include one credible source (WHO/CDC/NIH/NHS) if relevant.
+- Tags: 6–12 short, comma-separated English keywords (no hashtags, no emojis). Include the main topic and a few general wellness terms.
+
+Return pure JSON with keys:
 - voiceover: string
-- title: catchy, <=90 chars, include #Shorts
-- description: 2–3 sentences + “Educational only, not medical advice.” + 1 credible source (WHO/CDC/NIH/NHS)
-- tags: 6–12 comma-separated general tags
+- title: string
+- description: string
+- tags: array of strings OR comma-separated string
 """
     models_to_try = build_model_list()
     last_err = None
@@ -218,8 +415,9 @@ Output pure JSON with:
             block = extract_json_block(raw) or raw
             try:
                 data = json.loads(block)
+                # Normalize tags to CSV string here for consistency
                 if isinstance(data.get("tags"), list):
-                    data["tags"] = ",".join(data["tags"][:12])
+                    data["tags"] = ",".join([str(x) for x in data["tags"]][:12])
                 return data
             except Exception as e:
                 last_err = RuntimeError(f"Failed to parse LLM JSON from '{model}': {e}\nRaw: {raw[:500]}")
@@ -243,7 +441,7 @@ def ensure_voice_in_range(voice_path, min_sec=TARGET_LOW, max_sec=PREVIEW_MAX):
     if min_sec <= dur <= max_sec:
         return voice_path, dur
     target = max(min_sec, min(max_sec, dur))
-    factor = max(0.5, min(2.0, (target / dur) if dur else 1.0))
+    factor = max(0.5, min(2.0), (target / dur) if dur else 1.0)
     out = "voice_adj.mp3"
     subprocess.run(["ffmpeg","-y","-i",voice_path,"-filter:a",f"atempo={factor}","-vn",out], check=True)
     a2 = AudioFileClip(out); d2 = a2.duration; a2.close()
@@ -585,7 +783,7 @@ def upload_preview_fallback(video_path):
     try:
         with open(path_small, "rb") as f:
             r = requests.post("https://0x0.st", files={"file": (os.path.basename(path_small), f, "video/mp4")}, timeout=180)
-        if r.status_code == 200 and r.text.strip().startswith("http"):
+        if r.status_code == 200 and r.text.strip().startsWith("http"):
             return r.text.strip(), "0x0.st"
     except Exception:
         pass
@@ -715,7 +913,15 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
     for attempt in range(1, max_attempts+1):
         s = llm_script(topic, word_hint=word_hint)
         last_fields = s
-        text = s["voiceover"].strip()
+
+        # Ensure English + SEO for metadata (title/description/tags) before rendering/upload
+        seo_meta = enforce_english_and_seo(topic, {
+            "title": s.get("title",""),
+            "description": s.get("description",""),
+            "tags": s.get("tags","")
+        })
+
+        text = (s["voiceover"] or "").strip()
         if "thank you for watching" not in text.lower():
             if not text.endswith((".", "!", "?")): text += "."
             text += " Thank you for watching."
@@ -729,16 +935,15 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
         if sc < best_score:
             best_score = sc; best_dur = round(dur,2); best_attempt = attempt
             best_path = "best.mp4"; shutil.copyfile(final, best_path)
-        if TARGET_LOW <= dur < TARGET_HIGH:
-            desc = f"""{s['description']}
 
-Educational only, not medical advice. Consult a qualified professional for personal guidance.
-#Shorts #health #wellness"""
-            vid_id, link, info = upload_preview_youtube(final, s["title"], desc, s.get("tags",""))
+        if TARGET_LOW <= dur < TARGET_HIGH:
+            # Use SEO-optimized description directly (it already includes disclaimer + hashtags, deduped)
+            desc = seo_meta["description"]
+            vid_id, link, info = upload_preview_youtube(final, seo_meta["title"], desc, seo_meta["tags"])
             if not link:
                 raise RuntimeError(f"Preview upload failed and fallback unavailable: {info.get('error','unknown error')}")
             meta = {
-                "topic": topic, "title": s["title"], "description": desc, "tags": s.get("tags",""),
+                "topic": topic, "title": seo_meta["title"], "description": desc, "tags": seo_meta["tags"],
                 "preview_video_id": vid_id, "preview_link": link,
                 "yt_upload_blocked": bool(info.get("yt_upload_blocked")), "fallback_host": info.get("fallback"),
                 "slot": slot, "created_at": datetime.utcnow().isoformat(),
@@ -751,18 +956,17 @@ Educational only, not medical advice. Consult a qualified professional for perso
     # Best candidate outside target
     if best_path and os.path.exists(best_path):
         s = last_fields or {}
-        title = s.get("title","Preview #Shorts")
-        tags = s.get("tags","")
-        desc_body = s.get("description","Preview video.")
-        desc = f"""{desc_body}
-
-Educational only, not medical advice. Consult a qualified professional for personal guidance.
-#Shorts #health #wellness"""
-        vid_id, link, info = upload_preview_youtube(best_path, title, desc, tags)
+        # Ensure SEO again in fallback path
+        seo_meta = enforce_english_and_seo(topic, {
+            "title": s.get("title","Preview #Shorts"),
+            "description": s.get("description","Preview video."),
+            "tags": s.get("tags","")
+        })
+        vid_id, link, info = upload_preview_youtube(best_path, seo_meta["title"], seo_meta["description"], seo_meta["tags"])
         if not link:
             raise RuntimeError(f"Preview upload failed and fallback unavailable: {info.get('error','unknown error')}")
         meta = {
-            "topic": topic, "title": title, "description": desc, "tags": tags,
+            "topic": topic, "title": seo_meta["title"], "description": seo_meta["description"], "tags": seo_meta["tags"],
             "preview_video_id": vid_id, "preview_link": link,
             "yt_upload_blocked": bool(info.get("yt_upload_blocked")), "fallback_host": info.get("fallback"),
             "slot": slot, "created_at": datetime.utcnow().isoformat(),
