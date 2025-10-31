@@ -1,4 +1,4 @@
-import os, re, json, tempfile, subprocess, requests, traceback, sys, shutil, unicodedata
+import os, re, json, tempfile, subprocess, requests, traceback, sys, shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from moviepy.editor import (
@@ -55,23 +55,30 @@ SEO_DEFAULT_TAGS = [
 ]
 SEO_HASHTAGS = ["#Shorts", "#HealthTips", "#Wellness", "#HealthyHabits"]
 
+def _to_str(s):
+    return "" if s is None else str(s)
+
 def _normalize_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+    s = _to_str(s).replace("\r", "")
+    # collapse only spaces/tabs but preserve newlines
+    s = re.sub(r"[ \t\f\v]+", " ", s)
+    # trim lines and overall
+    s = "\n".join(line.strip() for line in s.split("\n")).strip()
+    return s
 
 def _strip_emojis(s: str) -> str:
-    # Remove non-ASCII and common emoji ranges
-    if not s:
-        return s
+    s = _to_str(s)
     return "".join(ch for ch in s if ord(ch) < 128)
 
 def _is_mostly_english(s: str, threshold=0.85) -> bool:
+    s = _to_str(s)
     if not s:
         return True
     ascii_chars = sum(1 for ch in s if ord(ch) < 128)
     return (ascii_chars / max(1, len(s))) >= threshold
 
 def _title_case_light(s: str) -> str:
-    # Title case but preserve ALL CAPS tokens (acronyms); avoid over-modifying
+    s = _to_str(s)
     words = s.split()
     out = []
     for w in words:
@@ -82,8 +89,8 @@ def _title_case_light(s: str) -> str:
     return " ".join(out)
 
 def _ensure_hashtag_shorts_at_end(title: str) -> str:
+    title = _to_str(title)
     if "#Shorts" not in title:
-        # Prefer adding at end; ensure no trailing punctuation issues
         title = title.rstrip(" .!?,;:") + " #Shorts"
     return title
 
@@ -92,21 +99,13 @@ def build_seo_title(topic: str, raw_title: str) -> str:
     if not base:
         base = _normalize_ws(topic or "Wellness Tips")
     base = _strip_emojis(base)
-    # Ensure English-like output
     if not _is_mostly_english(base):
         base = _strip_emojis(base)
-
-    # Put topic near the front if not already present (case-insensitive)
     if topic and topic.lower() not in base.lower():
-        base = f"{topic}: {base}"
-
-    # Light title-case, then ensure #Shorts
+        base = f"{_to_str(topic)}: {base}"
     base = _title_case_light(base)
     base = _ensure_hashtag_shorts_at_end(base)
-
-    # Keep within 90 chars (hard limit in our prompt; YouTube allows more but we stick to target)
     if len(base) > 90:
-        # Try to retain "#Shorts"
         if "#Shorts" in base:
             keep = 90 - len(" #Shorts")
             base = base[:max(0, keep)].rstrip() + " #Shorts"
@@ -115,23 +114,22 @@ def build_seo_title(topic: str, raw_title: str) -> str:
     return base
 
 def _ensure_disclaimer_once(desc: str) -> str:
-    # Normalize and ensure one occurrence of disclaimer
-    disclaimer_variants = [
-        "Educational only, not medical advice.",
+    desc = _to_str(desc)
+    disclaimer = "Educational only, not medical advice."
+    variants = [
         "Educational purposes only, not medical advice.",
         "Educational purpose only, not medical advice.",
     ]
-    norm = desc
-    if not any(v.lower() in norm.lower() for v in disclaimer_variants):
-        if norm and not norm.endswith("\n"):
-            norm += "\n"
-        norm += "Educational only, not medical advice."
-    # Prevent duplicates of common variants
-    for v in disclaimer_variants[1:]:
-        norm = re.sub(re.escape(v), "Educational only, not medical advice.", norm, flags=re.I)
-    return norm
+    if disclaimer.lower() not in desc.lower():
+        if desc and not desc.endswith("\n"):
+            desc += "\n"
+        desc += disclaimer
+    for v in variants:
+        desc = re.sub(re.escape(v), disclaimer, desc, flags=re.I)
+    return desc
 
 def _merge_hashtags(desc: str, extra_hashtags=None) -> str:
+    desc = _to_str(desc)
     extra_hashtags = extra_hashtags or []
     existing = set(m.group(0) for m in re.finditer(r"#\w[\w-]*", desc or ""))
     ordered = []
@@ -147,32 +145,19 @@ def _merge_hashtags(desc: str, extra_hashtags=None) -> str:
 def build_seo_description(topic: str, raw_desc: str) -> str:
     desc = _normalize_ws(raw_desc or "")
     desc = _strip_emojis(desc)
-    # If description is too short or missing, create a minimal SEO stub
     if len(desc) < 40:
         main_kw = _normalize_ws(topic or "Healthy habits")
         desc = f"{main_kw} made simple. Quick, science-informed tips to help you build daily wellness habits."
-
-    # Ensure English-like output
     if not _is_mostly_english(desc):
         desc = _strip_emojis(desc)
-
-    # Front-load keywords: ensure the topic appears early
     if topic and topic.lower() not in desc[:150].lower():
-        desc = f"{topic} — {desc}"
-
-    # Ensure disclaimer once
+        desc = f"{_to_str(topic)} — {desc}"
     desc = _ensure_disclaimer_once(desc)
-
-    # CTA (avoid duplication)
     if "Like & subscribe" not in desc and "Like and subscribe" not in desc:
         if desc and not desc.endswith("\n"):
             desc += "\n"
         desc += "Like & subscribe for daily wellness tips."
-
-    # Add SEO hashtags (avoid duplicates)
     desc = _merge_hashtags(desc)
-
-    # Keep reasonable length; YouTube supports long, but we keep concise
     if len(desc) > 900:
         desc = desc[:900].rstrip()
     return desc
@@ -183,18 +168,17 @@ def _split_tags(raw):
     if isinstance(raw, list):
         cand = raw
     else:
-        cand = [t for t in str(raw).split(",")]
+        cand = [t for t in _to_str(raw).split(",")]
     out = []
     for t in cand:
         t = _normalize_ws(t)
-        t = t.lstrip("#")  # tags should not include '#'
-        t = _strip_emojis(t)
+        t = _strip_emojis(t.lstrip("#"))
         if not t:
             continue
         out.append(t)
     return out
 
-def _uniquify(seq, key=lambda x: x.lower().strip()):
+def _uniquify(seq, key=lambda x: _to_str(x).lower().strip()):
     seen = set()
     out = []
     for item in seq:
@@ -207,34 +191,26 @@ def _uniquify(seq, key=lambda x: x.lower().strip()):
 
 def build_seo_tags(topic: str, raw_tags) -> str:
     tags = _split_tags(raw_tags)
-
-    # Inject topic keywords
     topic_kw = []
     if topic:
-        topic_kw.append(topic)
-        # Add key tokens (short phrases only)
-        toks = [w for w in re.split(r"[\W_]+", topic) if w and len(w) > 2]
+        topic_kw.append(_to_str(topic))
+        toks = [w for w in re.split(r"[\W_]+", _to_str(topic)) if w and len(w) > 2]
         for w in toks[:3]:
             if w.lower() not in [t.lower() for t in topic_kw]:
                 topic_kw.append(w)
-
-    # Combine, dedupe, English-only leaning
     combined = topic_kw + tags + SEO_DEFAULT_TAGS
+    combined = [ _to_str(t) for t in combined ]
     combined = [t for t in combined if _is_mostly_english(t)]
-    combined = _uniquify([t.lower() for t in combined])  # normalize to lowercase for tags
-
-    # Keep 6–12 tags
+    combined = _uniquify([t.lower() for t in combined])
     if len(combined) < 6:
         combined += [t for t in SAFE_TAGS if t not in combined]
     combined = combined[:12]
     return ",".join(combined)
 
 def enforce_english_and_seo(topic: str, fields: dict) -> dict:
-    # fields expected to include: title, description, tags
-    title = build_seo_title(topic, fields.get("title") or "")
-    description = build_seo_description(topic, fields.get("description") or "")
-    tags_csv = build_seo_tags(topic, fields.get("tags", ""))
-
+    title = build_seo_title(_to_str(topic), fields.get("title") or "")
+    description = build_seo_description(_to_str(topic), fields.get("description") or "")
+    tags_csv = build_seo_tags(_to_str(topic), fields.get("tags", ""))
     return {"title": title, "description": description, "tags": tags_csv}
 
 def is_authorized_commenter(event):
@@ -413,7 +389,6 @@ Return pure JSON with keys:
             block = extract_json_block(raw) or raw
             try:
                 data = json.loads(block)
-                # Normalize tags to CSV string here for consistency
                 if isinstance(data.get("tags"), list):
                     data["tags"] = ",".join([str(x) for x in data["tags"]][:12])
                 return data
@@ -439,7 +414,8 @@ def ensure_voice_in_range(voice_path, min_sec=TARGET_LOW, max_sec=PREVIEW_MAX):
     if min_sec <= dur <= max_sec:
         return voice_path, dur
     target = max(min_sec, min(max_sec, dur))
-    factor = max(0.5, min(2.0), (target / dur) if dur else 1.0)
+    # Correct factor clamp (0.5–2.0)
+    factor = max(0.5, min(2.0, (target / dur) if dur else 1.0))
     out = "voice_adj.mp3"
     subprocess.run(["ffmpeg","-y","-i",voice_path,"-filter:a",f"atempo={factor}","-vn",out], check=True)
     a2 = AudioFileClip(out); d2 = a2.duration; a2.close()
@@ -517,15 +493,14 @@ def transcribe_to_srt_faster_whisper(audio_path, srt_path, lang="en",
 
 def _ffmpeg_escape(s):
     return (
-        s.replace("\\", "\\\\")
+        _to_str(s).replace("\\", "\\\\")
          .replace(":", "\\:")
          .replace(",", "\\,")
          .replace("'", "\\'")
     )
 
 def burn_captions(in_mp4, srt_path, out_mp4):
-    # Bottom-center (Alignment=2). Small (12pt), yellow with black stroke, no filled box
-    # ASS color: &HAABBGGRR&; yellow = &H0000FFFF&, black = &H00000000&
+    # Bottom-center (Alignment=2). Small (12pt), yellow with black stroke
     style = (
         "Fontname=DejaVu Sans,Fontsize=12,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
@@ -549,10 +524,9 @@ def smart_cover_crop(clip, target_w=1080, target_h=1920):
     """Scale-to-cover (no stretching), then crop to 1080x1920 centered on detected face (if any), else center."""
     s_cover = max(target_w / clip.w, target_h / clip.h)
     resized = clip.resize(s_cover)
-    # Choose a mid-frame for face detection
     try:
         t = 0.5 * max(0.0, resized.duration)
-        frame = resized.get_frame(min(max(0.0, t), max(0.0, resized.duration - 0.05)))  # RGB
+        frame = resized.get_frame(min(max(0.0, t), max(0.0, resized.duration - 0.05)))
         if cv2 is not None:
             gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             cascade = _get_face_cascade()
@@ -574,7 +548,6 @@ def smart_cover_crop(clip, target_w=1080, target_h=1920):
             cx, cy = resized.w/2, resized.h/2
     except Exception:
         cx, cy = resized.w/2, resized.h/2
-    # Clamp crop center so window remains inside bounds
     half_w = target_w/2; half_h = target_h/2
     cx = max(half_w, min(resized.w - half_w, cx))
     cy = max(half_h, min(resized.h - half_h, cy))
@@ -781,7 +754,7 @@ def upload_preview_fallback(video_path):
     try:
         with open(path_small, "rb") as f:
             r = requests.post("https://0x0.st", files={"file": (os.path.basename(path_small), f, "video/mp4")}, timeout=180)
-        if r.status_code == 200 and r.text.strip().startsWith("http"):
+        if r.status_code == 200 and r.text.strip().startswith("http"):
             return r.text.strip(), "0x0.st"
     except Exception:
         pass
@@ -912,7 +885,7 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
         s = llm_script(topic, word_hint=word_hint)
         last_fields = s
 
-        # Ensure English + SEO for metadata (title/description/tags) before rendering/upload
+        # Ensure English + SEO for metadata (title/description/tags)
         seo_meta = enforce_english_and_seo(topic, {
             "title": s.get("title",""),
             "description": s.get("description",""),
@@ -935,7 +908,6 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
             best_path = "best.mp4"; shutil.copyfile(final, best_path)
 
         if TARGET_LOW <= dur < TARGET_HIGH:
-            # Use SEO-optimized description directly (it already includes disclaimer + hashtags, deduped)
             desc = seo_meta["description"]
             vid_id, link, info = upload_preview_youtube(final, seo_meta["title"], desc, seo_meta["tags"])
             if not link:
@@ -954,7 +926,6 @@ def build_preview_until_under_58(topic, slot, issue_body, max_attempts=3):
     # Best candidate outside target
     if best_path and os.path.exists(best_path):
         s = last_fields or {}
-        # Ensure SEO again in fallback path
         seo_meta = enforce_english_and_seo(topic, {
             "title": s.get("title","Preview #Shorts"),
             "description": s.get("description","Preview video."),
