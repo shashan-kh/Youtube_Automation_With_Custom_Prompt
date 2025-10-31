@@ -1,5 +1,3 @@
---- handle_comment.py ---
-
 import os, re, json, tempfile, subprocess, requests, traceback, sys, shutil, unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
