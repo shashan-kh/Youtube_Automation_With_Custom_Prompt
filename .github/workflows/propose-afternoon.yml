@@ -33,7 +33,7 @@ jobs:
           DEBUG: "1"
           # Use the built-in token; more reliable than secrets.GITHUB_TOKEN
           GITHUB_TOKEN: ${{ github.token }}
-          # Needed to call YouTube Data API for Trending
+          # YouTube OAuth for Trending fetch
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
