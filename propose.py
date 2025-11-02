@@ -1,12 +1,16 @@
 import os, re, json, requests, sys
 from datetime import datetime, timedelta, timezone
-from pytrends.request import TrendReq
 
 REGION = os.getenv("REGION", "IN")
 SLOT = os.getenv("SLOT", "morning")  # morning or afternoon
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")  # owner/repo
 DEBUG = os.getenv("DEBUG", "0") == "1"
+
+# YouTube OAuth secrets for Data API
+YT_CLIENT_ID = os.getenv("YT_CLIENT_ID")
+YT_CLIENT_SECRET = os.getenv("YT_CLIENT_SECRET")
+YT_REFRESH_TOKEN = os.getenv("YT_REFRESH_TOKEN")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 MORNING_IST = (9, 0)
@@ -100,7 +104,6 @@ def jaccard(a: str, b: str) -> float:
 
 def load_recent_approved_topics(owner, repo, max_issues=200, min_sim_threshold=0.8):
     approved = set()
-    titles_seen = set()
     page = 1
     fetched = 0
     while fetched < max_issues:
@@ -134,13 +137,7 @@ def load_recent_approved_topics(owner, repo, max_issues=200, min_sim_threshold=0
                         topic = str(md.get("topic")).strip()
                 except Exception:
                     pass
-            # If not found, fallback to title parsing
-            if not topic:
-                title = it.get("title","")
-                titles_seen.add(title)
             if topic:
-                norm = normalize_topic(topic)
-                # Avoid almost duplicates by Jaccard similarity
                 duplicate = any(jaccard(topic, t2) >= min_sim_threshold for t2 in approved)
                 if not duplicate:
                     approved.add(topic)
@@ -151,136 +148,149 @@ def load_recent_approved_topics(owner, repo, max_issues=200, min_sim_threshold=0
     log("Previously approved topics (normalized):", [normalize_topic(t) for t in list(approved)[:10]])
     return approved
 
-# ---------- Helper: ensure we always have at least 3 safe topics ----------
-FALLBACK_POOL = [
-    "Desk posture checklist",
-    "Healthy snack swaps at work",
-    "Walking breaks every hour",
-    "Quick mobility routine for hips",
-    "Breathing reset for stress",
-    "Screen-time eye care tips",
-    "Core stability basics",
-    "Neck and shoulder stretch break",
-    "Morning sunlight routine",
-    "Water intake habit tracker",
-    "Simple bedtime wind-down",
-    "Gentle back mobility flow",
-]
-
-def pad_topics_to_three(topics, exclude_topics):
-    out = [t for t in topics if isinstance(t, str) and t.strip()]
-    if len(out) >= 3:
-        return out[:3]
-
-    # Try to add from pool avoiding near-duplicates with both out and previously approved
-    def can_add(cand, thr=0.8):
-        if any(jaccard(cand, t) >= thr for t in out):
-            return False
-        if any(jaccard(cand, ex) >= thr for ex in exclude_topics):
-            return False
-        return True
-
-    # Two passes with decreasing strictness
-    for thr in (0.8, 0.7):
-        for cand in FALLBACK_POOL:
-            if len(out) >= 3:
-                break
-            if can_add(cand, thr=thr):
-                out.append(cand)
-        if len(out) >= 3:
-            break
-
-    # Absolute fallback: generic uniques
-    i = 1
-    while len(out) < 3:
-        cand = f"Healthy daily habit idea {i}"
-        if can_add(cand, thr=0.5):
-            out.append(cand)
-        i += 1
-    return out[:3]
-
-# ---------- Trending fetch ----------
-def fetch_trending_candidates(region="IN", max_items=20, exclude_topics=None):
-    exclude_topics = exclude_topics or set()
-    exclude_norms = {normalize_topic(x) for x in exclude_topics}
-    pt = TrendReq(hl="en-IN", tz=330)
-    seeds = [
-        "sleep","hydration","walking","steps","posture","stretching","mobility","stress","breathing",
-        "morning sunlight","protein","fiber","yoga","desk ergonomics","screen time","healthy snacks",
-        "core strength","back pain relief","neck pain","mindfulness","step count","water intake","bedtime routine"
-    ]
-    banned = re.compile(r"(covid|vaccine|cancer|diabetes|ozempic|semaglutide|hiv|flu|tumor|depress|adhd|autism|arthritis|ibd|crohn|pcos|pregnan|detox|steroid|pill|drug|supplement|dosage|cure|therapy|weight loss drugs?)", re.I)
-    def is_ok(s):
-        return bool(s) and not banned.search(s) and len(normalize_topic(s)) >= 6
-    found = []
-
-    # 1) realtime_trending_searches
+# ---------- YouTube client (OAuth, same secrets you already use for upload) ----------
+def ensure_google_client():
     try:
-        df = pt.realtime_trending_searches(pn=region)
-        if df is not None and "title" in df.columns:
-            for t in df["title"].tolist():
-                if isinstance(t, str) and is_ok(t):
-                    found.append(t)
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+        return Credentials, build
+    except Exception:
+        # Best-effort install in CI
+        import subprocess, sys as _sys
+        subprocess.run([_sys.executable, "-m", "pip", "install", "--upgrade", "-q",
+                        "google-api-python-client", "google-auth", "google-auth-oauthlib", "packaging>=23.1"], check=True)
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+        return Credentials, build
+
+def yt_client():
+    for v in ["YT_CLIENT_ID","YT_CLIENT_SECRET","YT_REFRESH_TOKEN"]:
+        if not os.getenv(v):
+            raise RuntimeError(f"Missing {v} secret")
+    Credentials, build = ensure_google_client()
+    creds = Credentials(
+        token=None, refresh_token=os.getenv("YT_REFRESH_TOKEN"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=os.getenv("YT_CLIENT_ID"), client_secret=os.getenv("YT_CLIENT_SECRET"),
+        scopes=["https://www.googleapis.com/auth/youtube"]  # full access includes read
+    )
+    return build("youtube", "v3", credentials=creds)
+
+# ---------- English + health filtering ----------
+HEALTH_KEYWORDS = [
+    "health","healthy","fitness","workout","exercise","gym","yoga","meditation",
+    "posture","sleep","insomnia","nutrition","diet","protein","hydration","water",
+    "stress","mindfulness","stretch","mobility","steps","walking","running","cardio",
+    "strength","back pain","neck pain","waist","core","ergonomics","breathing","sunlight"
+]
+BANNED = re.compile(
+    r"(covid|vaccine|cancer|diabetes|ozempic|semaglutide|hiv|flu|tumor|depress|adhd|autism|arthritis|ibd|crohn|pcos|pregnan|detox|steroid|pill|drug|supplement|dosage|cure|therapy|weight\s*loss\s*drugs?)",
+    re.I
+)
+
+def is_mostly_english(s: str, threshold=0.85) -> bool:
+    if not s:
+        return False
+    ascii_chars = sum(1 for ch in s if ord(ch) < 128)
+    return (ascii_chars / max(1, len(s))) >= threshold
+
+def clean_title_to_topic(title: str) -> str:
+    s = (title or "").strip()
+    # Remove #Shorts and brackets
+    s = re.sub(r"(?i)#?shorts?", "", s)
+    s = re.sub(r"\[[^\]]+\]|\([^)]+\)", "", s)
+    # Split on pipes/dashes to drop channel-like suffixes
+    parts = re.split(r"\s+[|\-–—]\s+", s)
+    s = parts[0].strip() if parts else s
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    # Capitalize first letter (avoid forced Title Case to keep meaning)
+    if s:
+        s = s[0].upper() + s[1:]
+    return s
+
+def text_has_health_signal(title: str, desc: str, tags: list) -> bool:
+    text = " ".join([title or "", desc or "", " ".join(tags or [])]).lower()
+    if BANNED.search(text):
+        return False
+    return any(kw in text for kw in HEALTH_KEYWORDS)
+
+# ---------- Fetch YouTube trending health topics (strictly English) ----------
+def fetch_youtube_trending_health_topics(region="IN", max_items=12, exclude_topics=None):
+    exclude_topics = exclude_topics or set()
+    try:
+        yt = yt_client()
     except Exception as e:
-        log("pytrends realtime_trending_searches error:", e)
+        log("YouTube client init failed:", e)
+        return []
 
-    # 2) related queries for seeds (rising first for freshness)
-    for s in seeds:
+    all_items = []
+    try:
+        req = yt.videos().list(part="snippet", chart="mostPopular", regionCode=region, maxResults=50)
+        while req is not None and len(all_items) < 150:
+            resp = req.execute()
+            all_items.extend(resp.get("items", []))
+            token = resp.get("nextPageToken")
+            if token:
+                req = yt.videos().list(part="snippet", chart="mostPopular", regionCode=region, maxResults=50, pageToken=token)
+            else:
+                break
+    except Exception as e:
+        log("YouTube trending fetch error:", e)
+        return []
+
+    # Sort by publishedAt desc for freshness
+    def published_at(it):
         try:
-            pt.build_payload([s], timeframe="now 1-d", geo=region)
-            rq = pt.related_queries() or {}
-            rq_s = rq.get(s, {})
-            for k in ("rising","top"):
-                df2 = rq_s.get(k)
-                if df2 is not None and "query" in df2.columns:
-                    for q in df2.head(15)["query"].tolist():
-                        if isinstance(q, str) and is_ok(q):
-                            found.append(q)
-        except Exception as e:
-            log(f"pytrends related_queries error for seed '{s}':", e)
-            continue
+            return datetime.fromisoformat(it["snippet"]["publishedAt"].replace("Z","+00:00"))
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
 
-    # Deduplicate while excluding previously approved
-    out, seen = [], set()
-    for q in found:
-        nq = normalize_topic(q)
-        if nq in seen:
+    all_items.sort(key=published_at, reverse=True)
+
+    topics, seen = [], set()
+    for it in all_items:
+        sn = it.get("snippet", {})
+        title = sn.get("title", "") or ""
+        desc = sn.get("description", "") or ""
+        tags = sn.get("tags", []) if isinstance(sn.get("tags", []), list) else []
+        # English only and health signal
+        if not is_mostly_english(title + " " + desc):
             continue
-        # Skip if similar to any previously approved topic
-        too_close = any(jaccard(q, ex) >= 0.8 for ex in exclude_topics)
-        if too_close:
+        if not text_has_health_signal(title, desc, tags):
             continue
-        seen.add(nq)
-        # Title-case lightly (but keep acronyms)
-        nice = q.strip()
-        nice = nice[0].upper() + nice[1:] if nice else q
-        out.append(nice)
-        if len(out) >= max_items:
+        topic = clean_title_to_topic(title)
+        if not topic or len(normalize_topic(topic)) < 4:
+            continue
+        # Dedup within this batch
+        norm = normalize_topic(topic)
+        if norm in seen:
+            continue
+        # Exclude if too similar to previously approved topics
+        if any(jaccard(topic, ex) >= 0.8 for ex in exclude_topics):
+            continue
+        seen.add(norm)
+        topics.append(topic)
+        if len(topics) >= max_items:
             break
 
-    # Ensure at least some safe fallback topics that are not previously approved and not dupes
-    fallbacks = ["Morning hydration habit","3 simple posture fixes","Sleep wind-down routine","Take more walking breaks","Easy stretch flow"]
-    for f in fallbacks:
-        if len(out) >= max_items:
-            break
-        if all(jaccard(f, ex) < 0.8 for ex in exclude_topics) and all(jaccard(f, q) < 0.8 for q in out):
-            out.append(f)
+    log("Trending health topics (EN):", topics[:5])
+    return topics
 
-    final = out[:max_items]
-    log("Candidate topics (filtered, fresh):", final[:5])
-    return final
-
+# ---------- Issue creation ----------
 def create_topic_issue(owner, repo, topics, scheduled_ist):
     slot_label = f"slot:{SLOT}"
     ensure_labels(owner, repo, {
         "await-topic-approval": ("ededed", "Awaiting topic approval"),
         slot_label: ("bfd4f2" if SLOT == "morning" else "c2e0c6", f"Issue for {SLOT} slot")
     })
-    # Dynamically render as many as we have (always padded to 3 upstream)
-    numbered = "\n".join([f"{i}) {t}" for i, t in enumerate(topics[:3], 1)])
-    opts_str = "/".join(str(i) for i in range(1, min(3, len(topics)) + 1))
+
+    shown = topics[:3]  # show up to 3 options without padding
+    numbered = "\n".join([f"{i}) {t}" for i, t in enumerate(shown, 1)]) if shown else "(no eligible topics found)"
+    opts_str = "/".join(str(i) for i in range(1, len(shown) + 1)) if shown else "N/A"
+
     title = f"Topic approval for {SLOT} slot ({scheduled_ist.strftime('%Y-%m-%d')} {scheduled_ist.strftime('%H:%M')} IST)"
-    body = f"""Proposed fresh topics for tomorrow's {SLOT} slot (older approved topics excluded).
+    body = f"""Proposed latest YouTube trending health topics (strictly English, excluding previously approved).
 Scheduled publish (IST): {scheduled_ist.strftime('%Y-%m-%d %H:%M')}.
 
 Choose one:
@@ -295,7 +305,7 @@ Reply with:
 
 Metadata:
 ```json
-{json.dumps({"slot": SLOT, "scheduled_ist": scheduled_ist.strftime('%Y-%m-%d %H:%M'), "topics": topics[:3]}, indent=2)}
+{json.dumps({"slot": SLOT, "scheduled_ist": scheduled_ist.strftime('%Y-%m-%d %H:%M'), "topics": shown}, indent=2)}
 ```"""
     log("Creating issue:", title)
     gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues",
@@ -326,12 +336,18 @@ def main():
         log("Failed to load approved topics:", e)
         approved = set()
 
-    candidates = fetch_trending_candidates(REGION, max_items=12, exclude_topics=approved)
-    topics = pad_topics_to_three(candidates, approved)  # ensure 3 safe options
+    # Fetch strictly English YouTube trending health topics
+    topics_all = fetch_youtube_trending_health_topics(REGION, max_items=12, exclude_topics=approved)
+    topics = topics_all[:3]  # do not pad; only trending
+
+    if not topics:
+        print("No English YouTube trending health topics found right now. Skipping issue creation.")
+        return
+
     scheduled_ist = next_slot_ist()
     try:
         create_topic_issue(owner, repo, topics, scheduled_ist)
-        log("Using topics:", topics[:3])
+        log("Using topics:", topics)
         print("Created topic approval issue for", SLOT)
     except requests.HTTPError as e:
         print("Failed to create issue:", e.response.text if e.response is not None else str(e))
