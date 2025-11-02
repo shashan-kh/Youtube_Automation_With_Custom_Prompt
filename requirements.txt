@@ -20,6 +20,7 @@ google-auth-oauthlib
 
 # Trends
 pytrends
+langdetect>=1.0.9
 
 # Video (pin to avoid Pillow ANTIALIAS removal)
 moviepy==1.0.3
