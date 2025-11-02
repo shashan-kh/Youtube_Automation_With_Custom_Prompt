@@ -7,7 +7,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO = os.getenv("GITHUB_REPOSITORY")  # owner/repo
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-# YouTube OAuth secrets for Data API
+# YouTube OAuth (read-only for fetch)
 YT_CLIENT_ID = os.getenv("YT_CLIENT_ID")
 YT_CLIENT_SECRET = os.getenv("YT_CLIENT_SECRET")
 YT_REFRESH_TOKEN = os.getenv("YT_REFRESH_TOKEN")
@@ -176,23 +176,50 @@ def yt_client():
     )
     return build("youtube", "v3", credentials=creds)
 
-# ---------- English + health filtering ----------
+# ---------- Language + health filtering ----------
+# We do NOT treat the word "english" as a keyword. We detect English language from text.
+from langdetect import detect_langs, DetectorFactory
+from langdetect.lang_detect_exception import LangDetectException
+DetectorFactory.seed = 0  # deterministic
+
+EN_STOP = {"the","and","you","your","with","from","this","that","for","not","are","can","how","tips","health","sleep","water","posture","daily","habit","routine","simple","easy"}
+
 HEALTH_KEYWORDS = [
-    "health","healthy","fitness","workout","exercise","gym","yoga","meditation",
+    "health","healthy","wellness","fitness","workout","exercise","gym","yoga","meditation",
     "posture","sleep","insomnia","nutrition","diet","protein","hydration","water",
     "stress","mindfulness","stretch","mobility","steps","walking","running","cardio",
-    "strength","back pain","neck pain","core","ergonomics","breathing","sunlight","wellness"
+    "strength","back pain","neck pain","core","ergonomics","breathing","sunlight","recovery","flexibility"
 ]
 BANNED = re.compile(
     r"(covid|vaccine|cancer|diabetes|ozempic|semaglutide|hiv|flu|tumor|depress|adhd|autism|arthritis|ibd|crohn|pcos|pregnan|detox|steroid|pill|drug|supplement|dosage|cure|therapy|remedy|weight\s*loss\s*drugs?)",
     re.I
 )
 
-def is_mostly_english(s: str, threshold=0.85) -> bool:
+def is_english_text(text: str, prob_threshold=0.85, ascii_threshold=0.97, allow_short=False) -> bool:
+    s = (text or "").strip()
     if not s:
         return False
-    ascii_chars = sum(1 for ch in s if ord(ch) < 128)
-    return (ascii_chars / max(1, len(s))) >= threshold
+    # Remove URLs and extra noise
+    s = re.sub(r"https?://\S+|www\.\S+", " ", s)
+    # Try langdetect
+    try:
+        langs = detect_langs(s)
+        if langs:
+            top = max(langs, key=lambda x: x.prob)
+            if top.lang == "en" and top.prob >= prob_threshold:
+                return True
+    except LangDetectException:
+        pass
+    # Fallback heuristic for short/noisy text
+    letters = [ch for ch in s if ch.isalpha()]
+    if not letters:
+        return False
+    ascii_letters = sum(1 for ch in letters if ord(ch) < 128)
+    ascii_ratio = ascii_letters / max(1, len(letters))
+    has_en_stop = any((" " + w + " ") in (" " + s.lower() + " ") for w in EN_STOP)
+    if allow_short:
+        return ascii_ratio >= 0.98 or (ascii_ratio >= ascii_threshold and has_en_stop)
+    return (ascii_ratio >= ascii_threshold and has_en_stop)
 
 def text_has_health_signal(title: str, desc: str, tags: list) -> bool:
     blob = " ".join([title or "", desc or "", " ".join(tags or [])]).lower()
@@ -206,13 +233,11 @@ def clean_title_to_topic(title: str) -> str:
     s = re.sub(r"\[[^\]]+\]|\([^)]+\)", "", s)      # remove bracketed
     s = re.split(r"\s+[|\-–—]\s+", s)[0].strip()    # keep left-most main part
     s = re.sub(r"\s+", " ", s).strip(" -–—:|")      # tidy
-    # Keep natural casing but ensure first char uppercase
     if s:
         s = s[0].upper() + s[1:]
-    # Keep concise
     return s[:100].rstrip()
 
-# ---------- Fetch YouTube trending health topics (strictly English) ----------
+# ---------- Primary: YouTube Trending (strict EN + health) ----------
 def fetch_youtube_trending_health_topics(region="IN", max_items=12, exclude_topics=None):
     exclude_topics = exclude_topics or set()
     try:
@@ -228,21 +253,17 @@ def fetch_youtube_trending_health_topics(region="IN", max_items=12, exclude_topi
             resp = req.execute()
             items.extend(resp.get("items", []) or [])
             token = resp.get("nextPageToken")
-            if token:
-                req = yt.videos().list(part="snippet", chart="mostPopular", regionCode=region, maxResults=50, pageToken=token)
-            else:
-                break
+            req = yt.videos().list(part="snippet", chart="mostPopular", regionCode=region, maxResults=50, pageToken=token) if token else None
     except Exception as e:
-        log("YouTube trending fetch error:", e)
+        log("YouTube Trending fetch error:", e)
         return []
 
-    # Sort newest first
+    # Newest first
     def pub_dt(it):
         try:
             return datetime.fromisoformat(it["snippet"]["publishedAt"].replace("Z","+00:00"))
         except Exception:
             return datetime.min.replace(tzinfo=timezone.utc)
-
     items.sort(key=pub_dt, reverse=True)
 
     topics, seen = [], set()
@@ -252,23 +273,18 @@ def fetch_youtube_trending_health_topics(region="IN", max_items=12, exclude_topi
         desc = sn.get("description") or ""
         tags = sn.get("tags") if isinstance(sn.get("tags"), list) else []
 
-        # Strict English
-        if not is_mostly_english(title + " " + desc):
+        if not is_english_text(title + " " + desc + " " + " ".join(tags or [])):   # true language detection
             continue
-        # Strict health niche
-        if not text_has_health_signal(title, desc, tags):
+        if not text_has_health_signal(title, desc, tags):  # strictly health
             continue
 
         topic = clean_title_to_topic(title)
         if not topic or len(normalize_topic(topic)) < 4:
             continue
 
-        # Dedup within this batch
         norm = normalize_topic(topic)
         if norm in seen:
             continue
-
-        # Exclude previously approved topics (near-duplicates)
         if any(jaccard(topic, ex) >= 0.8 for ex in exclude_topics):
             continue
 
@@ -276,28 +292,192 @@ def fetch_youtube_trending_health_topics(region="IN", max_items=12, exclude_topi
         topics.append(topic)
         if len(topics) >= max_items:
             break
-
-    log("Trending EN health topics:", topics[:5])
+    log("YT Trending EN health:", topics[:5])
     return topics
 
+# ---------- Fallback 1: YouTube Search (recent, EN + health) ----------
+SEARCH_SEEDS = [
+    "health tips", "sleep tips", "hydration habit", "posture fixes", "yoga routine",
+    "stretching routine", "mobility routine", "mindfulness", "breathing exercises",
+    "desk ergonomics", "healthy snacks", "back pain relief", "neck pain relief", "walking benefits",
+    "core strength", "morning routine health"
+]
+
+def fetch_youtube_search_health_topics(region="IN", max_items=12, days=7, exclude_topics=None):
+    exclude_topics = exclude_topics or set()
+    try:
+        yt = yt_client()
+    except Exception as e:
+        log("YouTube client init failed (search):", e)
+        return []
+
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    found, seen = [], set()
+    seeds = SEARCH_SEEDS[:8]  # limit to control quota
+
+    for q in seeds:
+        try:
+            req = yt.search().list(
+                part="snippet",
+                q=q,
+                type="video",
+                order="viewCount",
+                publishedAfter=cutoff,
+                maxResults=15,
+                regionCode=region,
+                relevanceLanguage="en",
+                safeSearch="none",
+            )
+            resp = req.execute()
+            items = resp.get("items", []) or []
+        except Exception as e:
+            log("YouTube search error:", q, e)
+            continue
+
+        for it in items:
+            sn = (it.get("snippet") or {})
+            title = sn.get("title") or ""
+            desc = sn.get("description") or ""
+
+            if not is_english_text(title + " " + desc):
+                continue
+            if not text_has_health_signal(title, desc, []):
+                continue
+
+            topic = clean_title_to_topic(title)
+            if not topic or len(normalize_topic(topic)) < 4:
+                continue
+
+            norm = normalize_topic(topic)
+            if norm in seen:
+                continue
+            if any(jaccard(topic, ex) >= 0.8 for ex in exclude_topics):
+                continue
+
+            seen.add(norm)
+            found.append(topic)
+            if len(found) >= max_items:
+                break
+        if len(found) >= max_items:
+            break
+
+    log("YT Search EN health:", found[:5])
+    return found
+
+# ---------- Fallback 2: Google Trends (health-related, EN only) ----------
+def fetch_google_trends_health_topics(region="IN", max_items=12, exclude_topics=None):
+    exclude_topics = exclude_topics or set()
+    topics, seen = [], set()
+    try:
+        from pytrends.request import TrendReq
+        pt = TrendReq(hl="en-IN", tz=330)
+    except Exception as e:
+        log("pytrends init error:", e)
+        return []
+
+    seeds = [
+        "sleep","hydration","walking","steps","posture","stretching","mobility","stress","breathing",
+        "morning sunlight","protein","fiber","yoga","desk ergonomics","healthy snacks","mindfulness",
+        "core strength","back pain relief","neck pain","bedtime routine"
+    ]
+
+    # 1) realtime trending searches
+    try:
+        df = pt.realtime_trending_searches(pn=region)
+        if df is not None and "title" in df.columns:
+            for t in df["title"].tolist():
+                if not isinstance(t, str): continue
+                if not is_english_text(t, allow_short=True): continue
+                if not text_has_health_signal(t, "", []): continue
+                topic = clean_title_to_topic(t)
+                norm = normalize_topic(topic)
+                if not topic or norm in seen: continue
+                if any(jaccard(topic, ex) >= 0.8 for ex in exclude_topics): continue
+                seen.add(norm); topics.append(topic)
+                if len(topics) >= max_items: break
+    except Exception as e:
+        log("pytrends realtime error:", e)
+
+    # 2) related queries rising/top for seeds (last 1 day)
+    for s in seeds:
+        if len(topics) >= max_items: break
+        try:
+            pt.build_payload([s], timeframe="now 1-d", geo=region)
+            rq = pt.related_queries() or {}
+            rq_s = rq.get(s, {})
+            for k in ("rising","top"):
+                df2 = rq_s.get(k)
+                if df2 is not None and "query" in df2.columns:
+                    for q in df2.head(15)["query"].tolist():
+                        if not isinstance(q, str): continue
+                        if not is_english_text(q, allow_short=True): continue
+                        if not text_has_health_signal(q, "", []): continue
+                        topic = clean_title_to_topic(q)
+                        norm = normalize_topic(topic)
+                        if not topic or norm in seen: continue
+                        if any(jaccard(topic, ex) >= 0.8 for ex in exclude_topics): continue
+                        seen.add(norm); topics.append(topic)
+                        if len(topics) >= max_items: break
+        except Exception as e:
+            log("pytrends related error:", s, e)
+            continue
+
+    log("Google Trends EN health:", topics[:5])
+    return topics[:max_items]
+
+# ---------- Aggregator with fallbacks ----------
+def gather_trending_health_topics(region="IN", need=3, exclude_topics=None):
+    exclude_topics = exclude_topics or set()
+    collected = []
+
+    # 1) YouTube Trending
+    yt_trending = fetch_youtube_trending_health_topics(region, max_items=12, exclude_topics=exclude_topics)
+    collected.extend(yt_trending)
+
+    # 2) YouTube Search (if still short)
+    if len(collected) < need:
+        yt_search = fetch_youtube_search_health_topics(region, max_items=12, days=7, exclude_topics=exclude_topics | set(collected))
+        collected.extend([t for t in yt_search if t not in collected])
+
+    # 3) Google Trends (if still short)
+    if len(collected) < need:
+        gtr = fetch_google_trends_health_topics(region, max_items=12, exclude_topics=exclude_topics | set(collected))
+        collected.extend([t for t in gtr if t not in collected])
+
+    return collected[:12]
+
 # ---------- Issue creation ----------
-def create_topic_issue(owner, repo, topics, scheduled_ist):
+def create_topic_issue(owner, repo, topics, scheduled_ist, note=""):
     slot_label = f"slot:{SLOT}"
     ensure_labels(owner, repo, {
         "await-topic-approval": ("ededed", "Awaiting topic approval"),
         slot_label: ("bfd4f2" if SLOT == "morning" else "c2e0c6", f"Issue for {SLOT} slot")
     })
 
-    shown = topics[:3]  # show up to 3 trending options (no padding)
-    numbered = "\n".join([f"{i}) {t}" for i, t in enumerate(shown, 1)]) if shown else "(no eligible topics found)"
-    opts_str = "/".join(str(i) for i in range(1, len(shown) + 1)) if shown else "N/A"
+    shown = topics[:3]  # show up to 3 trending options
+    if shown:
+        numbered = "\n".join([f"{i}) {t}" for i, t in enumerate(shown, 1)])
+        opts_str = "/".join(str(i) for i in range(1, len(shown) + 1))
+        guidance = ""
+    else:
+        numbered = "(No eligible English health topics found via YouTube Trending/Search/Google Trends.)"
+        opts_str = "N/A"
+        guidance = (
+            "\nNote:\n"
+            "- No strictly-English health topics detected right now.\n"
+            "- You can wait and rerun, or reply with:\n"
+            "  • /reject-topic (I’ll try again later)\n"
+            "  • /custom-topic Your Topic (provide a safe wellness topic)\n"
+        )
+    if note:
+        guidance += f"\nDebug: {note}"
 
     title = f"Topic approval for {SLOT} slot ({scheduled_ist.strftime('%Y-%m-%d')} {scheduled_ist.strftime('%H:%M')} IST)"
-    body = f"""Proposed latest YouTube trending health topics (strictly English; excludes previously approved).
+    body = f"""Proposed latest trending topics strictly in the health niche and strictly in English (YouTube-driven; excludes previously approved).
 Scheduled publish (IST): {scheduled_ist.strftime('%Y-%m-%d %H:%M')}.
 
 Choose one:
-{numbered}
+{numbered}{guidance}
 
 Reply with:
 - /approve-topic 1   (or {opts_str})
@@ -340,23 +520,21 @@ def main():
         log("Failed to load approved topics:", e)
         approved = set()
 
-    # Fetch strictly English, health-niche YouTube trending topics
+    # Aggregate trending topics with fallbacks
     try:
-        candidates = fetch_youtube_trending_health_topics(REGION, max_items=12, exclude_topics=approved)
+        candidates = gather_trending_health_topics(REGION, need=3, exclude_topics=approved)
     except Exception as e:
-        log("Trending fetch error:", e)
+        log("Aggregator error:", e)
         candidates = []
 
-    topics = candidates[:3]  # strictly trending only; no padding
-
-    if not topics:
-        print("No English YouTube trending health topics found right now. Skipping issue creation.")
-        return
+    topics = candidates[:3]
 
     scheduled_ist = next_slot_ist()
+    # Always create an issue (even if zero options), with guidance
     try:
-        create_topic_issue(owner, repo, topics, scheduled_ist)
-        log("Using topics:", topics)
+        note = "" if topics else "Found 0 topics after YouTube Trending, YouTube Search, and Google Trends."
+        create_topic_issue(owner, repo, topics, scheduled_ist, note=note)
+        log("Using topics:", topics if topics else ["<none>"])
         print("Created topic approval issue for", SLOT)
     except requests.HTTPError as e:
         print("Failed to create issue:", e.response.text if e.response is not None else str(e))
