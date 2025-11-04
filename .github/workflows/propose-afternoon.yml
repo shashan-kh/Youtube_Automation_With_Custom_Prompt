@@ -31,9 +31,9 @@ jobs:
           REGION: IN
           SLOT: afternoon
           DEBUG: "1"
-          # Use the built-in token; more reliable than secrets.GITHUB_TOKEN
+          # GitHub API
           GITHUB_TOKEN: ${{ github.token }}
-          # YouTube OAuth (for Trending + Search fallback)
+          # YouTube OAuth (Trending + Search + Channels)
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
