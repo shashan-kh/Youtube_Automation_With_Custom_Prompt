@@ -10,27 +10,27 @@ scheduled publish. All controlled via GitHub Issue comments.
 
 Evening (IST)
 -> Propose workflow runs
-└─ Finds 6 specific, actionable health topics
+-> Finds 6 specific, actionable health topics
 (YouTube Trending + Search + Top Channels + Google Trends + Reddit)
-└─ LLM refines vague signals into high-CTR titles
-└─ Creates GitHub Issue for approval
+-> LLM refines vague signals into high-CTR titles
+-> Creates GitHub Issue for approval
 
 You comment: /approve-topic 2
-└─ Bot asks for your script prompt
-└─ You reply: /set-prompt <your prompt>
+-> Bot asks for your script prompt
+-> You reply: /set-prompt <your prompt>
 OR /use-default-prompt
-└─ LLM writes script using YOUR prompt
-└─ gTTS renders voiceover
-└─ Pexels b-roll downloaded (parallel)
-└─ Video rendered (1080×1920, ≤58 s)
-└─ Whisper captions burned
-└─ BGM mixed
-└─ SEO package generated
+-> LLM writes script using YOUR prompt
+-> gTTS renders voiceover
+-> Pexels b-roll downloaded (parallel)
+-> Video rendered (1080×1920, ≤58 s)
+-> Whisper captions burned
+-> BGM mixed
+-> SEO package generated
 (title + description + 350 hashtags)
-└─ Uploaded unlisted to YouTube
+-> Uploaded unlisted to YouTube
 
 You comment: /approve-video
-└─ Video scheduled PRIVATE → auto-publish next day
+-> Video scheduled PRIVATE → auto-publish next day
 
 ---
 
