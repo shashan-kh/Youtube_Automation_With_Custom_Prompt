@@ -775,3 +775,70 @@ Scheduled publish (IST): **{scheduled_ist.strftime('%Y-%m-%d %H:%M')}**
 ---
 
 ### Default script prompt (will be shown again after topic approval):
+{default_prompt_placeholder}
+  
+{METADATA_SENTINEL if False else ""}
+"""
+    import json as _json
+    meta_block = set_metadata_in_issue_body(
+        body,
+        {
+            "slot": SLOT,
+            "scheduled_ist": scheduled_ist.strftime("%Y-%m-%d %H:%M"),
+            "topics": shown,
+        },
+    )
+
+    log.info("Creating issue: %s", title)
+    gh(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/issues",
+        json={
+            "title": title,
+            "body": meta_block,
+            "labels": ["await-topic-approval", slot_label],
+        },
+    )
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    log.info("Region=%s Slot=%s Repo=%s", REGION, SLOT, REPO)
+    if not REPO or "/" not in REPO:
+        print("GITHUB_REPOSITORY not set."); sys.exit(2)
+    if not GITHUB_TOKEN:
+        print("GITHUB_TOKEN not available."); sys.exit(2)
+
+    owner, repo = REPO.split("/", 1)
+
+    # Guard: skip if an open approval issue already exists for this slot
+    try:
+        open_slot = open_issues_with_labels(owner, repo, [f"slot:{SLOT}", "await-topic-approval"])
+    except requests.HTTPError as exc:
+        print("Failed to query issues:", exc); sys.exit(4)
+    if open_slot:
+        print("An approval issue for this slot is already open. Skipping.")
+        return
+
+    approved = load_recent_approved_topics(owner, repo)
+
+    try:
+        candidates = gather_topics(REGION, need=6, exclude=approved)
+    except Exception as exc:
+        log.error("Aggregator error: %s", exc)
+        candidates = []
+
+    scheduled_ist = next_slot_ist()
+    note = "" if candidates else "All sources returned 0 eligible topics."
+    try:
+        create_topic_issue(owner, repo, candidates, scheduled_ist, note=note)
+        print(f"Created topic approval issue for {SLOT} slot.")
+    except requests.HTTPError as exc:
+        body_txt = exc.response.text if exc.response is not None else str(exc)
+        print("Failed to create issue:", body_txt)
+        sys.exit(5)
+
+
+if __name__ == "__main__":
+    main()
