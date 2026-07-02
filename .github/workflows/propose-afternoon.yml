@@ -9,18 +9,22 @@ permissions:
   contents: read
   issues: write
 
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node20
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
 jobs:
   propose:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5.4.0
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Cache pip
-        uses: actions/cache@v4.2.3
+        uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
