@@ -9,7 +9,7 @@ scheduled publish. All controlled via GitHub Issue comments.
 ## How It Works
 
 Evening (IST)
-└─ Propose workflow runs
+-> Propose workflow runs
 └─ Finds 6 specific, actionable health topics
 (YouTube Trending + Search + Top Channels + Google Trends + Reddit)
 └─ LLM refines vague signals into high-CTR titles
