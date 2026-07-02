@@ -19,8 +19,7 @@ permissions:
   statuses: none
 
 env:
-  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node20
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   handle:
@@ -68,12 +67,12 @@ jobs:
 
       - name: Validate required secrets
         if: |
-          contains(github.event.comment.body, '/approve-topic')     ||
-          contains(github.event.comment.body, '/custom-topic')      ||
-          contains(github.event.comment.body, '/set-prompt')        ||
-          contains(github.event.comment.body, '/use-default-prompt')||
-          contains(github.event.comment.body, '/approve-video')     ||
-          contains(github.event.comment.body, '/reject-video')      ||
+          contains(github.event.comment.body, '/approve-topic')      ||
+          contains(github.event.comment.body, '/custom-topic')       ||
+          contains(github.event.comment.body, '/set-prompt')         ||
+          contains(github.event.comment.body, '/use-default-prompt') ||
+          contains(github.event.comment.body, '/approve-video')      ||
+          contains(github.event.comment.body, '/reject-video')       ||
           contains(github.event.comment.body, '/regenerate-video')
         shell: bash
         run: |
