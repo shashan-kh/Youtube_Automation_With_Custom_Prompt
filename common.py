@@ -55,13 +55,14 @@ def gh(
                 method, url, headers=headers, timeout=60, **kwargs
             )
             if r.status_code in _RETRIABLE and attempt < max_retries:
-                wait = int(r.headers.get("Retry-After", backoff**attempt))
+                wait = int(r.headers.get("Retry-After", backoff ** attempt))
                 log.warning("GitHub API %s → retrying in %ss…", r.status_code, wait)
                 time.sleep(wait)
                 continue
             if r.status_code >= 400:
                 raise requests.HTTPError(
-                    f"GitHub API error {r.status_code}: {r.text[:400]}", response=r
+                    f"GitHub API error {r.status_code}: {r.text[:400]}",
+                    response=r,
                 )
             return r
         except requests.HTTPError as exc:
@@ -69,10 +70,10 @@ def gh(
             if code not in _RETRIABLE:
                 raise
             last_exc = exc
-            time.sleep(backoff**attempt)
+            time.sleep(backoff ** attempt)
         except (requests.ConnectionError, requests.Timeout) as exc:
             last_exc = exc
-            time.sleep(backoff**attempt)
+            time.sleep(backoff ** attempt)
     raise last_exc or RuntimeError(
         f"gh({method} {url}) failed after {max_retries} retries"
     )
@@ -123,6 +124,7 @@ METADATA_SENTINEL = "<!-- automation-metadata -->"
 
 
 def get_metadata_from_issue_body(issue_body: str) -> dict | None:
+    import json
     pattern = re.compile(
         re.escape(METADATA_SENTINEL) + r"\s*```json\s*(\{.*?\})\s*```",
         re.S,
@@ -130,20 +132,27 @@ def get_metadata_from_issue_body(issue_body: str) -> dict | None:
     m = pattern.search(issue_body or "")
     if m:
         try:
-            return __import__("json").loads(m.group(1))
+            return json.loads(m.group(1))
         except Exception:
             pass
     # Legacy fallback
     m2 = re.search(r"```json\s*(\{.*?\})\s*```", issue_body or "", re.S)
     if m2:
         try:
-            return __import__("json").loads(m2.group(1))
+            return json.loads(m2.group(1))
         except Exception:
             pass
     return None
 
 
 def set_metadata_in_issue_body(issue_body: str, meta: dict) -> str:
+    """
+    Insert or replace the metadata JSON block in the issue body.
+
+    IMPORTANT: uses a lambda replacement to avoid re.sub interpreting
+    backslashes in the replacement string (e.g. \\u, \\n from prompt text)
+    as regex escape sequences, which causes re.error: bad escape.
+    """
     import json
     block = f"{METADATA_SENTINEL}\n```json\n{json.dumps(meta, indent=2)}\n```"
     pattern = re.compile(
@@ -151,7 +160,9 @@ def set_metadata_in_issue_body(issue_body: str, meta: dict) -> str:
         re.S,
     )
     if pattern.search(issue_body or ""):
-        return pattern.sub(block, issue_body, count=1)
+        # ── KEY FIX: lambda prevents re from interpreting backslashes
+        #    in `block` as regex escape sequences (\u, \n, \t, etc.)
+        return pattern.sub(lambda _: block, issue_body, count=1)
     return (issue_body or "").rstrip() + f"\n\n{block}"
 
 
