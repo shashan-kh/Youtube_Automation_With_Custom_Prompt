@@ -22,9 +22,15 @@ google-auth-oauthlib
 pytrends
 langdetect>=1.0.9
 
+# Reddit scraping
+praw>=7.7.0
+
 # Video (pin to avoid Pillow ANTIALIAS removal)
 moviepy==1.0.3
 imageio>=2.31
 imageio-ffmpeg>=0.4.9
 numpy<2
 pillow<10
+
+# Retry / resilience
+tenacity>=8.2.0
