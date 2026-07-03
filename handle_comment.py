@@ -74,10 +74,14 @@ TARGET_HIGH = 58.0
 PREVIEW_MAX = 57.3
 SAFE_TAGS   = ["health", "wellness", "habits", "selfcare", "sleep", "hydration"]
 
-# ── Default script prompt ─────────────────────────────────────────────────────
-# The prompt is extremely strict.
-# {topic} is the only placeholder — replaced at call time via .format().
-DEFAULT_SCRIPT_PROMPT_TEMPLATE = (
+# ── Prompt loading ─────────────────────────────────────────────────────────────
+# The default prompt is stored in prompt.txt at the root of the repository.
+# Edit prompt.txt anytime to change the default prompt without touching code.
+# {topic} in the file is replaced with the actual approved topic at runtime.
+
+_PROMPT_FILE = Path(__file__).parent / "prompt.txt"
+
+_BUILTIN_PROMPT = (
     "Write a spoken voiceover script for a 55-second YouTube Short "
     "about this topic: {topic}\n\n"
     "Your response must contain ONLY the spoken words — nothing else at all.\n"
@@ -105,6 +109,31 @@ DEFAULT_SCRIPT_PROMPT_TEMPLATE = (
     "The last sentence must be a complete call to action.\n"
     "Write the script now, starting with the first spoken word:"
 )
+
+
+def load_default_prompt() -> str:
+    """
+    Load the prompt template from prompt.txt.
+    Falls back to the built-in hardcoded prompt if the file is missing
+    or cannot be read.
+    The returned string contains {topic} as a placeholder.
+    """
+    try:
+        content = _PROMPT_FILE.read_text(encoding="utf-8").strip()
+        if content and "{topic}" in content:
+            log.info("[prompt] loaded from prompt.txt (%d chars)", len(content))
+            return content
+        if content and "{topic}" not in content:
+            log.warning(
+                "[prompt] prompt.txt exists but has no {topic} placeholder. "
+                "Using built-in prompt."
+            )
+    except FileNotFoundError:
+        log.warning("[prompt] prompt.txt not found. Using built-in prompt.")
+    except Exception as exc:
+        log.warning("[prompt] could not read prompt.txt: %s. Using built-in.", exc)
+    return _BUILTIN_PROMPT
+
 
 PROMPT_REMINDER_HOURS = 1
 
@@ -169,9 +198,8 @@ def _build_model_list() -> list[str]:
     return ordered[:12]
 
 
-# ── Patterns that indicate the LLM leaked meta-commentary ─────────────────────
+# ── Meta-commentary detection and removal ─────────────────────────────────────
 _META_LINE_PATTERNS = [
-    # Preamble phrases at the start of a line
     re.compile(
         r"^(here(\s+is|\s*'s)\s+(the\s+)?(script|voiceover|short|video)|"
         r"sure[!,.]|of\s+course[!,.]|absolutely[!,.]|"
@@ -181,21 +209,16 @@ _META_LINE_PATTERNS = [
         r"as\s+requested|certainly[!,.])",
         re.I,
     ),
-    # Section label lines: "Hook:", "CTA:", "Tip 1:", etc.
     re.compile(
         r"^(hook|pain\s*point|reveal|tip\s*\d*|cta|call\s+to\s+action|"
         r"script|voiceover|section|part\s*\d*|intro|outro|"
         r"loop|closing|opening)\s*[:\-–]",
         re.I,
     ),
-    # Markdown headers
     re.compile(r"^#{1,6}\s+", re.I),
-    # Lines that are entirely inside brackets or parentheses
     re.compile(r"^\[.*\]$", re.I),
     re.compile(r"^\(.*\)$", re.I),
-    # Separator lines
     re.compile(r"^[-=*_]{3,}$"),
-    # Lines talking about the script/topic as a meta object
     re.compile(
         r"(the\s+user\s+wants|youtube\s+shorts?\s+script\s+(about|for|on)|"
         r"write\s+a\s+script|this\s+script\s+is|the\s+topic\s+is|"
@@ -204,7 +227,6 @@ _META_LINE_PATTERNS = [
     ),
 ]
 
-# Inline prefixes to strip from the beginning of the first line
 _INLINE_PREFIX_RE = re.compile(
     r"^(here(\s+is|\s*'s)\s+(the\s+)?(script|voiceover)[:\s]*|"
     r"sure[!,.]?\s*|of\s+course[!,.]?\s*|absolutely[!,.]?\s*|"
@@ -214,93 +236,38 @@ _INLINE_PREFIX_RE = re.compile(
 
 
 def _clean_script_output(raw: str) -> str:
-    """
-    Remove any meta-commentary the LLM outputs despite strict instructions.
-    Returns only the spoken script lines joined into a single paragraph.
-    """
     lines = raw.strip().splitlines()
     kept: list[str] = []
-
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
-        # Skip lines matching any meta pattern
         if any(p.search(stripped) for p in _META_LINE_PATTERNS):
-            log.debug("[clean] dropped meta line: %r", stripped[:80])
+            log.debug("[clean] dropped: %r", stripped[:80])
             continue
         kept.append(stripped)
-
     if not kept:
         return raw.strip()
-
-    # Join all kept lines into a single flowing paragraph
     text = " ".join(kept)
-
-    # Strip inline prefix from the very start
     text = _INLINE_PREFIX_RE.sub("", text).strip()
-
-    # Remove any leading punctuation artifacts
     text = re.sub(r"^[:\-–\s]+", "", text).strip()
-
     return text
 
 
-def _is_script_complete(text: str) -> bool:
-    """
-    Check that the script ends with a complete sentence.
-    A complete sentence ends with . ! or ?
-    """
-    stripped = text.strip()
-    if not stripped:
-        return False
-    return stripped[-1] in ".!?"
-
-
 def _ensure_complete_ending(text: str) -> str:
-    """
-    If the script does not end with a complete sentence punctuation,
-    append a standard CTA to close it properly.
-    """
     text = text.strip()
     if not text:
         return text
     if text[-1] not in ".!?":
-        # Find the last complete sentence and truncate after it
-        last_end = max(
-            text.rfind("."),
-            text.rfind("!"),
-            text.rfind("?"),
-        )
+        last_end = max(text.rfind("."), text.rfind("!"), text.rfind("?"))
         if last_end > len(text) // 2:
-            # There is a complete sentence in the second half — truncate there
             text = text[: last_end + 1].strip()
         else:
-            # No good truncation point — just add a period
             text = text + "."
-    # Ensure ends with a CTA-style closing if very abrupt
-    last_sentence = re.split(r"[.!?]", text)
-    last_sentence = [s.strip() for s in last_sentence if s.strip()]
-    if last_sentence:
-        last = last_sentence[-1].lower()
-        # If the last sentence is suspiciously short (< 4 words) it may be cut off
-        if len(last.split()) < 4:
-            text = text.rstrip(".!?")
-            # Remove the incomplete last fragment
-            for punct in [".", "!", "?"]:
-                idx = text.rfind(punct)
-                if idx > len(text) // 2:
-                    text = text[: idx + 1].strip()
-                    break
     return text
 
 
 def generate_script(topic: str, user_prompt: str) -> str:
-    """
-    Generate script using Groq LLM.
-    Enforces clean output via system message + post-processing.
-    Retries if output is incomplete or contains meta-commentary.
-    """
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret.")
 
@@ -351,31 +318,23 @@ def generate_script(topic: str, user_prompt: str) -> str:
                 last_err = RuntimeError(f"Model {model} returned empty.")
                 continue
 
-            # Clean meta-commentary
             cleaned = _clean_script_output(raw)
-            log.info(
-                "[script] raw=%d chars cleaned=%d chars words=%d",
-                len(raw), len(cleaned), len(cleaned.split()),
-            )
-
-            # Ensure the script is complete
             cleaned = _ensure_complete_ending(cleaned)
 
-            # Word count check — must be at least 80 words to be usable
             word_count = len(cleaned.split())
+            log.info(
+                "[script] model=%s words=%d", model, word_count
+            )
             if word_count < 80:
                 log.warning(
-                    "[script] model %s produced only %d words, retrying",
-                    model, word_count,
+                    "[script] model %s: only %d words, retrying", model, word_count
                 )
                 last_err = RuntimeError(
                     f"Model {model} produced too few words ({word_count})."
                 )
                 continue
 
-            log.info(
-                "[script] success: model=%s words=%d", model, word_count
-            )
+            log.info("[script] success: model=%s words=%d", model, word_count)
             return cleaned
 
         except Exception as exc:
@@ -468,8 +427,8 @@ def get_audio_duration(path: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Captions (faster-whisper → SRT → burn)
-# Original style: yellow text, black outline, bottom-center, 12pt
+# Captions
+# Original style: yellow text, black outline, bottom-center, 12pt, MarginV=96
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fmt_time(t: float) -> str:
@@ -518,7 +477,6 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
         if not words:
             raise RuntimeError("No word-level timestamps from whisper.")
 
-        # Group into 2-3 word chunks (original logic)
         chunks: list[tuple[str, float, float]] = []
         i = 0
         while i < len(words):
@@ -532,10 +490,10 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
             )
             i += take
 
-        out:  list[str] = []
-        idx   = 1
-        cur_t = max(0.0, chunks[0][1]) if chunks else 0.0
-        gap   = 0.02
+        out:    list[str] = []
+        idx     = 1
+        cur_t   = max(0.0, chunks[0][1]) if chunks else 0.0
+        gap     = 0.02
         min_dur = 0.35
 
         for text, w_start, w_end in chunks:
@@ -555,7 +513,8 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
 
         if not out:
             out.append(
-                f"1\n{_fmt_time(0.0)} --> {_fmt_time(max(0.8, audio_dur))}\n \n\n"
+                f"1\n{_fmt_time(0.0)} --> "
+                f"{_fmt_time(max(0.8, audio_dur))}\n \n\n"
             )
 
         with open(srt_path, "w", encoding="utf-8") as f:
@@ -565,7 +524,7 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
         return True
 
     except Exception as exc:
-        log.warning("[srt] transcription failed: %s — writing blank srt", exc)
+        log.warning("[srt] failed: %s — writing blank srt", exc)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(
                 f"1\n{_fmt_time(0.0)} --> "
@@ -575,10 +534,6 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
 
 
 def _ffmpeg_escape(s: str) -> str:
-    """
-    Escape string for ffmpeg -vf filter value.
-    Exact same function as original repo.
-    """
     return (
         s.replace("\\", "\\\\")
          .replace(":", "\\:")
@@ -588,16 +543,8 @@ def _ffmpeg_escape(s: str) -> str:
 
 
 def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
-    """
-    Burn captions using original repo style:
-    - Yellow text (PrimaryColour=&H0000FFFF&)
-    - Black outline (OutlineColour=&H00000000&)
-    - Bottom-center (Alignment=2)
-    - 12pt DejaVu Sans Bold
-    - MarginV=96
-    """
     srt_abs = str(Path(srt_path).resolve())
-    log.info("[captions] srt=%s in=%s out=%s", srt_abs, in_mp4, out_mp4)
+    log.info("[captions] srt=%s out=%s", srt_abs, out_mp4)
 
     style = (
         "Fontname=DejaVu Sans,Fontsize=12,Bold=1,"
@@ -609,8 +556,6 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
         f"subtitles={_ffmpeg_escape(srt_abs)}"
         f":force_style={_ffmpeg_escape(style)}"
     )
-
-    log.info("[captions] vf=%s", vf[:200])
 
     result = subprocess.run(
         [
@@ -904,8 +849,8 @@ def render_and_cap(
     if not local:
         raise RuntimeError("No b-roll clips downloaded.")
 
-    raw_clips:  list[VideoFileClip] = []
-    cropped:    list                = []
+    raw_clips:  list[VideoFileClip]  = []
+    cropped:    list                 = []
     voice_clip: AudioFileClip | None = None
     merged                           = None
 
@@ -1295,10 +1240,7 @@ def build_preview(
             log.error("[build] script attempt %d failed: %s", attempt, exc)
             continue
 
-        # Ensure complete ending
         script_text = _ensure_complete_ending(script_text)
-
-        # Add sign-off if missing
         if "thank you for watching" not in script_text.lower():
             if not script_text.endswith((".", "!", "?")):
                 script_text += "."
@@ -1321,7 +1263,7 @@ def build_preview(
                 "tags_csv": "health,wellness,shorts,healthy habits,fitness,tips",
             }
 
-        # 3. TTS — natural pace, no speed change
+        # 3. TTS
         voice_raw = f"voice_{attempt}.mp3"
         try:
             synthesize_speech(script_text, voice_raw, lang=TTS_LANG)
@@ -1471,15 +1413,18 @@ def _post_preview_comment(
 def _post_prompt_request(
     owner: str, repo: str, number: int, topic: str
 ) -> None:
-    default = DEFAULT_SCRIPT_PROMPT_TEMPLATE.format(topic=topic)
+    # Load the current prompt from prompt.txt so the user sees exactly
+    # what will be used when they reply /use-default-prompt
+    default = load_default_prompt().format(topic=topic)
     body = (
         f"Topic approved: {topic}\n\n"
         "Please provide your script prompt so I can write the video script.\n\n"
         "Option A - Use your own prompt:\n"
         "Reply with: /set-prompt followed by your full prompt\n\n"
-        "Option B - Use the default template:\n"
+        "Option B - Use the default template (from prompt.txt):\n"
         "Reply with exactly: /use-default-prompt\n\n"
-        f"Default prompt for reference:\n\n{default}\n\n"
+        "Current default prompt (edit prompt.txt in the repository to change it):\n\n"
+        f"{default}\n\n"
         f"A reminder will be posted if no prompt is received within "
         f"{PROMPT_REMINDER_HOURS} hour."
     )
@@ -1627,7 +1572,8 @@ def handle_use_default_prompt(ctx: Ctx) -> None:
             "No approved topic found. Please /approve-topic or /custom-topic first.",
         )
         return
-    user_prompt = DEFAULT_SCRIPT_PROMPT_TEMPLATE.format(topic=topic)
+    # Load prompt fresh from prompt.txt every time this command is used
+    user_prompt = load_default_prompt().format(topic=topic)
     _run_build_with_prompt(ctx, user_prompt)
 
 
