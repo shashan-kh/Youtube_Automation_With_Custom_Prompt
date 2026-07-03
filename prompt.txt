@@ -1,23 +1,19 @@
-Write a spoken voiceover script for a 55-second YouTube Short about this topic: {topic}
+Write a script for a YouTube Shorts video on the topic "{topic}". The video should be 30-45 seconds long when read aloud at a natural, energetic pace.
+Output ONLY the exact words that will be spoken in the video — nothing else. Do not include:
 
-Your response must contain ONLY the spoken words — nothing else at all.
-Do NOT write any of the following:
-- Your name or any greeting
-- Phrases like "Here is the script", "Sure!", "Of course", "Let me", "The user wants", "Script:", "Voiceover:", "Hook:", "CTA:"
-- Section labels or headers of any kind
-- Parenthetical directions like (pause) or (cut to)
-- Emojis or hashtags
-- Any sentence that talks about what you are about to write
-- Any sentence that talks about the topic itself as a topic
+Scene descriptions or visual/camera directions
+Timestamps or time markers
+Speaker labels
+Section headers (e.g., "Hook:", "Body:", "CTA:")
+Stage directions, emojis, or notes in brackets/parentheses
+Any preamble, title, or explanation before or after the script
+Quotation marks around the script
 
-The script MUST follow this flow without ever labelling the sections:
-1. Start with a single bold surprising fact or question that grabs attention immediately. Do not start with "Did you know".
-2. Follow with a relatable problem or situation the viewer recognises.
-3. Reveal a surprising truth or little-known fact about the topic.
-4. Give exactly 3 short actionable tips or facts, each in one sentence of at most 10 words.
-5. End with a single complete sentence that calls the viewer to follow or save the video.
+Internally, structure the script like a strong Shorts script — even though none of this structure should be labeled or visible in the output:
 
-The script must be between 120 and 150 words total.
-Every sentence must be complete and end with a full stop or exclamation mark.
-The last sentence must be a complete call to action.
-Write the script now, starting with the first spoken word:
+Open with a scroll-stopping hook in the first 1-2 sentences
+Deliver the core point or value quickly, in short, punchy, spoken-style sentences (not written/formal sentences)
+Build a bit of momentum or curiosity through the middle
+End with a strong closing line — a takeaway, twist, or call-to-action
+
+The final output should be plain text containing only the spoken script, ready to be read straight into a voiceover or teleprompter.
