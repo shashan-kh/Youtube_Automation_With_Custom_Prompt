@@ -1,0 +1,23 @@
+Write a spoken voiceover script for a 55-second YouTube Short about this topic: {topic}
+
+Your response must contain ONLY the spoken words — nothing else at all.
+Do NOT write any of the following:
+- Your name or any greeting
+- Phrases like "Here is the script", "Sure!", "Of course", "Let me", "The user wants", "Script:", "Voiceover:", "Hook:", "CTA:"
+- Section labels or headers of any kind
+- Parenthetical directions like (pause) or (cut to)
+- Emojis or hashtags
+- Any sentence that talks about what you are about to write
+- Any sentence that talks about the topic itself as a topic
+
+The script MUST follow this flow without ever labelling the sections:
+1. Start with a single bold surprising fact or question that grabs attention immediately. Do not start with "Did you know".
+2. Follow with a relatable problem or situation the viewer recognises.
+3. Reveal a surprising truth or little-known fact about the topic.
+4. Give exactly 3 short actionable tips or facts, each in one sentence of at most 10 words.
+5. End with a single complete sentence that calls the viewer to follow or save the video.
+
+The script must be between 120 and 150 words total.
+Every sentence must be complete and end with a full stop or exclamation mark.
+The last sentence must be a complete call to action.
+Write the script now, starting with the first spoken word:
