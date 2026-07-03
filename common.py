@@ -7,7 +7,7 @@ import sys
 import time
 import logging
 import requests
-from typing import Any, Callable, TypeVar
+from typing import Callable, TypeVar
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 def get_logger(name: str) -> logging.Logger:
@@ -20,8 +20,7 @@ def get_logger(name: str) -> logging.Logger:
         )
         handler.setFormatter(fmt)
         logger.addHandler(handler)
-    level = logging.DEBUG if os.getenv("DEBUG", "0") == "1" else logging.INFO
-    logger.setLevel(level)
+    logger.setLevel(logging.DEBUG)
     return logger
 
 log = get_logger("common")
@@ -56,7 +55,7 @@ def gh(
             )
             if r.status_code in _RETRIABLE and attempt < max_retries:
                 wait = int(r.headers.get("Retry-After", backoff ** attempt))
-                log.warning("GitHub API %s → retrying in %ss…", r.status_code, wait)
+                log.warning("GitHub API %s retry in %ss", r.status_code, wait)
                 time.sleep(wait)
                 continue
             if r.status_code >= 400:
@@ -148,20 +147,17 @@ def get_metadata_from_issue_body(issue_body: str) -> dict | None:
 def set_metadata_in_issue_body(issue_body: str, meta: dict) -> str:
     """
     Insert or replace the metadata JSON block in the issue body.
-
-    IMPORTANT: uses a lambda replacement to avoid re.sub interpreting
-    backslashes in the replacement string (e.g. \\u, \\n from prompt text)
-    as regex escape sequences, which causes re.error: bad escape.
+    Uses lambda in re.sub to prevent backslash interpretation in
+    replacement strings (fixes: re.error bad escape).
     """
     import json
-    block = f"{METADATA_SENTINEL}\n```json\n{json.dumps(meta, indent=2)}\n```"
+    block   = f"{METADATA_SENTINEL}\n```json\n{json.dumps(meta, indent=2)}\n```"
     pattern = re.compile(
         re.escape(METADATA_SENTINEL) + r"\s*```json\s*\{.*?\}\s*```",
         re.S,
     )
     if pattern.search(issue_body or ""):
-        # ── KEY FIX: lambda prevents re from interpreting backslashes
-        #    in `block` as regex escape sequences (\u, \n, \t, etc.)
+        # lambda prevents re from interpreting backslashes in block
         return pattern.sub(lambda _: block, issue_body, count=1)
     return (issue_body or "").rstrip() + f"\n\n{block}"
 
@@ -179,14 +175,12 @@ def extract_json_block(text: str) -> str | None:
 
 
 def normalize_key(s: str) -> str:
-    """Lowercase, alphanumeric-only key for deduplication."""
     s = (s or "").lower()
     s = re.sub(r"[^\w\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
 def normalize_display(s: str) -> str:
-    """Normalize whitespace for display (preserves case)."""
     s = (s or "").replace("\r", "")
     s = re.sub(r"[ \t\f\v]+", " ", s)
     return "\n".join(line.strip() for line in s.split("\n")).strip()
