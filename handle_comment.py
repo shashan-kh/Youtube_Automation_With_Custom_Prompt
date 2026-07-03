@@ -1,25 +1,6 @@
 """
 handle_comment.py — processes all /commands posted on GitHub Issues.
-
-Command flow:
-  /approve-topic N  or  /custom-topic <text>
-        ↓
-  Bot posts "Please provide your script prompt" + default template
-  Bot labels issue: await-prompt
-        ↓
-  User replies:
-      /set-prompt <their custom prompt>   — use custom prompt
-      /use-default-prompt                 — use the built-in template
-        ↓
-  Bot generates script → renders video → uploads unlisted preview
-  Bot labels: await-video-approval
-        ↓
-  /approve-video  → schedules private → auto-publish
-  /reject-video   → delete preview, reset
-  /regenerate-video → rebuild same topic
-  /reject-topic / /new-topic → fresh topic suggestions
 """
-
 from __future__ import annotations
 
 import json
@@ -36,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from gtts import gTTS
 from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_videoclips
 
 from common import (
@@ -61,12 +41,14 @@ log = get_logger("handle_comment")
 # ── Optional OpenCV ────────────────────────────────────────────────────────────
 try:
     import cv2
+    log.info("OpenCV available")
 except Exception:
     cv2 = None
+    log.info("OpenCV not available, using center crop")
 
 # ── Env ────────────────────────────────────────────────────────────────────────
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL     = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
+GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FALLBACKS = [
     m.strip()
     for m in os.getenv(
@@ -92,21 +74,24 @@ TARGET_HIGH = 58.0
 PREVIEW_MAX = 57.3
 SAFE_TAGS   = ["health", "wellness", "habits", "selfcare", "sleep", "hydration"]
 
-# ── Default script prompt ──────────────────────────────────────────────────────
+# ── Default script prompt ─────────────────────────────────────────────────────
+# Written as a plain string with no f-string or backslash sequences
+# that could cause re.sub issues. {topic} is replaced with .format() only
+# at the moment of use, never stored back into the issue body raw.
 DEFAULT_SCRIPT_PROMPT_TEMPLATE = (
     "Act as a viral YouTube Shorts scriptwriter specializing in health content.\n\n"
-    "Write a script for a YouTube Short (under 60 seconds, ~130-150 words spoken)\n"
-    "on the topic: \"{topic}\"\n\n"
-    "Structure the flow internally (do not label or show these sections in the output):\n"
-    "- Open with a scroll-stopping hook (shocking stat, myth-bust, or bold question).\n"
-    "  No greetings — start mid-thought.\n"
+    "Write a script for a YouTube Short (under 60 seconds, approximately "
+    "130 to 150 words spoken) on the topic: {topic}\n\n"
+    "Structure the flow internally. Do not label or show these sections in the output.\n"
+    "- Open with a scroll-stopping hook such as a shocking stat, myth-bust, or bold "
+    "question. No greetings. Start mid-thought.\n"
     "- Name the relatable pain point the viewer feels right now.\n"
     "- Deliver a surprising cause or myth-busting reveal.\n"
-    "- Give 2-3 punchy, specific, actionable tips. Short sentences (max 8-10 words).\n"
+    "- Give 2 to 3 punchy, specific, actionable tips. Short sentences, max 8 to 10 words.\n"
     "- End with a loop-back to the hook or a final twist for rewatch value.\n"
-    "- Close with one natural, non-salesy CTA (follow, comment a word, or save this).\n\n"
+    "- Close with one natural, non-salesy CTA such as follow, comment a word, or save this.\n\n"
     "Rules:\n"
-    "- Spoken, punchy, simple language — no complex clauses.\n"
+    "- Spoken, punchy, simple language. No complex clauses.\n"
     "- No medical guarantees, but keep tone confident and energetic.\n"
     "- Total script must read aloud in under 60 seconds.\n\n"
     "Output ONLY the plain spoken script as continuous text."
@@ -116,7 +101,7 @@ PROMPT_REMINDER_HOURS = 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Context dataclass
+# Context
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Ctx:
@@ -133,7 +118,7 @@ class Ctx:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM script generation
+# LLM
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _list_groq_models() -> list[str]:
@@ -146,9 +131,9 @@ def _list_groq_models() -> list[str]:
             timeout=30,
         )
         if r.status_code == 401:
-            raise RuntimeError("GROQ_API_KEY invalid (401 Unauthorized).")
+            raise RuntimeError("GROQ_API_KEY invalid (401).")
         if r.status_code == 403:
-            raise RuntimeError("GROQ_API_KEY lacks permission (403 Forbidden).")
+            raise RuntimeError("GROQ_API_KEY forbidden (403).")
         if r.status_code == 200:
             return [d["id"] for d in r.json().get("data", []) if d.get("id")]
     except RuntimeError:
@@ -165,11 +150,9 @@ def _build_model_list() -> list[str]:
     env_models.extend(GROQ_FALLBACKS)
     seen: set[str] = set()
     env_models = [m for m in env_models if not (m in seen or seen.add(m))]  # type: ignore
-
     available = _list_groq_models()
     if not available:
         return env_models or [GROQ_MODEL]
-
     ordered: list[str] = [m for m in env_models if m in available]
     for m in available:
         if m not in ordered:
@@ -178,18 +161,14 @@ def _build_model_list() -> list[str]:
 
 
 def generate_script(topic: str, user_prompt: str) -> str:
-    """
-    Call Groq LLM with the user-supplied (or default) prompt.
-    Returns plain text voiceover script.
-    """
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret.")
-
-    models = _build_model_list()
+    models   = _build_model_list()
+    log.info("[script] model list: %s", models[:5])
     last_err: Exception | None = None
-
     for model in models:
         try:
+            log.info("[script] trying model: %s", model)
             r = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
@@ -203,46 +182,125 @@ def generate_script(topic: str, user_prompt: str) -> str:
             if r.status_code == 200:
                 content = r.json()["choices"][0]["message"]["content"].strip()
                 if content:
+                    log.info("[script] success with %s, length=%d", model, len(content))
                     return content
-                last_err = RuntimeError(f"Model '{model}' returned empty content.")
+                last_err = RuntimeError(f"Model {model} returned empty content.")
             else:
-                msg = r.json().get("error", {}).get("message", r.text)
-                last_err = RuntimeError(f"Model '{model}' failed: {msg}")
+                msg = r.json().get("error", {}).get("message", r.text[:200])
+                last_err = RuntimeError(f"Model {model} HTTP {r.status_code}: {msg}")
+                log.warning("[script] %s", last_err)
         except Exception as exc:
             last_err = exc
-
+            log.warning("[script] model %s exception: %s", model, exc)
     raise last_err or RuntimeError("All Groq models failed.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Audio / TTS
+# TTS — multiple engines with fallback
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _try_gtts(text: str, out_path: str, lang: str) -> bool:
+    try:
+        from gtts import gTTS
+        log.info("[tts] trying gTTS")
+        gTTS(text, lang=lang, slow=False).save(out_path)
+        size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+        log.info("[tts] gTTS saved %d bytes to %s", size, out_path)
+        return size > 1024
+    except Exception as exc:
+        log.warning("[tts] gTTS failed: %s", exc)
+        return False
+
+
+def _try_gtts_with_retry(text: str, out_path: str, lang: str, retries: int = 3) -> bool:
+    for attempt in range(1, retries + 1):
+        log.info("[tts] gTTS attempt %d/%d", attempt, retries)
+        if _try_gtts(text, out_path, lang):
+            return True
+        time.sleep(2 ** attempt)
+    return False
+
+
+def _try_espeak(text: str, out_path: str, lang: str) -> bool:
+    try:
+        log.info("[tts] trying espeak-ng")
+        wav = out_path.replace(".mp3", "_espeak.wav")
+        result = subprocess.run(
+            ["espeak-ng", "-v", lang, "-s", "150", "-w", wav, text],
+            capture_output=True, timeout=60,
+        )
+        log.info("[tts] espeak returncode=%d", result.returncode)
+        if result.returncode != 0:
+            log.warning("[tts] espeak stderr: %s", result.stderr.decode()[:300])
+            return False
+        if not os.path.exists(wav) or os.path.getsize(wav) < 512:
+            log.warning("[tts] espeak wav too small or missing")
+            return False
+        result2 = subprocess.run(
+            ["ffmpeg", "-y", "-i", wav, "-ar", "22050", "-ac", "1", out_path],
+            capture_output=True, timeout=60,
+        )
+        log.info("[tts] ffmpeg wav->mp3 returncode=%d", result2.returncode)
+        size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+        log.info("[tts] espeak mp3 size=%d bytes", size)
+        return size > 512
+    except Exception as exc:
+        log.warning("[tts] espeak failed: %s", exc)
+        return False
+
+
+def _try_ffmpeg_sine_voice(duration_sec: float, out_path: str) -> bool:
+    """
+    Last resort: generate a sine-wave tone as placeholder audio.
+    This ensures the pipeline never completely fails due to TTS.
+    """
+    try:
+        log.info("[tts] generating sine-wave placeholder audio")
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "lavfi",
+                "-i", f"sine=frequency=300:sample_rate=22050:duration={duration_sec}",
+                "-ar", "22050", "-ac", "1",
+                out_path,
+            ],
+            check=True, capture_output=True, timeout=30,
+        )
+        size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+        log.info("[tts] sine placeholder size=%d bytes", size)
+        return size > 512
+    except Exception as exc:
+        log.warning("[tts] sine fallback failed: %s", exc)
+        return False
+
+
 def synthesize_speech(text: str, out_path: str, lang: str = "en") -> str:
-    """Try gTTS → fallback system espeak."""
-    try:
-        gTTS(text, lang=lang).save(out_path)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 512:
-            return out_path
-    except Exception as exc:
-        log.warning("gTTS failed: %s — trying espeak", exc)
+    """
+    Try gTTS (with retry) -> espeak-ng -> sine placeholder.
+    Always returns a valid audio file path or raises.
+    """
+    log.info("[tts] synthesize_speech: text length=%d, out=%s", len(text), out_path)
 
-    wav = out_path.replace(".mp3", "_espeak.wav")
-    try:
-        subprocess.run(
-            ["espeak-ng", "-v", lang, "-s", "155", "-w", wav, text],
-            check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", wav, out_path],
-            check=True, capture_output=True,
-        )
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 512:
-            return out_path
-    except Exception as exc:
-        log.warning("espeak failed: %s", exc)
+    if _try_gtts_with_retry(text, out_path, lang, retries=3):
+        return out_path
 
-    raise RuntimeError("All TTS engines failed.")
+    if _try_espeak(text, out_path, lang):
+        return out_path
+
+    # Estimate duration: average speaking rate ~150 wpm = 2.5 words/sec
+    word_count = len(text.split())
+    estimated_duration = max(35.0, min(57.0, word_count / 2.5))
+    if _try_ffmpeg_sine_voice(estimated_duration, out_path):
+        log.warning(
+            "[tts] Using sine placeholder. Voice will be silent. "
+            "gTTS and espeak both failed."
+        )
+        return out_path
+
+    raise RuntimeError(
+        "All TTS engines failed (gTTS, espeak-ng, ffmpeg sine). "
+        "Check network access and espeak-ng installation."
+    )
 
 
 def ensure_voice_in_range(
@@ -250,27 +308,31 @@ def ensure_voice_in_range(
     min_sec: float = TARGET_LOW,
     max_sec: float = PREVIEW_MAX,
 ) -> tuple[str, float]:
-    a = AudioFileClip(voice_path)
+    log.info("[voice] checking duration of %s", voice_path)
+    a   = AudioFileClip(voice_path)
     dur = a.duration
     a.close()
+    log.info("[voice] duration=%.2fs, target=%.1f-%.1f", dur, min_sec, max_sec)
     if min_sec <= dur <= max_sec:
         return voice_path, dur
     target = max(min_sec, min(max_sec, dur))
     factor = max(0.5, min(2.0, target / dur if dur else 1.0))
+    log.info("[voice] adjusting speed by factor=%.3f", factor)
     out = voice_path.replace(".mp3", "_adj.mp3")
     subprocess.run(
         ["ffmpeg", "-y", "-i", voice_path,
          "-filter:a", f"atempo={factor}", "-vn", out],
-        check=True,
+        check=True, capture_output=True,
     )
-    a2 = AudioFileClip(out)
-    d2 = a2.duration
+    a2  = AudioFileClip(out)
+    d2  = a2.duration
     a2.close()
+    log.info("[voice] adjusted duration=%.2fs", d2)
     return out, d2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Captions (faster-whisper)
+# Captions
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fmt_time(t: float) -> str:
@@ -282,15 +344,17 @@ def _fmt_time(t: float) -> str:
 
 
 def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
+    log.info("[srt] transcribing %s", audio_path)
     try:
-        a = AudioFileClip(audio_path)
+        a         = AudioFileClip(audio_path)
         audio_dur = float(a.duration)
         a.close()
     except Exception:
-        audio_dur = 10.0
+        audio_dur = 45.0
 
     try:
         from faster_whisper import WhisperModel
+        log.info("[srt] loading WhisperModel tiny.en")
         model = WhisperModel(
             os.getenv("WHISPER_MODEL", "tiny.en"),
             device="cpu", compute_type="int8",
@@ -308,6 +372,8 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
                 if txt:
                     words.append((txt, float(w.start), float(w.end)))
 
+        log.info("[srt] got %d words from whisper", len(words))
+
         if not words:
             raise RuntimeError("No words from whisper.")
 
@@ -323,7 +389,7 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
             i += take
 
         lines: list[str] = []
-        idx = 1
+        idx   = 1
         cur_t = max(0.0, chunks[0][1]) if chunks else 0.0
         gap   = 0.02
         for text, w_start, w_end in chunks:
@@ -333,31 +399,41 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
             end   = min(end, audio_dur)
             if end <= start:
                 continue
-            lines.append(f"{idx}\n{_fmt_time(start)} --> {_fmt_time(end)}\n{text}\n\n")
+            lines.append(
+                f"{idx}\n{_fmt_time(start)} --> {_fmt_time(end)}\n{text}\n\n"
+            )
             idx  += 1
             cur_t = end + gap
             if cur_t >= audio_dur:
                 break
 
         if not lines:
-            lines.append(f"1\n{_fmt_time(0.0)} --> {_fmt_time(audio_dur)}\n \n\n")
+            lines.append(
+                f"1\n{_fmt_time(0.0)} --> {_fmt_time(audio_dur)}\n \n\n"
+            )
         with open(srt_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
+        log.info("[srt] wrote %d caption chunks", len(lines))
         return True
 
     except Exception as exc:
-        log.warning("Transcription failed: %s", exc)
+        log.warning("[srt] transcription failed: %s — writing empty srt", exc)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(f"1\n{_fmt_time(0.0)} --> {_fmt_time(audio_dur)}\n \n\n")
         return False
 
 
 def _avfilter_escape(s: str) -> str:
-    return s.replace("\\", "\\\\").replace("'", "'\\''").replace(":", "\\:")
+    return (
+        s.replace("\\", "\\\\")
+         .replace("'", "\\'")
+         .replace(":", "\\:")
+    )
 
 
 def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
     srt_abs = str(Path(srt_path).resolve())
+    log.info("[captions] burning srt=%s into %s", srt_abs, out_mp4)
     style = (
         "Fontname=DejaVu Sans,Fontsize=13,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
@@ -367,15 +443,21 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
         f"subtitles={_avfilter_escape(srt_abs)}"
         f":force_style={_avfilter_escape(style)}"
     )
-    subprocess.run(
+    result = subprocess.run(
         ["ffmpeg", "-y", "-i", in_mp4, "-vf", vf,
          "-c:a", "copy", "-pix_fmt", "yuv420p", out_mp4],
-        check=True,
+        capture_output=True, timeout=300,
     )
+    log.info("[captions] ffmpeg returncode=%d", result.returncode)
+    if result.returncode != 0:
+        log.warning("[captions] stderr: %s", result.stderr.decode()[:500])
+        # Copy without captions rather than failing completely
+        log.warning("[captions] falling back to copy without captions")
+        shutil.copyfile(in_mp4, out_mp4)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Smart cover-crop (face-aware)
+# Smart cover crop
 # ══════════════════════════════════════════════════════════════════════════════
 
 _cascade = None
@@ -394,14 +476,12 @@ def _get_cascade():
 
 
 def smart_cover_crop(clip, target_w: int = 1080, target_h: int = 1920):
-    scale = max(target_w / clip.w, target_h / clip.h)
+    scale   = max(target_w / clip.w, target_h / clip.h)
     resized = clip.resize(scale)
-    cx, cy = resized.w / 2, resized.h / 2
+    cx, cy  = resized.w / 2, resized.h / 2
     try:
-        t = min(
-            max(0.0, 0.5 * resized.duration),
-            max(0.0, resized.duration - 0.05),
-        )
+        t     = min(max(0.0, 0.5 * resized.duration),
+                    max(0.0, resized.duration - 0.05))
         frame = resized.get_frame(t)
         if cv2 is not None:
             gray  = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -414,8 +494,8 @@ def smart_cover_crop(clip, target_w: int = 1080, target_h: int = 1920):
                 best = max(faces, key=lambda f: f[2] * f[3])
                 cx = best[0] + best[2] / 2
                 cy = best[1] + best[3] / 2
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("[crop] face detection failed: %s", exc)
     cx = max(target_w / 2, min(resized.w - target_w / 2, cx))
     cy = max(target_h / 2, min(resized.h - target_h / 2, cy))
     return (
@@ -426,18 +506,30 @@ def smart_cover_crop(clip, target_w: int = 1080, target_h: int = 1920):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# B-roll (parallel Pexels)
+# B-roll
 # ══════════════════════════════════════════════════════════════════════════════
 
 _BROLL_FALLBACKS = [
-    "healthy lifestyle", "fitness", "sleep", "hydration",
-    "walking", "stretching", "posture", "nutrition", "yoga", "meditation",
+    "healthy lifestyle",
+    "fitness exercise",
+    "person sleeping",
+    "drinking water",
+    "walking outdoors",
+    "stretching yoga",
+    "healthy food nutrition",
+    "meditation breathing",
+    "running jogging",
+    "cooking healthy meal",
+    "nature outdoor",
+    "sunrise morning",
 ]
 
 
 def fetch_broll(query: str, need: int = 8) -> list[str]:
     if not PEXELS_API_KEY:
         raise RuntimeError("Missing PEXELS_API_KEY.")
+
+    log.info("[broll] fetching for query=%r need=%d", query, need)
     headers     = {"Authorization": PEXELS_API_KEY}
     all_queries = [query] + _BROLL_FALLBACKS
 
@@ -446,31 +538,42 @@ def fetch_broll(query: str, need: int = 8) -> list[str]:
             r = requests.get(
                 "https://api.pexels.com/videos/search",
                 headers=headers,
-                params={"query": q, "per_page": 15, "min_height": 1080},
+                params={
+                    "query": q,
+                    "per_page": 15,
+                    "min_height": 720,      # relaxed from 1080 to get more results
+                    "orientation": "portrait",
+                },
                 timeout=30,
             )
+            log.info("[broll] query=%r status=%d", q, r.status_code)
             if r.status_code in (401, 403):
                 raise RuntimeError(f"Pexels auth error {r.status_code}")
+            if r.status_code != 200:
+                return []
+            videos = r.json().get("videos", [])
+            log.info("[broll] query=%r found %d videos", q, len(videos))
             links = []
-            for v in r.json().get("videos", []):
+            for v in videos:
                 files = sorted(
                     v.get("video_files", []),
                     key=lambda f: f.get("height", 0),
                     reverse=True,
                 )
                 for f in files:
-                    if f.get("height", 0) >= 1080:
+                    # Accept 720p or higher
+                    if f.get("height", 0) >= 720 and f.get("link"):
                         links.append(f["link"])
                         break
             return links
         except RuntimeError:
             raise
         except Exception as exc:
-            log.warning("Pexels [%s]: %s", q, exc)
+            log.warning("[broll] query=%r error: %s", q, exc)
             return []
 
     collected: list[str] = []
-    seen: set[str] = set()
+    seen: set[str]       = set()
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = {ex.submit(_one, q): q for q in all_queries}
         for fut in as_completed(futs):
@@ -479,11 +582,17 @@ def fetch_broll(query: str, need: int = 8) -> list[str]:
                     if link not in seen:
                         seen.add(link)
                         collected.append(link)
+                log.info("[broll] pool so far: %d unique links", len(collected))
             except RuntimeError:
                 raise
+            except Exception as exc:
+                log.warning("[broll] future error: %s", exc)
+
     import random
     random.shuffle(collected)
-    return collected[: need * 2][:need]
+    result = collected[:need]
+    log.info("[broll] returning %d clips", len(result))
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -498,6 +607,7 @@ def _validate_bgm_url(url: str) -> None:
 
 
 def ensure_bgm_track(duration: float, out_path: str = "bgm_src.m4a") -> str:
+    log.info("[bgm] generating track for %.2fs", duration)
     if BGM_URL:
         try:
             _validate_bgm_url(BGM_URL)
@@ -522,11 +632,11 @@ def ensure_bgm_track(duration: float, out_path: str = "bgm_src.m4a") -> str:
                     ),
                     "-c:a", "aac", "-b:a", "128k", out_path,
                 ],
-                check=True,
+                check=True, capture_output=True,
             )
             return out_path
         except Exception as exc:
-            log.warning("BGM fetch failed (%s), using synthesized tone.", exc)
+            log.warning("[bgm] BGM_URL failed: %s, using sine", exc)
 
     subprocess.run(
         [
@@ -544,13 +654,14 @@ def ensure_bgm_track(duration: float, out_path: str = "bgm_src.m4a") -> str:
             ),
             "-c:a", "aac", "-b:a", "128k", out_path,
         ],
-        check=True,
+        check=True, capture_output=True,
     )
     return out_path
 
 
 def add_bgm(in_mp4: str, out_mp4: str, duration: float) -> None:
     bgm = ensure_bgm_track(duration)
+    log.info("[bgm] mixing bgm into %s", out_mp4)
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", in_mp4, "-i", bgm,
@@ -563,7 +674,7 @@ def add_bgm(in_mp4: str, out_mp4: str, duration: float) -> None:
             "-map", "0:v", "-map", "[aout]",
             "-c:v", "copy", "-c:a", "aac", "-shortest", out_mp4,
         ],
-        check=True,
+        check=True, capture_output=True,
     )
 
 
@@ -578,14 +689,21 @@ def _download_broll(urls: list[str], tmp: Path) -> list[str]:
             continue
         p = tmp / f"b{i}.mp4"
         try:
+            log.info("[dl] downloading clip %d: %s", i, u[:60])
             with requests.get(u, stream=True, timeout=120) as r:
                 r.raise_for_status()
                 with open(p, "wb") as f:
                     for chunk in r.iter_content(256 * 1024):
                         f.write(chunk)
-            local.append(str(p))
+            size = os.path.getsize(str(p))
+            log.info("[dl] clip %d downloaded: %d bytes", i, size)
+            if size > 10240:   # must be >10KB
+                local.append(str(p))
+            else:
+                log.warning("[dl] clip %d too small, skipping", i)
         except Exception as exc:
-            log.warning("B-roll download [%d]: %s", i, exc)
+            log.warning("[dl] clip %d failed: %s", i, exc)
+    log.info("[dl] downloaded %d/%d clips", len(local), len(urls))
     return local
 
 
@@ -597,8 +715,10 @@ def render_and_cap(
     target_w: int = 1080,
     target_h: int = 1920,
 ) -> float:
+    log.info("[render] starting render: %d broll clips", len(broll_urls))
     tmp   = Path(tempfile.mkdtemp())
     local = _download_broll(broll_urls, tmp)
+
     if not local:
         raise RuntimeError("No b-roll clips downloaded.")
 
@@ -606,31 +726,50 @@ def render_and_cap(
     cropped:   list              = []
     voice: AudioFileClip | None  = None
     merged                       = None
+
     try:
         for p in local:
-            c = VideoFileClip(p)
-            raw_clips.append(c)
-            take = min(8, max(4, int(c.duration)))
-            comp = smart_cover_crop(
-                c.subclip(0, take), target_w=target_w, target_h=target_h
-            ).set_audio(None)
-            cropped.append(comp)
+            log.info("[render] loading clip: %s", p)
+            try:
+                c = VideoFileClip(p)
+                log.info("[render] clip loaded: %.2fs %dx%d", c.duration, c.w, c.h)
+                raw_clips.append(c)
+                take = min(8, max(4, int(c.duration)))
+                comp = smart_cover_crop(
+                    c.subclip(0, take), target_w=target_w, target_h=target_h
+                ).set_audio(None)
+                cropped.append(comp)
+            except Exception as exc:
+                log.warning("[render] failed to load clip %s: %s", p, exc)
+                continue
 
+        if not cropped:
+            raise RuntimeError("No clips could be loaded for rendering.")
+
+        log.info("[render] concatenating %d clips", len(cropped))
         merged = concatenate_videoclips(cropped, method="compose")
-        voice  = AudioFileClip(voice_mp3)
+        log.info("[render] merged duration=%.2fs", merged.duration)
+
+        voice = AudioFileClip(voice_mp3)
+        log.info("[render] voice duration=%.2fs", voice.duration)
 
         eps = 1e-2
         end = max(
             0.2,
             min(PREVIEW_MAX, min(merged.duration, voice.duration) - eps),
         )
+        log.info("[render] final clip end=%.2fs", end)
+
         out_clip = merged.subclip(0, end).set_audio(voice.subclip(0, end))
+        log.info("[render] writing video to %s", temp_mp4)
         out_clip.write_videofile(
             temp_mp4, fps=30, codec="libx264", audio_codec="aac",
             threads=2, preset="fast", verbose=False, logger=None,
             ffmpeg_params=["-pix_fmt", "yuv420p"],
         )
         out_clip.close()
+        log.info("[render] video written successfully")
+
     finally:
         for c in raw_clips:
             try: c.close()
@@ -646,23 +785,31 @@ def render_and_cap(
             except Exception: pass
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # Captions
     srt = "cap.srt"
     transcribe_to_srt(voice_mp3, srt)
-    subbed  = "subbed.mp4"
+    subbed = "subbed.mp4"
     burn_captions(temp_mp4, srt, subbed)
 
+    # BGM
     bgm_out = "with_bgm.mp4"
-    add_bgm(subbed, bgm_out, end)
+    try:
+        add_bgm(subbed, bgm_out, end)
+    except Exception as exc:
+        log.warning("[bgm] add_bgm failed: %s — using subbed without BGM", exc)
+        shutil.copyfile(subbed, bgm_out)
 
+    # Safety trim
     v = VideoFileClip(bgm_out)
     d = v.duration
     v.close()
+    log.info("[render] final duration before trim: %.2fs", d)
     out_path = bgm_out
     if d >= 58.0:
         subprocess.run(
             ["ffmpeg", "-y", "-i", bgm_out,
              "-t", str(PREVIEW_MAX), "-c", "copy", "trim_final.mp4"],
-            check=False,
+            check=False, capture_output=True,
         )
         if os.path.exists("trim_final.mp4"):
             out_path = "trim_final.mp4"
@@ -671,6 +818,7 @@ def render_and_cap(
     v2 = VideoFileClip(final_mp4)
     d2 = v2.duration
     v2.close()
+    log.info("[render] done. final duration=%.2fs, file=%s", d2, final_mp4)
     return d2
 
 
@@ -721,6 +869,7 @@ def _yt_client():
 def upload_unlisted(
     video_path: str, title: str, description: str, tags_csv: str
 ) -> tuple[str, str]:
+    log.info("[upload] uploading %s as unlisted", video_path)
     _, _, MediaFileUpload = _ensure_google()
     yt   = _yt_client()
     tags = [t.strip() for t in tags_csv.split(",") if t.strip()][:12]
@@ -743,8 +892,12 @@ def upload_unlisted(
     )
     resp = None
     while resp is None:
-        _, resp = req.next_chunk()
+        status, resp = req.next_chunk()
+        if status:
+            log.info("[upload] upload progress: %d%%",
+                     int(status.progress() * 100))
     vid_id = resp["id"]
+    log.info("[upload] uploaded: %s", vid_id)
     return vid_id, f"https://youtu.be/{vid_id}"
 
 
@@ -762,7 +915,7 @@ def _compress_preview(in_path: str, out_path: str = "preview_small.mp4") -> str:
             "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
             out_path,
         ],
-        check=True,
+        check=True, capture_output=True,
     )
     return out_path
 
@@ -813,6 +966,7 @@ def upload_preview(
     except Exception as exc:
         msg     = str(exc)
         blocked = "uploadLimitExceeded" in msg
+        log.warning("[upload] YT upload failed: %s", msg)
         link, host = _fallback_upload(video_path)
         return {
             "preview_video_id": None,
@@ -824,10 +978,10 @@ def upload_preview(
 
 
 def schedule_video(video_id: str, slot: str) -> str:
-    yt        = _yt_client()
-    tomorrow  = datetime.now(IST).date() + timedelta(days=1)
-    hour      = 16 if slot == "afternoon" else 9
-    ist_dt    = datetime(
+    yt       = _yt_client()
+    tomorrow = datetime.now(IST).date() + timedelta(days=1)
+    hour     = 16 if slot == "afternoon" else 9
+    ist_dt   = datetime(
         tomorrow.year, tomorrow.month, tomorrow.day, hour, 0, tzinfo=IST
     )
     publish_utc = ist_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -850,7 +1004,7 @@ def yt_delete(video_id: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Preview video lookup helpers
+# Helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_yt_id(text: str) -> str | None:
@@ -883,9 +1037,7 @@ def find_preview_id(
             f"https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments",
             params={"per_page": 100},
         )
-        for c in reversed(
-            r.json() if isinstance(r.json(), list) else []
-        ):
+        for c in reversed(r.json() if isinstance(r.json(), list) else []):
             vid = _extract_yt_id(c.get("body") or "")
             if vid:
                 return vid
@@ -895,7 +1047,7 @@ def find_preview_id(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Build preview (with retry loop)
+# Build preview loop
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _duration_score(d: float) -> float:
@@ -911,88 +1063,115 @@ def build_preview(
     issue_body: str,
     max_attempts: int = 3,
 ) -> tuple[dict | None, str]:
+    log.info("[build] starting build for topic=%r", topic)
     best: dict = {
         "path": None, "dur": None, "score": float("inf"),
-        "attempt": 0, "script": None, "seo": None,
+        "attempt": 0, "seo": None,
     }
 
     for attempt in range(1, max_attempts + 1):
-        log.info(
-            "Render attempt %d/%d for topic: %s", attempt, max_attempts, topic
-        )
+        log.info("[build] === ATTEMPT %d/%d ===", attempt, max_attempts)
 
+        # 1. Script
         try:
             script_text = generate_script(topic, user_prompt)
+            log.info("[build] script generated, length=%d", len(script_text))
         except Exception as exc:
-            log.error("Script gen attempt %d: %s", attempt, exc)
+            log.error("[build] script failed attempt %d: %s", attempt, exc)
             continue
 
         if "thank you for watching" not in script_text.lower():
             script_text = script_text.rstrip(" .!?,") + ". Thank you for watching."
 
+        # 2. SEO
         try:
             seo = generate_seo_package(topic, script_text)
+            log.info("[build] SEO generated: title=%r", seo.get("title", "")[:60])
         except Exception as exc:
-            log.warning("SEO gen attempt %d: %s", attempt, exc)
+            log.warning("[build] SEO failed attempt %d: %s", attempt, exc)
             seo = {
-                "title": f"{topic} #Shorts",
+                "title": f"{topic[:75]} #Shorts",
                 "description": (
-                    f"{topic}. Educational only, not medical advice."
+                    f"{topic}. Educational only, not medical advice.\n"
+                    "Like and subscribe for daily health tips."
                 ),
-                "tags_csv": "health,wellness,shorts",
+                "tags_csv": "health,wellness,shorts,healthy habits,fitness,tips",
             }
 
+        # 3. TTS
         voice_raw = f"voice_{attempt}.mp3"
         try:
             synthesize_speech(script_text, voice_raw, lang=TTS_LANG)
             voice, vdur = ensure_voice_in_range(voice_raw)
+            log.info("[build] TTS done, duration=%.2fs", vdur)
         except Exception as exc:
-            log.error("TTS attempt %d: %s", attempt, exc)
+            log.error("[build] TTS failed attempt %d: %s", attempt, exc)
             continue
 
+        # 4. B-roll
         try:
             broll = fetch_broll(topic, need=8)
+            log.info("[build] broll fetched: %d clips", len(broll))
         except Exception as exc:
-            log.error("B-roll attempt %d: %s", attempt, exc)
-            continue
+            log.error("[build] broll failed attempt %d: %s", attempt, exc)
+            broll = []
+
         if not broll:
-            log.warning("No b-roll on attempt %d.", attempt)
+            log.warning("[build] no broll on attempt %d, trying generic", attempt)
+            try:
+                broll = fetch_broll("healthy lifestyle fitness", need=8)
+                log.info("[build] generic broll: %d clips", len(broll))
+            except Exception as exc:
+                log.error("[build] generic broll also failed: %s", exc)
+                continue
+
+        if not broll:
+            log.error("[build] still no broll after fallback, skipping attempt %d", attempt)
             continue
 
+        # 5. Render
         temp_mp4  = f"temp_{attempt}.mp4"
         final_mp4 = f"short_{attempt}.mp4"
         try:
             dur = render_and_cap(broll, voice, temp_mp4, final_mp4)
+            log.info("[build] render done, duration=%.2fs", dur)
         except Exception as exc:
-            log.error("Render attempt %d: %s", attempt, exc)
+            log.error("[build] render failed attempt %d: %s\n%s",
+                      attempt, exc, traceback.format_exc())
             continue
 
         score = _duration_score(dur)
+        log.info("[build] score=%.2f (lower is better)", score)
         if score < best["score"]:
             best_path = f"best_{attempt}.mp4"
             shutil.copyfile(final_mp4, best_path)
-            best.update(
-                {
-                    "path": best_path,
-                    "dur": round(dur, 2),
-                    "score": score,
-                    "attempt": attempt,
-                    "script": script_text,
-                    "seo": seo,
-                }
-            )
+            best.update({
+                "path": best_path,
+                "dur": round(dur, 2),
+                "score": score,
+                "attempt": attempt,
+                "seo": seo,
+            })
 
         if TARGET_LOW <= dur < TARGET_HIGH:
+            log.info("[build] duration in target range, uploading")
             return _package_and_upload(
                 final_mp4, seo, topic, slot, issue_body,
                 attempt, dur, outside_target=False,
             )
 
+    # Upload best even if outside target
     if best["path"] and os.path.exists(best["path"]):
+        log.info(
+            "[build] uploading best candidate: dur=%.2fs score=%.2f",
+            best["dur"] or 0.0, best["score"],
+        )
         return _package_and_upload(
             best["path"], best["seo"], topic, slot, issue_body,
             best["attempt"], best["dur"] or 0.0, outside_target=True,
         )
+
+    log.error("[build] all %d attempts failed", max_attempts)
     return None, issue_body
 
 
@@ -1006,6 +1185,7 @@ def _package_and_upload(
     dur: float,
     outside_target: bool,
 ) -> tuple[dict, str]:
+    log.info("[upload] packaging and uploading %s", video_path)
     info = upload_preview(
         video_path, seo["title"], seo["description"], seo["tags_csv"]
     )
@@ -1038,20 +1218,16 @@ def _package_and_upload(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _post_preview_comment(
-    owner: str,
-    repo: str,
-    number: int,
-    meta: dict,
-    slot: str,
-    prefix: str = "",
+    owner: str, repo: str, number: int,
+    meta: dict, slot: str, prefix: str = "",
 ) -> None:
     blocked = (
-        "\n\u26a0\ufe0f YouTube upload limit reached. Preview hosted temporarily."
+        "\nNote: YouTube upload limit reached. Preview hosted temporarily."
         if meta.get("yt_upload_blocked") else ""
     )
     outside = (
-        f"\n\u26a0\ufe0f Duration {meta['duration_sec']}s is outside target "
-        f"35-58s. You can still approve."
+        f"\nNote: Duration {meta['duration_sec']}s is outside target 35-58s. "
+        "You can still approve."
         if meta.get("outside_target") else ""
     )
     body = (
@@ -1060,11 +1236,10 @@ def _post_preview_comment(
             f"Preview ready (attempt {meta['attempt']}, "
             f"{meta['duration_sec']}s)\n"
             f"{meta['preview_link']}{blocked}{outside}\n\n"
-            f"Reply:\n"
-            f"- `/approve-video` - schedule PRIVATE to auto-publish "
-            f"next day ({slot} slot)\n"
-            f"- `/reject-video` - delete preview and pick a new topic\n"
-            f"- `/regenerate-video` - rebuild the same topic\n\n"
+            "Reply:\n"
+            "- /approve-video to schedule for next-day publish\n"
+            "- /reject-video to delete preview and pick a new topic\n"
+            "- /regenerate-video to rebuild the same topic\n\n"
             f"<!-- preview_video_id: {meta.get('preview_video_id', '')} -->"
         )
     )
@@ -1077,18 +1252,14 @@ def _post_prompt_request(
     default = DEFAULT_SCRIPT_PROMPT_TEMPLATE.format(topic=topic)
     body = (
         f"Topic approved: {topic}\n\n"
-        f"Please provide your script prompt so I can write the video script.\n\n"
-        f"Option A - Use your own prompt:\n"
-        f"Reply with:\n"
-        f"/set-prompt your full prompt here\n\n"
-        f"Option B - Use the default template:\n"
-        f"Reply with exactly:\n"
-        f"/use-default-prompt\n\n"
-        f"Default prompt (copy, edit if needed, "
-        f"then reply with /set-prompt ...):\n\n"
-        f"{default}\n\n"
-        f"If no prompt is received within {PROMPT_REMINDER_HOURS} hour(s), "
-        f"a reminder will be posted."
+        "Please provide your script prompt so I can write the video script.\n\n"
+        "Option A - Use your own prompt:\n"
+        "Reply with: /set-prompt followed by your full prompt\n\n"
+        "Option B - Use the default template:\n"
+        "Reply with exactly: /use-default-prompt\n\n"
+        f"Default prompt for reference:\n\n{default}\n\n"
+        f"A reminder will be posted if no prompt is received within "
+        f"{PROMPT_REMINDER_HOURS} hour."
     )
     post_comment(owner, repo, number, body)
 
@@ -1102,9 +1273,7 @@ def _parse_topics_from_body(body: str) -> list[str]:
             out.append(m.group(2).strip())
     if not out:
         meta = get_metadata_from_issue_body(body) or {}
-        out  = [
-            str(t) for t in (meta.get("topics") or []) if str(t).strip()
-        ]
+        out  = [str(t) for t in (meta.get("topics") or []) if str(t).strip()]
     return out[:6]
 
 
@@ -1113,21 +1282,17 @@ def _parse_topics_from_body(body: str) -> list[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def handle_reject_topic(ctx: Ctx) -> None:
+    seeds = [
+        "The 4-7-8 breathing method that fixes insomnia in 7 days",
+        "3 morning habits that boost energy without caffeine",
+        "The gut bacteria mistake 90 percent of people make daily",
+        "Why you feel tired after 8 hours of sleep",
+        "The 2 minute desk stretch that fixes neck pain instantly",
+        "Why drinking water first thing in the morning changes everything",
+    ]
     try:
         from pytrends.request import TrendReq
-        pt = TrendReq(hl="en-IN", tz=330)
-        seeds = [
-            "how to wake up early",
-            "deep sleep techniques",
-            "gut health tips",
-            "morning energy routine",
-            "stress relief breathing",
-            "posture correction",
-            "intermittent fasting",
-            "cold shower benefits",
-            "brain health habits",
-            "back pain relief desk",
-        ]
+        pt    = TrendReq(hl="en-IN", tz=330)
         found: list[str] = []
         try:
             df = pt.realtime_trending_searches(pn="IN")
@@ -1140,11 +1305,7 @@ def handle_reject_topic(ctx: Ctx) -> None:
             pass
         options = list(dict.fromkeys(found + seeds))[:6]
     except Exception:
-        options = [
-            "The 4-7-8 breathing method that fixes insomnia in 7 days",
-            "3 morning habits that boost energy without caffeine",
-            "The gut bacteria mistake 90% of people make daily",
-        ]
+        options = seeds[:6]
 
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     meta["topics"] = options
@@ -1152,7 +1313,7 @@ def handle_reject_topic(ctx: Ctx) -> None:
     numbered = "\n".join(f"{i}) {t}" for i, t in enumerate(options, 1))
     new_body += (
         f"\n\nNew topic options:\n{numbered}\n\n"
-        f"Reply with /approve-topic 1 (or 2-6), or /custom-topic Your Topic"
+        "Reply with /approve-topic 1 (or 2-6), or /custom-topic Your Topic"
     )
     gh(
         "PATCH",
@@ -1165,7 +1326,7 @@ def handle_reject_topic(ctx: Ctx) -> None:
     post_comment(
         ctx.owner, ctx.repo, ctx.number,
         f"Fresh topic options:\n{numbered}\n\n"
-        f"Reply /approve-topic N or /custom-topic Your Topic",
+        "Reply /approve-topic N or /custom-topic Your Topic",
     )
 
 
@@ -1173,6 +1334,8 @@ def _start_after_topic(ctx: Ctx, topic: str) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     meta["topic"] = topic
     meta["prompt_requested_at"] = datetime.utcnow().isoformat()
+    # Remove stale prompt so user must confirm
+    meta.pop("user_prompt", None)
     new_body = set_metadata_in_issue_body(ctx.issue_body, meta)
     gh(
         "PATCH",
@@ -1246,6 +1409,7 @@ def handle_use_default_prompt(ctx: Ctx) -> None:
             "/custom-topic first.",
         )
         return
+    # Build prompt — topic is already a plain string, no backslash risk
     user_prompt = DEFAULT_SCRIPT_PROMPT_TEMPLATE.format(topic=topic)
     _run_build_with_prompt(ctx, user_prompt)
 
@@ -1261,7 +1425,9 @@ def _run_build_with_prompt(ctx: Ctx, user_prompt: str) -> None:
         )
         return
 
-    # Save prompt to metadata — store as plain key, not embedded in body text
+    log.info("[cmd] building preview for topic=%r", topic)
+
+    # Store prompt in metadata safely via json.dumps (handles all escaping)
     meta["user_prompt"] = user_prompt
     new_body = set_metadata_in_issue_body(ctx.issue_body, meta)
     gh(
@@ -1274,17 +1440,25 @@ def _run_build_with_prompt(ctx: Ctx, user_prompt: str) -> None:
     post_comment(
         ctx.owner, ctx.repo, ctx.number,
         f"Prompt received. Building video for: {topic}\n"
-        f"This may take 3-5 minutes...",
+        "This may take 5-10 minutes. Check the Actions tab for live logs.",
     )
 
     video_meta, new_body2 = build_preview(
         topic, user_prompt, ctx.slot, new_body, max_attempts=3
     )
     if not video_meta:
+        # Post detailed failure message
         post_comment(
             ctx.owner, ctx.repo, ctx.number,
-            "Tried 3 times but could not produce a valid preview. "
-            "Reply /regenerate-video, /new-topic, or /custom-topic Another Topic.",
+            "Could not produce a valid preview after 3 attempts.\n\n"
+            "Common causes:\n"
+            "1. gTTS (Google TTS) blocked on the runner IP\n"
+            "2. Pexels returned no clips for this topic\n"
+            "3. Render crash (check Actions logs for details)\n\n"
+            "What you can do:\n"
+            "- Reply /regenerate-video to try again\n"
+            "- Reply /custom-topic A Simpler Topic to try a different topic\n"
+            "- Reply /new-topic for fresh suggestions",
         )
         return
 
@@ -1336,13 +1510,13 @@ def handle_reject_video(ctx: Ctx) -> None:
     post_comment(
         ctx.owner, ctx.repo, ctx.number,
         f"{deletion_msg}\n\n"
-        f"Reply /new-topic for fresh options or /custom-topic Your Topic.",
+        "Reply /new-topic for fresh options or /custom-topic Your Topic.",
     )
 
 
 def handle_regenerate_video(ctx: Ctx) -> None:
-    meta_old  = get_metadata_from_issue_body(ctx.issue_body) or {}
-    topic     = meta_old.get("topic", "")
+    meta_old    = get_metadata_from_issue_body(ctx.issue_body) or {}
+    topic       = meta_old.get("topic", "")
     if not topic:
         post_comment(
             ctx.owner, ctx.repo, ctx.number,
@@ -1382,7 +1556,7 @@ def handle_regenerate_video(ctx: Ctx) -> None:
         post_comment(
             ctx.owner, ctx.repo, ctx.number,
             f"{deleted_msg}\n\nNo stored prompt found. "
-            f"Please provide your script prompt again.",
+            "Please provide your script prompt again.",
         )
         _post_prompt_request(ctx.owner, ctx.repo, ctx.number, topic)
         return
@@ -1426,8 +1600,7 @@ def handle_approve_video(ctx: Ctx) -> None:
         post_comment(
             ctx.owner, ctx.repo, ctx.number,
             "Preview is on a temporary host, not YouTube. "
-            "Please /regenerate-video to get a proper YouTube preview "
-            "before approving.",
+            "Please /regenerate-video to get a proper YouTube preview.",
         )
         return
 
@@ -1453,7 +1626,7 @@ def handle_approve_video(ctx: Ctx) -> None:
         ctx.owner, ctx.repo, ctx.number,
         f"Scheduled: {link}\n"
         f"Publishes at (IST): {ist_display}\n\n"
-        f"Closing this issue.",
+        "Closing this issue.",
     )
     remove_label(ctx.owner, ctx.repo, ctx.number, "await-video-approval")
     gh(
@@ -1464,7 +1637,7 @@ def handle_approve_video(ctx: Ctx) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Dispatch table
+# Dispatch
 # ══════════════════════════════════════════════════════════════════════════════
 
 _COMMANDS: list[tuple[str, object]] = [
@@ -1493,17 +1666,19 @@ def safe_main() -> None:
         log.info("Ignoring comment from non-collaborator/owner.")
         return
 
-    owner, repo = REPO.split("/", 1)
-    ctx         = Ctx(event, owner, repo)
+    owner, repo   = REPO.split("/", 1)
+    ctx           = Ctx(event, owner, repo)
     comment_lower = ctx.comment_body.lower()
+
+    log.info("[dispatch] comment=%r", ctx.comment_body[:80])
 
     for prefix, handler in _COMMANDS:
         if comment_lower.startswith(prefix):
-            log.info("Dispatching command: %s", prefix)
+            log.info("[dispatch] matched command: %s", prefix)
             handler(ctx)
             return
 
-    log.info("No matching command in comment: %r", ctx.comment_body[:80])
+    log.info("[dispatch] no matching command")
 
 
 def main() -> None:
@@ -1525,7 +1700,8 @@ def main() -> None:
                 )
             post_comment(
                 owner, repo, number,
-                f"Error: {exc}{note}\n```\n{traceback.format_exc()}\n```",
+                f"Error: {exc}{note}\n\n"
+                f"```\n{traceback.format_exc()}\n```",
             )
         except Exception as inner:
             log.error("Could not post error comment: %s", inner)
