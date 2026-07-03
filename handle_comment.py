@@ -75,26 +75,35 @@ PREVIEW_MAX = 57.3
 SAFE_TAGS   = ["health", "wellness", "habits", "selfcare", "sleep", "hydration"]
 
 # ── Default script prompt ─────────────────────────────────────────────────────
+# The prompt is extremely strict.
+# {topic} is the only placeholder — replaced at call time via .format().
 DEFAULT_SCRIPT_PROMPT_TEMPLATE = (
-    "You are a viral YouTube Shorts scriptwriter specializing in health content.\n\n"
-    "Write a script for a YouTube Short on the topic: {topic}\n\n"
-    "STRICT OUTPUT RULES — violating any rule means your response is rejected:\n"
-    "1. Output ONLY the spoken words of the script. Nothing else whatsoever.\n"
-    "2. NO labels, NO section headers, NO stage directions, NO parentheses.\n"
-    "3. NO meta-commentary like 'Here is the script' or 'Script:' or 'Sure!'.\n"
-    "4. NO emojis, NO hashtags, NO markdown formatting of any kind.\n"
-    "5. NO introductory sentences about what you are going to write.\n"
-    "6. Start the very first word of the script immediately — mid-thought if needed.\n"
-    "7. The script must be 130 to 150 words when counted. Not more, not less.\n"
-    "8. End the script with exactly one call to action sentence.\n\n"
-    "Script structure to follow internally (never write these labels out):\n"
-    "- Hook: shocking stat, myth-bust, or bold question. No greetings.\n"
-    "- Pain point: name the relatable problem the viewer has right now.\n"
-    "- Reveal: surprising cause or myth-busting fact.\n"
-    "- Tips: 2 to 3 punchy actionable tips, max 8 words per sentence.\n"
-    "- Loop: callback to the hook or a final twist.\n"
-    "- CTA: one natural sentence asking to follow, save, or comment.\n\n"
-    "Begin the script now:"
+    "Write a spoken voiceover script for a 55-second YouTube Short "
+    "about this topic: {topic}\n\n"
+    "Your response must contain ONLY the spoken words — nothing else at all.\n"
+    "Do NOT write any of the following:\n"
+    "- Your name or any greeting\n"
+    "- Phrases like 'Here is the script', 'Sure!', 'Of course', 'Let me', "
+    "'The user wants', 'Script:', 'Voiceover:', 'Hook:', 'CTA:'\n"
+    "- Section labels or headers of any kind\n"
+    "- Parenthetical directions like (pause) or (cut to)\n"
+    "- Emojis or hashtags\n"
+    "- Any sentence that talks about what you are about to write\n"
+    "- Any sentence that talks about the topic itself as a topic\n\n"
+    "The script MUST follow this flow without ever labelling the sections:\n"
+    "1. Start with a single bold surprising fact or question that grabs "
+    "attention immediately. Do not start with 'Did you know'.\n"
+    "2. Follow with a relatable problem or situation the viewer recognises.\n"
+    "3. Reveal a surprising truth or little-known fact about the topic.\n"
+    "4. Give exactly 3 short actionable tips or facts, each in one sentence "
+    "of at most 10 words.\n"
+    "5. End with a single complete sentence that calls the viewer to follow "
+    "or save the video.\n\n"
+    "The script must be between 120 and 150 words total.\n"
+    "Every sentence must be complete and end with a full stop or "
+    "exclamation mark.\n"
+    "The last sentence must be a complete call to action.\n"
+    "Write the script now, starting with the first spoken word:"
 )
 
 PROMPT_REMINDER_HOURS = 1
@@ -160,95 +169,220 @@ def _build_model_list() -> list[str]:
     return ordered[:12]
 
 
+# ── Patterns that indicate the LLM leaked meta-commentary ─────────────────────
+_META_LINE_PATTERNS = [
+    # Preamble phrases at the start of a line
+    re.compile(
+        r"^(here(\s+is|\s*'s)\s+(the\s+)?(script|voiceover|short|video)|"
+        r"sure[!,.]|of\s+course[!,.]|absolutely[!,.]|"
+        r"let\s+me\s+|i\s+will\s+|i\s+'ll\s+|"
+        r"the\s+(user|viewer|topic|following)|"
+        r"below\s+is|here\s+you\s+go|"
+        r"as\s+requested|certainly[!,.])",
+        re.I,
+    ),
+    # Section label lines: "Hook:", "CTA:", "Tip 1:", etc.
+    re.compile(
+        r"^(hook|pain\s*point|reveal|tip\s*\d*|cta|call\s+to\s+action|"
+        r"script|voiceover|section|part\s*\d*|intro|outro|"
+        r"loop|closing|opening)\s*[:\-–]",
+        re.I,
+    ),
+    # Markdown headers
+    re.compile(r"^#{1,6}\s+", re.I),
+    # Lines that are entirely inside brackets or parentheses
+    re.compile(r"^\[.*\]$", re.I),
+    re.compile(r"^\(.*\)$", re.I),
+    # Separator lines
+    re.compile(r"^[-=*_]{3,}$"),
+    # Lines talking about the script/topic as a meta object
+    re.compile(
+        r"(the\s+user\s+wants|youtube\s+shorts?\s+script\s+(about|for|on)|"
+        r"write\s+a\s+script|this\s+script\s+is|the\s+topic\s+is|"
+        r"for\s+this\s+script|in\s+this\s+video\s+we\s+will\s+write)",
+        re.I,
+    ),
+]
+
+# Inline prefixes to strip from the beginning of the first line
+_INLINE_PREFIX_RE = re.compile(
+    r"^(here(\s+is|\s*'s)\s+(the\s+)?(script|voiceover)[:\s]*|"
+    r"sure[!,.]?\s*|of\s+course[!,.]?\s*|absolutely[!,.]?\s*|"
+    r"script\s*:\s*|voiceover\s*:\s*)",
+    re.I,
+)
+
+
 def _clean_script_output(raw: str) -> str:
     """
-    Strip any preamble/postamble the LLM adds despite instructions.
-    Removes lines that look like meta-commentary rather than spoken script.
+    Remove any meta-commentary the LLM outputs despite strict instructions.
+    Returns only the spoken script lines joined into a single paragraph.
     """
     lines = raw.strip().splitlines()
-    cleaned: list[str] = []
-    skip_patterns = [
-        r"(?i)^(here\s+is|here'?s|sure[,!]?|of course|absolutely|"
-        r"script:|voiceover:|spoken script:|output:|below is|"
-        r"the following|certainly)",
-        r"(?i)^(hook|pain point|reveal|tip|cta|call to action|"
-        r"loop|section|part)\s*[:\-–]",
-        r"(?i)^\*{1,3}(hook|pain|reveal|tip|cta|loop)\*{1,3}",
-        r"(?i)^---+$",
-        r"(?i)^\[.*\]$",
-        r"(?i)^\(.*\)$",
-    ]
-    compiled = [re.compile(p) for p in skip_patterns]
+    kept: list[str] = []
+
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
-        if any(p.match(stripped) for p in compiled):
+        # Skip lines matching any meta pattern
+        if any(p.search(stripped) for p in _META_LINE_PATTERNS):
+            log.debug("[clean] dropped meta line: %r", stripped[:80])
             continue
-        cleaned.append(stripped)
+        kept.append(stripped)
 
-    result = " ".join(cleaned).strip()
-    # Remove leading meta phrases inline too
-    result = re.sub(
-        r"(?i)^(here is (the )?script[:\s]*|"
-        r"here'?s (the )?script[:\s]*|"
-        r"sure[,!]?\s*here[:\s]*|"
-        r"of course[,!]?\s*)",
-        "",
-        result,
-    ).strip()
-    return result
+    if not kept:
+        return raw.strip()
+
+    # Join all kept lines into a single flowing paragraph
+    text = " ".join(kept)
+
+    # Strip inline prefix from the very start
+    text = _INLINE_PREFIX_RE.sub("", text).strip()
+
+    # Remove any leading punctuation artifacts
+    text = re.sub(r"^[:\-–\s]+", "", text).strip()
+
+    return text
+
+
+def _is_script_complete(text: str) -> bool:
+    """
+    Check that the script ends with a complete sentence.
+    A complete sentence ends with . ! or ?
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return stripped[-1] in ".!?"
+
+
+def _ensure_complete_ending(text: str) -> str:
+    """
+    If the script does not end with a complete sentence punctuation,
+    append a standard CTA to close it properly.
+    """
+    text = text.strip()
+    if not text:
+        return text
+    if text[-1] not in ".!?":
+        # Find the last complete sentence and truncate after it
+        last_end = max(
+            text.rfind("."),
+            text.rfind("!"),
+            text.rfind("?"),
+        )
+        if last_end > len(text) // 2:
+            # There is a complete sentence in the second half — truncate there
+            text = text[: last_end + 1].strip()
+        else:
+            # No good truncation point — just add a period
+            text = text + "."
+    # Ensure ends with a CTA-style closing if very abrupt
+    last_sentence = re.split(r"[.!?]", text)
+    last_sentence = [s.strip() for s in last_sentence if s.strip()]
+    if last_sentence:
+        last = last_sentence[-1].lower()
+        # If the last sentence is suspiciously short (< 4 words) it may be cut off
+        if len(last.split()) < 4:
+            text = text.rstrip(".!?")
+            # Remove the incomplete last fragment
+            for punct in [".", "!", "?"]:
+                idx = text.rfind(punct)
+                if idx > len(text) // 2:
+                    text = text[: idx + 1].strip()
+                    break
+    return text
 
 
 def generate_script(topic: str, user_prompt: str) -> str:
+    """
+    Generate script using Groq LLM.
+    Enforces clean output via system message + post-processing.
+    Retries if output is incomplete or contains meta-commentary.
+    """
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY secret.")
+
     models   = _build_model_list()
-    log.info("[script] model list: %s", models[:5])
+    log.info("[script] models: %s", models[:5])
     last_err: Exception | None = None
+
+    system_msg = (
+        "You are a voiceover artist reading a script aloud. "
+        "You only ever output the exact spoken words. "
+        "You never output labels, headers, preamble, meta-commentary, "
+        "or any text that would not be spoken aloud. "
+        "You never mention that you are writing a script. "
+        "You never mention the user, the topic name as a topic, "
+        "or YouTube Shorts as a format. "
+        "Every response you give starts with the very first spoken word "
+        "of the content and ends with the last spoken word. "
+        "Every sentence you write is complete and ends with punctuation."
+    )
+
     for model in models:
         try:
-            log.info("[script] trying model: %s", model)
+            log.info("[script] trying: %s", model)
             r = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 json={
                     "model": model,
                     "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You output ONLY the raw spoken script text. "
-                                "No labels, no headers, no preamble, no commentary. "
-                                "Start with the first spoken word immediately."
-                            ),
-                        },
-                        {"role": "user", "content": user_prompt},
+                        {"role": "system", "content": system_msg},
+                        {"role": "user",   "content": user_prompt},
                     ],
-                    "temperature": 0.85,
+                    "temperature": 0.80,
+                    "max_tokens": 400,
                 },
                 timeout=120,
             )
-            if r.status_code == 200:
-                content = r.json()["choices"][0]["message"]["content"].strip()
-                if content:
-                    content = _clean_script_output(content)
-                    log.info(
-                        "[script] success with %s, length=%d words=%d",
-                        model, len(content), len(content.split()),
-                    )
-                    return content
-                last_err = RuntimeError(f"Model {model} returned empty content.")
-            else:
+            if r.status_code != 200:
                 msg = r.json().get("error", {}).get("message", r.text[:200])
                 last_err = RuntimeError(
                     f"Model {model} HTTP {r.status_code}: {msg}"
                 )
                 log.warning("[script] %s", last_err)
+                continue
+
+            raw = r.json()["choices"][0]["message"]["content"].strip()
+            if not raw:
+                last_err = RuntimeError(f"Model {model} returned empty.")
+                continue
+
+            # Clean meta-commentary
+            cleaned = _clean_script_output(raw)
+            log.info(
+                "[script] raw=%d chars cleaned=%d chars words=%d",
+                len(raw), len(cleaned), len(cleaned.split()),
+            )
+
+            # Ensure the script is complete
+            cleaned = _ensure_complete_ending(cleaned)
+
+            # Word count check — must be at least 80 words to be usable
+            word_count = len(cleaned.split())
+            if word_count < 80:
+                log.warning(
+                    "[script] model %s produced only %d words, retrying",
+                    model, word_count,
+                )
+                last_err = RuntimeError(
+                    f"Model {model} produced too few words ({word_count})."
+                )
+                continue
+
+            log.info(
+                "[script] success: model=%s words=%d", model, word_count
+            )
+            return cleaned
+
         except Exception as exc:
             last_err = exc
             log.warning("[script] model %s exception: %s", model, exc)
-    raise last_err or RuntimeError("All Groq models failed.")
+
+    raise last_err or RuntimeError("All Groq models failed to generate a script.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -289,7 +423,9 @@ def _try_espeak(text: str, out_path: str, lang: str) -> bool:
         )
         log.info("[tts] espeak returncode=%d", result.returncode)
         if result.returncode != 0:
-            log.warning("[tts] espeak stderr: %s", result.stderr.decode()[:300])
+            log.warning(
+                "[tts] espeak stderr: %s", result.stderr.decode()[:300]
+            )
             return False
         if not os.path.exists(wav) or os.path.getsize(wav) < 512:
             return False
@@ -308,9 +444,9 @@ def _try_espeak(text: str, out_path: str, lang: str) -> bool:
 def synthesize_speech(text: str, out_path: str, lang: str = "en") -> str:
     """
     Try gTTS (with retry) -> espeak-ng.
-    NO speed/tempo adjustment — use natural TTS pace as-is.
+    NO speed or tempo adjustment — natural TTS pace only.
     """
-    log.info("[tts] synthesize: text=%d chars out=%s", len(text), out_path)
+    log.info("[tts] synthesize: %d chars -> %s", len(text), out_path)
     if _try_gtts_with_retry(text, out_path, lang, retries=3):
         return out_path
     if _try_espeak(text, out_path, lang):
@@ -322,7 +458,6 @@ def synthesize_speech(text: str, out_path: str, lang: str = "en") -> str:
 
 
 def get_audio_duration(path: str) -> float:
-    """Return duration in seconds without loading full audio into memory."""
     try:
         a   = AudioFileClip(path)
         dur = float(a.duration)
@@ -333,8 +468,8 @@ def get_audio_duration(path: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Captions (faster-whisper → SRT → burn with ffmpeg subtitles filter)
-# Exact same style as original repo: yellow text, black outline, bottom-center
+# Captions (faster-whisper → SRT → burn)
+# Original style: yellow text, black outline, bottom-center, 12pt
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _fmt_time(t: float) -> str:
@@ -346,10 +481,6 @@ def _fmt_time(t: float) -> str:
 
 
 def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
-    """
-    Use faster-whisper with word-level timestamps to produce 2-3 word chunks.
-    Identical logic to original repo.
-    """
     log.info("[srt] transcribing %s", audio_path)
     try:
         a         = AudioFileClip(audio_path)
@@ -362,7 +493,6 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
 
     try:
         from faster_whisper import WhisperModel
-
         model_name = os.getenv("WHISPER_MODEL", "tiny.en")
         log.info("[srt] loading WhisperModel: %s", model_name)
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
@@ -388,7 +518,7 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
         if not words:
             raise RuntimeError("No word-level timestamps from whisper.")
 
-        # Group into 2-3 word chunks (same logic as original)
+        # Group into 2-3 word chunks (original logic)
         chunks: list[tuple[str, float, float]] = []
         i = 0
         while i < len(words):
@@ -411,9 +541,8 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
         for text, w_start, w_end in chunks:
             start = max(cur_t, w_start)
             end   = max(start + min_dur, w_end)
-            if audio_dur is not None:
-                start = min(start, max(0.0, audio_dur - 0.01))
-                end   = min(end, audio_dur)
+            start = min(start, max(0.0, audio_dur - 0.01))
+            end   = min(end, audio_dur)
             if end <= start:
                 continue
             out.append(
@@ -421,7 +550,7 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
             )
             idx  += 1
             cur_t = end + gap
-            if audio_dur is not None and cur_t >= audio_dur:
+            if cur_t >= audio_dur:
                 break
 
         if not out:
@@ -432,22 +561,23 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
         with open(srt_path, "w", encoding="utf-8") as f:
             f.writelines(out)
 
-        log.info("[srt] wrote %d subtitle chunks to %s", len(out), srt_path)
+        log.info("[srt] wrote %d chunks to %s", len(out), srt_path)
         return True
 
     except Exception as exc:
         log.warning("[srt] transcription failed: %s — writing blank srt", exc)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(
-                f"1\n{_fmt_time(0.0)} --> {_fmt_time(max(0.8, audio_dur))}\n \n\n"
+                f"1\n{_fmt_time(0.0)} --> "
+                f"{_fmt_time(max(0.8, audio_dur))}\n \n\n"
             )
         return False
 
 
 def _ffmpeg_escape(s: str) -> str:
     """
-    Escape a string for use inside an ffmpeg -vf filter value.
-    Matches the original repo's _ffmpeg_escape function exactly.
+    Escape string for ffmpeg -vf filter value.
+    Exact same function as original repo.
     """
     return (
         s.replace("\\", "\\\\")
@@ -459,20 +589,16 @@ def _ffmpeg_escape(s: str) -> str:
 
 def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
     """
-    Burn subtitles using ffmpeg subtitles filter.
-    Style matches original repo exactly:
-    - Yellow text (#00FFFF in ASS = BGR so 0000FFFF = yellow)
-    - Black outline/border
+    Burn captions using original repo style:
+    - Yellow text (PrimaryColour=&H0000FFFF&)
+    - Black outline (OutlineColour=&H00000000&)
     - Bottom-center (Alignment=2)
-    - Small font (12pt)
+    - 12pt DejaVu Sans Bold
     - MarginV=96
-    Original _ffmpeg_escape used for the filter string.
     """
-    # Use absolute path to avoid any working-directory issues
     srt_abs = str(Path(srt_path).resolve())
-    log.info("[captions] burning srt=%s into %s -> %s", srt_abs, in_mp4, out_mp4)
+    log.info("[captions] srt=%s in=%s out=%s", srt_abs, in_mp4, out_mp4)
 
-    # Exact same style string as original repo
     style = (
         "Fontname=DejaVu Sans,Fontsize=12,Bold=1,"
         "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
@@ -484,7 +610,7 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
         f":force_style={_ffmpeg_escape(style)}"
     )
 
-    log.info("[captions] vf filter: %s", vf[:200])
+    log.info("[captions] vf=%s", vf[:200])
 
     result = subprocess.run(
         [
@@ -498,22 +624,21 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
         timeout=300,
     )
 
-    log.info("[captions] ffmpeg returncode=%d", result.returncode)
+    log.info("[captions] returncode=%d", result.returncode)
     if result.returncode != 0:
         stderr_text = result.stderr.decode(errors="replace")
         log.error("[captions] ffmpeg stderr:\n%s", stderr_text[:1000])
-        # Do NOT silently copy — raise so the caller knows captions failed
         raise RuntimeError(
-            f"burn_captions ffmpeg failed (rc={result.returncode}):\n"
+            f"burn_captions failed (rc={result.returncode}):\n"
             f"{stderr_text[:500]}"
         )
 
     size = os.path.getsize(out_mp4) if os.path.exists(out_mp4) else 0
-    log.info("[captions] output size=%d bytes", size)
+    log.info("[captions] output=%d bytes", size)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Smart cover crop (face-aware)
+# Smart cover crop
 # ══════════════════════════════════════════════════════════════════════════════
 
 _cascade = None
@@ -536,7 +661,7 @@ def smart_cover_crop(clip, target_w: int = 1080, target_h: int = 1920):
     resized = clip.resize(scale)
     cx, cy  = resized.w / 2, resized.h / 2
     try:
-        t     = min(
+        t = min(
             max(0.0, 0.5 * resized.duration),
             max(0.0, resized.duration - 0.05),
         )
@@ -610,8 +735,7 @@ def fetch_broll(query: str, need: int = 6) -> list[str]:
             if r.status_code != 200:
                 return []
             videos = r.json().get("videos", [])
-            log.info("[broll] query=%r found %d videos", q, len(videos))
-            links = []
+            links  = []
             for v in videos:
                 files = sorted(
                     v.get("video_files", []),
@@ -622,6 +746,7 @@ def fetch_broll(query: str, need: int = 6) -> list[str]:
                     if f.get("height", 0) >= 720 and f.get("link"):
                         links.append(f["link"])
                         break
+            log.info("[broll] query=%r links=%d", q, len(links))
             return links
         except RuntimeError:
             raise
@@ -664,7 +789,7 @@ def _validate_bgm_url(url: str) -> None:
 
 
 def ensure_bgm_track(duration: float, out_path: str = "bgm_src.m4a") -> str:
-    log.info("[bgm] generating track for %.2fs", duration)
+    log.info("[bgm] duration=%.2fs", duration)
     if BGM_URL:
         try:
             _validate_bgm_url(BGM_URL)
@@ -760,7 +885,7 @@ def _download_broll(urls: list[str], tmp: Path) -> list[str]:
                 log.warning("[dl] clip %d too small, skipping", i)
         except Exception as exc:
             log.warning("[dl] clip %d failed: %s", i, exc)
-    log.info("[dl] downloaded %d/%d clips", len(local), len(urls))
+    log.info("[dl] downloaded %d/%d", len(local), len(urls))
     return local
 
 
@@ -772,45 +897,31 @@ def render_and_cap(
     target_w: int = 1080,
     target_h: int = 1920,
 ) -> float:
-    """
-    Render video:
-    1. Download b-roll
-    2. Cover-crop each clip to 1080x1920
-    3. Concatenate and attach voice audio (trimmed to voice duration)
-    4. Write temp_mp4
-    5. Transcribe voice -> SRT (2-3 word chunks, whisper word timestamps)
-    6. Burn captions (yellow, bottom-center, 12pt, original style)
-    7. Mix BGM at low volume
-    8. Safety trim if >= 58s
-    """
-    log.info("[render] starting: %d broll urls", len(broll_urls))
+    log.info("[render] %d broll urls", len(broll_urls))
     tmp   = Path(tempfile.mkdtemp())
     local = _download_broll(broll_urls, tmp)
 
     if not local:
         raise RuntimeError("No b-roll clips downloaded.")
 
-    raw_clips: list[VideoFileClip] = []
-    cropped:   list              = []
+    raw_clips:  list[VideoFileClip] = []
+    cropped:    list                = []
     voice_clip: AudioFileClip | None = None
     merged                           = None
 
     try:
         for p in local:
             try:
-                log.info("[render] loading: %s", p)
                 c = VideoFileClip(p)
-                log.info("[render] loaded: %.2fs %dx%d", c.duration, c.w, c.h)
+                log.info("[render] clip: %.2fs %dx%d", c.duration, c.w, c.h)
                 raw_clips.append(c)
                 take = min(8, max(4, int(c.duration)))
                 comp = smart_cover_crop(
-                    c.subclip(0, take),
-                    target_w=target_w,
-                    target_h=target_h,
+                    c.subclip(0, take), target_w=target_w, target_h=target_h
                 ).set_audio(None)
                 cropped.append(comp)
             except Exception as exc:
-                log.warning("[render] failed to load clip %s: %s", p, exc)
+                log.warning("[render] clip load failed %s: %s", p, exc)
                 continue
 
         if not cropped:
@@ -818,19 +929,20 @@ def render_and_cap(
 
         log.info("[render] concatenating %d clips", len(cropped))
         merged = concatenate_videoclips(cropped, method="compose")
-        log.info("[render] merged=%.2fs", merged.duration)
 
         voice_clip = AudioFileClip(voice_mp3)
         voice_dur  = voice_clip.duration
-        log.info("[render] voice=%.2fs", voice_dur)
+        log.info("[render] voice=%.2fs merged=%.2fs", voice_dur, merged.duration)
 
-        # Clip to voice duration (natural pace, no speed change)
         eps = 1e-2
-        end = max(0.2, min(PREVIEW_MAX, min(merged.duration, voice_dur) - eps))
+        end = max(
+            0.2,
+            min(PREVIEW_MAX, min(merged.duration, voice_dur) - eps),
+        )
         log.info("[render] end=%.2fs", end)
 
         out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
-        log.info("[render] writing temp video: %s", temp_mp4)
+        log.info("[render] writing temp: %s", temp_mp4)
         out_clip.write_videofile(
             temp_mp4,
             fps=30,
@@ -843,7 +955,7 @@ def render_and_cap(
             ffmpeg_params=["-pix_fmt", "yuv420p"],
         )
         out_clip.close()
-        log.info("[render] temp video written OK")
+        log.info("[render] temp written OK")
 
     finally:
         for c in raw_clips:
@@ -860,10 +972,10 @@ def render_and_cap(
             except Exception: pass
         shutil.rmtree(tmp, ignore_errors=True)
 
-    # ── Captions ──────────────────────────────────────────────────────────────
+    # Captions
     srt_path = "cap.srt"
     srt_ok   = transcribe_to_srt(voice_mp3, srt_path, lang=TTS_LANG)
-    log.info("[render] SRT generated: ok=%s", srt_ok)
+    log.info("[render] srt ok=%s", srt_ok)
 
     subbed = "subbed.mp4"
     try:
@@ -871,43 +983,42 @@ def render_and_cap(
         log.info("[render] captions burned OK")
     except Exception as exc:
         log.error("[render] caption burn failed: %s", exc)
-        # Try once more with a fresh minimal SRT
         try:
-            log.info("[render] retrying captions with minimal SRT")
+            log.info("[render] retrying with minimal SRT")
             v_dur = get_audio_duration(voice_mp3)
             with open(srt_path, "w", encoding="utf-8") as f:
                 f.write(
-                    f"1\n{_fmt_time(0.0)} --> {_fmt_time(max(1.0, v_dur - 0.5))}\n"
+                    f"1\n{_fmt_time(0.0)} --> "
+                    f"{_fmt_time(max(1.0, v_dur - 0.5))}\n"
                     "Watch till end\n\n"
                 )
             burn_captions(temp_mp4, srt_path, subbed)
-            log.info("[render] minimal SRT captions burned OK")
+            log.info("[render] minimal SRT captions OK")
         except Exception as exc2:
-            log.error("[render] minimal caption burn also failed: %s", exc2)
+            log.error("[render] minimal caption also failed: %s", exc2)
             log.warning("[render] proceeding without captions")
             shutil.copyfile(temp_mp4, subbed)
 
-    # ── BGM ───────────────────────────────────────────────────────────────────
+    # BGM
     bgm_out = "with_bgm.mp4"
     try:
         add_bgm(subbed, bgm_out, end)
-        log.info("[render] BGM mixed OK")
+        log.info("[render] BGM OK")
     except Exception as exc:
         log.warning("[render] BGM failed: %s — using without BGM", exc)
         shutil.copyfile(subbed, bgm_out)
 
-    # ── Safety trim ───────────────────────────────────────────────────────────
+    # Safety trim
     v = VideoFileClip(bgm_out)
     d = v.duration
     v.close()
-    log.info("[render] pre-trim duration=%.2fs", d)
+    log.info("[render] pre-trim=%.2fs", d)
     out_path = bgm_out
     if d >= 58.0:
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", bgm_out,
-                "-t", str(PREVIEW_MAX),
-                "-c", "copy", "trim_final.mp4",
+                "-t", str(PREVIEW_MAX), "-c", "copy", "trim_final.mp4",
             ],
             check=False, capture_output=True,
         )
@@ -918,7 +1029,7 @@ def render_and_cap(
     v2 = VideoFileClip(final_mp4)
     d2 = v2.duration
     v2.close()
-    log.info("[render] final duration=%.2fs file=%s", d2, final_mp4)
+    log.info("[render] done=%.2fs file=%s", d2, final_mp4)
     return d2
 
 
@@ -969,7 +1080,7 @@ def _yt_client():
 def upload_unlisted(
     video_path: str, title: str, description: str, tags_csv: str
 ) -> tuple[str, str]:
-    log.info("[upload] uploading %s as unlisted", video_path)
+    log.info("[upload] %s as unlisted", video_path)
     _, _, MediaFileUpload = _ensure_google()
     yt   = _yt_client()
     tags = [t.strip() for t in tags_csv.split(",") if t.strip()][:12]
@@ -1029,7 +1140,11 @@ def _fallback_upload(video_path: str) -> tuple[str | None, str | None]:
             "0x0.st",
             lambda p: requests.post(
                 "https://0x0.st",
-                files={"file": (os.path.basename(p), open(p, "rb"), "video/mp4")},
+                files={
+                    "file": (
+                        os.path.basename(p), open(p, "rb"), "video/mp4"
+                    )
+                },
                 timeout=180,
             ),
         ),
@@ -1173,21 +1288,28 @@ def build_preview(
         try:
             script_text = generate_script(topic, user_prompt)
             log.info(
-                "[build] script: %d chars, %d words",
+                "[build] script: %d chars %d words",
                 len(script_text), len(script_text.split()),
             )
         except Exception as exc:
             log.error("[build] script attempt %d failed: %s", attempt, exc)
             continue
 
-        # Ensure sign-off
+        # Ensure complete ending
+        script_text = _ensure_complete_ending(script_text)
+
+        # Add sign-off if missing
         if "thank you for watching" not in script_text.lower():
-            script_text = script_text.rstrip(" .!?,") + ". Thank you for watching."
+            if not script_text.endswith((".", "!", "?")):
+                script_text += "."
+            script_text += " Follow for more daily health tips."
+
+        log.info("[build] final script: %r", script_text[:120])
 
         # 2. SEO
         try:
             seo = generate_seo_package(topic, script_text)
-            log.info("[build] SEO: title=%r", seo.get("title", "")[:60])
+            log.info("[build] SEO title=%r", seo.get("title", "")[:60])
         except Exception as exc:
             log.warning("[build] SEO attempt %d failed: %s", attempt, exc)
             seo = {
@@ -1199,12 +1321,12 @@ def build_preview(
                 "tags_csv": "health,wellness,shorts,healthy habits,fitness,tips",
             }
 
-        # 3. TTS — natural pace, no speed adjustment
+        # 3. TTS — natural pace, no speed change
         voice_raw = f"voice_{attempt}.mp3"
         try:
             synthesize_speech(script_text, voice_raw, lang=TTS_LANG)
             voice_dur = get_audio_duration(voice_raw)
-            log.info("[build] TTS done: %.2fs", voice_dur)
+            log.info("[build] TTS: %.2fs", voice_dur)
         except Exception as exc:
             log.error("[build] TTS attempt %d failed: %s", attempt, exc)
             continue
@@ -1215,7 +1337,7 @@ def build_preview(
             broll = fetch_broll(topic, need=6)
             log.info("[build] broll: %d clips", len(broll))
         except Exception as exc:
-            log.warning("[build] broll attempt %d failed: %s", attempt, exc)
+            log.warning("[build] broll attempt %d: %s", attempt, exc)
 
         if not broll:
             log.warning("[build] trying generic broll fallback")
@@ -1226,7 +1348,7 @@ def build_preview(
                 log.error("[build] generic broll failed: %s", exc)
 
         if not broll:
-            log.error("[build] no broll available, skipping attempt %d", attempt)
+            log.error("[build] no broll, skipping attempt %d", attempt)
             continue
 
         # 5. Render
@@ -1263,10 +1385,9 @@ def build_preview(
                 attempt, dur, outside_target=False,
             )
 
-    # Upload best candidate even if outside target
     if best["path"] and os.path.exists(best["path"]):
         log.info(
-            "[build] uploading best candidate: dur=%.2fs score=%.2f",
+            "[build] uploading best: dur=%.2fs score=%.2f",
             best["dur"] or 0.0, best["score"],
         )
         return _package_and_upload(
@@ -1520,7 +1641,7 @@ def _run_build_with_prompt(ctx: Ctx, user_prompt: str) -> None:
         )
         return
 
-    log.info("[cmd] building preview: topic=%r", topic)
+    log.info("[cmd] building: topic=%r", topic)
 
     meta["user_prompt"] = user_prompt
     new_body = set_metadata_in_issue_body(ctx.issue_body, meta)
@@ -1545,7 +1666,7 @@ def _run_build_with_prompt(ctx: Ctx, user_prompt: str) -> None:
             ctx.owner, ctx.repo, ctx.number,
             "Could not produce a valid preview after 3 attempts.\n\n"
             "Common causes:\n"
-            "1. gTTS blocked on runner IP (Google TTS)\n"
+            "1. gTTS blocked on runner IP\n"
             "2. Pexels returned no clips\n"
             "3. Render crash\n\n"
             "Check the Actions tab logs for the exact error.\n\n"
@@ -1568,7 +1689,9 @@ def _run_build_with_prompt(ctx: Ctx, user_prompt: str) -> None:
 
 
 def handle_reject_video(ctx: Ctx) -> None:
-    vid_id       = find_preview_id(ctx.owner, ctx.repo, ctx.number, ctx.issue_body)
+    vid_id       = find_preview_id(
+        ctx.owner, ctx.repo, ctx.number, ctx.issue_body
+    )
     deletion_msg = ""
     if vid_id:
         try:
@@ -1614,7 +1737,7 @@ def handle_regenerate_video(ctx: Ctx) -> None:
         )
         return
     user_prompt = meta_old.get("user_prompt", "")
-    prev_vid = meta_old.get("preview_video_id") or find_preview_id(
+    prev_vid    = meta_old.get("preview_video_id") or find_preview_id(
         ctx.owner, ctx.repo, ctx.number, ctx.issue_body
     )
     deleted_msg = ""
