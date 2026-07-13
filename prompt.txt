@@ -1,10 +1,10 @@
 Write a spoken voiceover script for a 50-second YouTube Short about: {topic}
 
-CRITICAL INSTRUCTIONS:
-1. Output ONLY the exact words to be spoken.
-2. Start your response IMMEDIATELY with the first spoken word. 
-3. Do NOT include greetings, confirmations, or preamble (e.g. NEVER write "Here is the script", "Sure!", "Okay").
-4. Do NOT include ANY section headers, labels, or stage directions (e.g. NEVER write "Hook:", "Body:", "CTA:", "[Upbeat music]", "(Camera pans)").
+CRITICAL INSTRUCTIONS - READ CAREFULLY:
+1. Output ONLY the exact words to be spoken aloud.
+2. START YOUR RESPONSE IMMEDIATELY with the first spoken word of the video. Do not write ANY introductory text.
+3. NEVER write "Here is the script", "Sure!", "Okay", "The hook is", or "The topic is".
+4. NEVER include ANY section headers, labels, or stage directions (e.g. do NOT write "Hook:", "Body:", "CTA:", "Title:", "[Upbeat music]", "(Camera pans)").
 5. Write in plain text. Do not use quotes around the script.
 
 The script must flow naturally from start to finish as a single continuous speech.
