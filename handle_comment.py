@@ -72,6 +72,7 @@ IST         = timezone(timedelta(hours=5, minutes=30))
 TARGET_LOW  = 35.0
 TARGET_HIGH = 58.0
 PREVIEW_MAX = 57.3
+SAFE_TAGS   = ["health", "wellness", "habits", "selfcare", "sleep", "hydration"]
 
 _PROMPT_FILE = Path(__file__).parent / "prompt.txt"
 
@@ -86,10 +87,6 @@ def load_default_prompt() -> str:
 
 PROMPT_REMINDER_HOURS = 1
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Context
-# ══════════════════════════════════════════════════════════════════════════════
-
 class Ctx:
     def __init__(self, event: dict, owner: str, repo: str) -> None:
         self.event        = event
@@ -102,12 +99,9 @@ class Ctx:
         self.labels       = self.issue.get("labels", [])
         self.slot         = get_slot_from_labels(self.labels)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LLM
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _list_groq_models() -> list[str]:
-    if not GROQ_API_KEY: return []
+    if not GROQ_API_KEY:
+        return []
     try:
         r = requests.get(
             "https://api.groq.com/openai/v1/models",
@@ -121,11 +115,13 @@ def _list_groq_models() -> list[str]:
     return []
 
 def _build_model_list() -> list[str]:
-    env_models = [GROQ_MODEL] + GROQ_FALLBACKS
+    env_models = []
+    if GROQ_MODEL: env_models.append(GROQ_MODEL)
+    env_models.extend(GROQ_FALLBACKS)
     seen = set()
     env_models = [m for m in env_models if not (m in seen or seen.add(m))]
     available = _list_groq_models()
-    if not available: return env_models[:6]
+    if not available: return env_models or [GROQ_MODEL]
     ordered = [m for m in env_models if m in available]
     for m in available:
         if m not in ordered: ordered.append(m)
@@ -153,7 +149,7 @@ _META_LINE_PATTERNS = [
     re.compile(r"^\(.*\)$", re.I),
     re.compile(r"^[-=*_]{3,}$"),
     re.compile(
-        r"(the\s+user\s+wants|the\s+hook\s+is|the\s+user\s+asked|youtube\s+shorts?\s+script\s+(about|for|on)|"
+        r"(the\s+user\s+wants|youtube\s+shorts?\s+script\s+(about|for|on)|"
         r"write\s+a\s+script|this\s+script\s+is|the\s+topic\s+is|"
         r"for\s+this\s+script|in\s+this\s+video\s+we\s+will\s+write)",
         re.I,
@@ -173,14 +169,19 @@ def _clean_script_output(raw: str) -> str:
     for line in lines:
         stripped = line.strip()
         if not stripped: continue
+        # Skip full lines of meta commentary
         if any(p.search(stripped) for p in _META_LINE_PATTERNS):
             continue
+        # Strip inline headers like "**Hook:**" or "Intro:"
+        stripped = re.sub(r"(?i)^\**((The )?(Hook|Intro|Body|CTA|Voiceover|Script|Title|Subtitle|Part \d+|Section \d+))\**\s*[:-]\s*", "", stripped)
         kept.append(stripped)
+        
     if not kept: return raw.strip()
     text = " ".join(kept)
     text = _INLINE_PREFIX_RE.sub("", text).strip()
     text = re.sub(r"^[:\-–\s]+", "", text).strip()
-    text = re.sub(r"\*\*.*?\*\*", "", text) # Aggressively strip bold markdown
+    text = text.replace("**", "") # Remove bold markdown formatting
+    text = text.strip('"\'') # Remove wrapping quotes
     return text
 
 def _ensure_complete_ending(text: str) -> str:
@@ -199,7 +200,7 @@ def generate_script(topic: str, user_prompt: str) -> str:
         "You only ever output the exact spoken words. "
         "You never output labels, headers, preamble, meta-commentary, "
         "or any text that would not be spoken aloud. "
-        "Every response starts with the first spoken word."
+        "Every response starts with the very first spoken word."
     )
     for model in models:
         try:
@@ -223,7 +224,7 @@ def generate_script(topic: str, user_prompt: str) -> str:
             raw = r.json()["choices"][0]["message"]["content"].strip()
             cleaned = _clean_script_output(raw)
             cleaned = _ensure_complete_ending(cleaned)
-            if len(cleaned.split()) < 50:
+            if len(cleaned.split()) < 40:
                 last_err = RuntimeError(f"Too few words from {model}")
                 continue
             return cleaned
@@ -232,7 +233,7 @@ def generate_script(topic: str, user_prompt: str) -> str:
     raise last_err or RuntimeError("All Groq models failed to generate a script.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TTS & Captions & Video Rendering
+# TTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _try_gtts(text: str, out_path: str, lang: str) -> bool:
@@ -269,61 +270,127 @@ def get_audio_duration(path: str) -> float:
     except Exception:
         return 45.0
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Captions (Restored Original Logic)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _fmt_time(t: float) -> str:
-    h, m, s = int(t // 3600), int((t % 3600) // 60), int(t % 60)
+    h  = int(t // 3600)
+    m  = int((t % 3600) // 60)
+    s  = int(t % 60)
     ms = int((t - int(t)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
+    log.info("[srt] transcribing %s", audio_path)
     try:
-        audio_dur = get_audio_duration(audio_path)
+        a         = AudioFileClip(audio_path)
+        audio_dur = float(a.duration)
+        a.close()
+    except Exception:
+        audio_dur = 45.0
+
+    try:
         from faster_whisper import WhisperModel
-        model = WhisperModel(os.getenv("WHISPER_MODEL", "tiny.en"), device="cpu", compute_type="int8")
-        segments, _ = model.transcribe(audio_path, language=lang, word_timestamps=True)
-        words = []
+        model_name = os.getenv("WHISPER_MODEL", "tiny.en")
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+
+        segments, _info = model.transcribe(
+            audio_path,
+            language=lang,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 200},
+            word_timestamps=True,
+        )
+
+        words: list[tuple[str, float, float]] = []
         for seg in segments:
             for w in seg.words or []:
-                if (w.word or "").strip():
-                    words.append((w.word.strip(), float(w.start), float(w.end)))
-        
-        chunks = []
+                txt = (w.word or "").strip()
+                if txt:
+                    words.append((txt, float(w.start), float(w.end)))
+
+        if not words:
+            raise RuntimeError("No word-level timestamps from whisper.")
+
+        chunks: list[tuple[str, float, float]] = []
         i = 0
         while i < len(words):
-            take = max(2, min(3, len(words) - i))
-            if (len(words) - i) - take == 1 and take > 2: take -= 1
+            remaining = len(words) - i
+            take = max(2, min(3, remaining))
+            if remaining - take == 1 and take > 2:
+                take -= 1
             grp = words[i : i + take]
-            chunks.append((" ".join(w[0] for w in grp), grp[0][1], grp[-1][2]))
+            chunks.append(
+                (" ".join(w[0] for w in grp), grp[0][1], grp[-1][2])
+            )
             i += take
 
-        out = []
-        idx = 1
-        cur_t = max(0.0, chunks[0][1]) if chunks else 0.0
+        out:    list[str] = []
+        idx     = 1
+        cur_t   = max(0.0, chunks[0][1]) if chunks else 0.0
+        gap     = 0.02
+        min_dur = 0.35
+
         for text, w_start, w_end in chunks:
             start = max(cur_t, w_start)
-            end = max(start + 0.35, w_end)
+            end   = max(start + min_dur, w_end)
             start = min(start, max(0.0, audio_dur - 0.01))
-            end = min(end, audio_dur)
-            if end > start:
-                out.append(f"{idx}\n{_fmt_time(start)} --> {_fmt_time(end)}\n{text}\n\n")
-                idx += 1
-                cur_t = end + 0.02
-        
-        if not out: raise ValueError("No valid captions generated")
-        with open(srt_path, "w", encoding="utf-8") as f: f.writelines(out)
+            end   = min(end, audio_dur)
+            if end <= start:
+                continue
+            out.append(
+                f"{idx}\n{_fmt_time(start)} --> {_fmt_time(end)}\n{text}\n\n"
+            )
+            idx  += 1
+            cur_t = end + gap
+            if cur_t >= audio_dur:
+                break
+
+        if not out:
+            out.append(f"1\n{_fmt_time(0.0)} --> {_fmt_time(max(0.8, audio_dur))}\n \n\n")
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.writelines(out)
         return True
+
     except Exception as exc:
-        log.warning("[srt] failed: %s", exc)
+        log.warning("[srt] failed: %s — writing blank srt", exc)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(f"1\n{_fmt_time(0.0)} --> {_fmt_time(max(0.8, audio_dur))}\n \n\n")
         return False
 
+def _ffmpeg_escape(s: str) -> str:
+    return (
+        s.replace("\\", "\\\\")
+         .replace(":", "\\:")
+         .replace(",", "\\,")
+         .replace("'", "\\'")
+    )
+
 def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
-    srt_abs = str(Path(srt_path).resolve()).replace("\\", "\\\\").replace(":", "\\:").replace(",", "\\,").replace("'", "\\'")
-    style = "Fontname=DejaVu Sans,Fontsize=12,Bold=1,PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=96"
+    srt_abs = str(Path(srt_path).resolve())
+    style = (
+        "Fontname=DejaVu Sans,Fontsize=12,Bold=1,"
+        "PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,"
+        "BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=96,Spacing=0"
+    )
+    vf = (
+        f"subtitles={_ffmpeg_escape(srt_abs)}"
+        f":force_style={_ffmpeg_escape(style)}"
+    )
     subprocess.run([
-        "ffmpeg", "-y", "-i", in_mp4, "-vf", f"subtitles={srt_abs}:force_style={style}",
-        "-c:a", "copy", "-pix_fmt", "yuv420p", out_mp4
+        "ffmpeg", "-y", "-i", in_mp4,
+        "-vf", vf,
+        "-c:a", "copy",
+        "-pix_fmt", "yuv420p",
+        out_mp4,
     ], check=True, capture_output=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rendering Helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
 _cascade = None
 def smart_cover_crop(clip, target_w=1080, target_h=1920):
@@ -429,22 +496,44 @@ def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_m
         if merged: merged.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # Restored Original Caption Logic Block
     srt_path = "cap.srt"
-    transcribe_to_srt(voice_mp3, srt_path, lang=TTS_LANG)
-    
-    subbed = "subbed.mp4"
-    try: burn_captions(temp_mp4, srt_path, subbed)
-    except Exception: shutil.copyfile(temp_mp4, subbed)
+    srt_ok   = transcribe_to_srt(voice_mp3, srt_path, lang=TTS_LANG)
+    log.info("[render] srt ok=%s", srt_ok)
 
+    subbed = "subbed.mp4"
+    try:
+        burn_captions(temp_mp4, srt_path, subbed)
+        log.info("[render] captions burned OK")
+    except Exception as exc:
+        log.error("[render] caption burn failed: %s", exc)
+        try:
+            log.info("[render] retrying with minimal SRT")
+            v_dur = get_audio_duration(voice_mp3)
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(
+                    f"1\n{_fmt_time(0.0)} --> "
+                    f"{_fmt_time(max(1.0, v_dur - 0.5))}\n"
+                    "Watch till end\n\n"
+                )
+            burn_captions(temp_mp4, srt_path, subbed)
+            log.info("[render] minimal SRT captions OK")
+        except Exception as exc2:
+            log.error("[render] minimal caption also failed: %s", exc2)
+            log.warning("[render] proceeding without captions")
+            shutil.copyfile(temp_mp4, subbed)
+
+    bgm_out = "with_bgm.mp4"
     try:
         bgm = ensure_bgm_track(end)
         subprocess.run([
             "ffmpeg", "-y", "-i", subbed, "-i", bgm, "-filter_complex",
             f"[1:a]volume={BGM_VOL}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0,aresample=async=1[aout]",
-            "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-shortest", final_mp4
+            "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-shortest", bgm_out
         ], check=True, capture_output=True)
-    except Exception: shutil.copyfile(subbed, final_mp4)
+    except Exception: shutil.copyfile(subbed, bgm_out)
 
+    os.replace(bgm_out, final_mp4)
     return get_audio_duration(final_mp4)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -538,7 +627,7 @@ def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None
 def handle_reject_topic(ctx: Ctx) -> None:
     try:
         from propose import gather_topics
-        options = gather_topics(REGION, need=6)
+        options = gather_topics(REGION, need=6, exclude=set())
     except Exception:
         options = ["Gut health basics", "Fixing posture in 2 minutes", "Better sleep habits", "Hydration tips", "Mental clarity routine", "Metabolism boosters"]
     
