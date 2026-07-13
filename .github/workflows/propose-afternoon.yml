@@ -6,13 +6,12 @@ on:
     - cron: "30 15 * * *"   # 21:00 IST daily
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 env:
   NODE_OPTIONS: "--no-deprecation"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 
 jobs:
   propose:
