@@ -19,11 +19,11 @@ You comment: /approve-topic 2
 -> Bot asks for your script or default generation
 -> You reply: /set-script <your complete voiceover text>
 OR /use-default-prompt
--> Script is processed
+-> Script is processed (and aggressively cleaned of AI commentary)
 -> gTTS renders voiceover
 -> Pexels b-roll downloaded (parallel)
 -> Video rendered (1080×1920, ≤58 s)
--> Whisper captions burned
+-> Whisper captions burned (yellow text, black outline)
 -> BGM mixed
 -> SEO package generated (title + description + 350 hashtags)
 -> Uploaded unlisted to YouTube
