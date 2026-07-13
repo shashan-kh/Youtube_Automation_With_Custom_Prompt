@@ -1,8 +1,8 @@
 Write a spoken voiceover script for a 50-second YouTube Short about: {topic}
 
-CRITICAL: Output ONLY the exact words to be spoken.
-START immediately with the first spoken word.
-NO "Title:", "Hook:", "Intro:", "Voiceover:", or labels of any kind.
-NO descriptions, notes, or brackets.
-The script must be a continuous, single block of text.
-End with: "Thank you for watching. Follow for more daily health tips."
+CRITICAL INSTRUCTIONS:
+1. Output ONLY the exact words to be spoken aloud.
+2. START immediately with the first spoken word. Do NOT include any intro text.
+3. NO labels (e.g., "Hook:", "Title:"). NO brackets. NO stage directions.
+4. The script must be a continuous single block of text.
+5. End with: "Thank you for watching. Follow for more daily health tips."
