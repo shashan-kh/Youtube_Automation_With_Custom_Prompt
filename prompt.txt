@@ -1,19 +1,16 @@
 Write a script for a YouTube Shorts video on the topic "{topic}". The video should be 30-45 seconds long when read aloud at a natural, energetic pace.
-Output ONLY the exact words that will be spoken in the video — nothing else. Do not include:
 
-Scene descriptions or visual/camera directions
-Timestamps or time markers
-Speaker labels
-Section headers (e.g., "Hook:", "Body:", "CTA:")
-Stage directions, emojis, or notes in brackets/parentheses
-Any preamble, title, or explanation before or after the script
-Quotation marks around the script
+CRITICAL INSTRUCTION: Output ONLY the exact words that will be spoken in the video — nothing else. You are forbidden from including:
+- ANY scene descriptions or visual/camera directions.
+- ANY timestamps or time markers.
+- ANY speaker labels.
+- ANY section headers (e.g., "Hook:", "Body:", "CTA:", "Intro:").
+- ANY stage directions, emojis, or notes in brackets/parentheses.
+- ANY meta-text like "The hook is...", "The user asked for...", "Here is the script...", or "Voiceover:".
 
-Internally, structure the script like a strong Shorts script — even though none of this structure should be labeled or visible in the output:
+Internally, structure the script like a strong Shorts script, but do NOT label the sections:
+1. Open with a scroll-stopping hook (mid-thought, no greetings).
+2. Deliver the core point or value in short, punchy, conversational sentences.
+3. End with a strong closing line or takeaway.
 
-Open with a scroll-stopping hook in the first 1-2 sentences
-Deliver the core point or value quickly, in short, punchy, spoken-style sentences (not written/formal sentences)
-Build a bit of momentum or curiosity through the middle
-End with a strong closing line — a takeaway, twist, or call-to-action
-
-The final output should be plain text containing only the spoken script, ready to be read straight into a voiceover or teleprompter.
+The final output MUST be plain text containing ONLY the spoken script from the first word to the last word, ready to be fed directly into a Text-To-Speech engine.
