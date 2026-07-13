@@ -1,10 +1,7 @@
 """
-propose.py — discovers specific, actionable health topics and opens a GitHub
-approval issue. Saves unseen topics to a dynamic pool file, serving as a fallback.
+propose.py — discovers topics and manages the dynamic topics_pool.json.
 """
-
 from __future__ import annotations
-
 import base64
 import json
 import os
@@ -16,16 +13,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 import requests
-
 from common import (
-    gh,
-    post_comment,
-    get_metadata_from_issue_body,
-    set_metadata_in_issue_body,
-    normalize_key,
-    jaccard,
-    get_logger,
-    REPO,
+    gh, post_comment, get_metadata_from_issue_body,
+    set_metadata_in_issue_body, normalize_key, jaccard, get_logger, REPO
 )
 
 log = get_logger("propose")
@@ -67,7 +57,7 @@ def save_topics_pool(owner: str, repo: str, pool: list[str]) -> None:
     except Exception:
         pass
     
-    unique_pool = list(dict.fromkeys(pool))[-150:] # Keep last 150 unique topics max
+    unique_pool = list(dict.fromkeys(pool))[-150:]
     content = base64.b64encode(json.dumps(unique_pool, indent=2).encode()).decode()
     payload = {"message": "chore: update dynamic topics pool [skip ci]", "content": content}
     if sha: payload["sha"] = sha
@@ -199,7 +189,6 @@ def main() -> None:
     approved = load_recent_approved_topics(owner, repo)
     pool = get_topics_pool(owner, repo)
     
-    # Exclude already approved topics from the pool
     pool = [t for t in pool if not any(jaccard(t, a) >= 0.75 for a in approved)]
     
     try:
@@ -217,7 +206,7 @@ def main() -> None:
         random.shuffle(rem)
         issue_topics.extend(rem[:6-len(issue_topics)])
         
-    note = "" if live_candidates else "\n*Note: Pulled from dynamic fallback pool (live fetch empty).*”"
+    note = "" if live_candidates else "\n*Note: Pulled from dynamic fallback pool.*"
     create_topic_issue(owner, repo, issue_topics, next_slot_ist(), note)
 
 if __name__ == "__main__":
