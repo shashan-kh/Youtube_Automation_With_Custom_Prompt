@@ -19,7 +19,9 @@ permissions:
   statuses: none
 
 env:
+  NODE_OPTIONS: "--no-deprecation"
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 
 jobs:
   handle:
