@@ -30,8 +30,8 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Run Gemini CLI with skip-trust and the high-quota Flash model
-          gemini --yolo --skip-trust --model gemini-2.5-flash -p "${{ github.event.comment.body }}"
+          # Run Gemini CLI with skip-trust and the updated gemini-3.8-flash model
+          gemini --yolo --skip-trust --model gemini-3.8-flash -p "${{ github.event.comment.body }}"
           
           # Automatically commit and push any changes made by the AI agent
           git add -A
