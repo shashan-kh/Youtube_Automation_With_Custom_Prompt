@@ -4,43 +4,36 @@ on:
   issue_comment:
     types: [created]
 
-permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-
 jobs:
-  gemini-cli:
+  gemini_chat:
     runs-on: ubuntu-latest
-    if: contains(github.event.comment.body, '@gemini-cli')
+    # Only run if the comment mentions @gemini-cli and is posted on an Issue or Pull Request
+    if: github.event.issue.pull_request == null && contains(github.event.comment.body, '@gemini-cli')
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install Gemini CLI
-        run: npm install -g @google/gemini-cli
+        run: npm install -g @google/gemini-cli@latest
 
-      - name: Run Gemini CLI
+      - name: Run Gemini Agent
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-        run: gemini --yolo -p "$COMMENT_BODY"
-
-      - name: Commit and Push changes
         run: |
-          git config --global user.name "gemini-cli[bot]"
-          git config --global user.email "gemini-cli[bot]@users.noreply.github.com"
-          if [[ -n $(git status -s) ]]; then
-            git add .
-            git commit -m "chore: apply changes from @gemini-cli"
-            git push
-          else
-            echo "No changes to commit"
-          fi
+          # Configure Git user for automated commits
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Run Gemini CLI with the high-quota Flash model
+          gemini --yolo --model gemini-2.5-flash -p "${{ github.event.comment.body }}"
+          
+          # Automatically commit and push any changes made by the AI agent
+          git add -A
+          git diff --cached --quiet || git commit -m "refactor: apply updates via @gemini-cli instruction"
+          git push origin HEAD:${{ github.ref_name }}
