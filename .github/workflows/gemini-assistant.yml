@@ -46,7 +46,7 @@ jobs:
           # Option 4: Pro Model (Advanced reasoning, lower daily quota)
           # gemini --yolo --skip-trust --model gemini-3.8-pro -p "${{ github.event.comment.body }}"
           
-          gemini --yolo --skip-trust --model Gemini-3.1-Pro -p "${{ github.event.comment.body }}"
+          gemini --yolo --skip-trust --model gemini-3.1-pro -p "${{ github.event.comment.body }}"
 
           # Automatically commit and push any changes made by the AI agent
           git add -A
