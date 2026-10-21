@@ -38,7 +38,7 @@ jobs:
           # gemini --yolo --skip-trust --model gemini-3.8-flash -p "${{ github.event.comment.body }}"
           
           # Option 2: Flash-Lite Alias (Fastest lower tier model for simple tasks/higher limits)
-          gemini --yolo --skip-trust --model flash-lite -p "${{ github.event.comment.body }}"
+          # gemini --yolo --skip-trust --model flash-lite -p "${{ github.event.comment.body }}"
           
           # Option 3: Previous Generation Flash (Lower version alternative if newer models hit limits)
           # gemini --yolo --skip-trust --model gemini-2.5-flash -p "${{ github.event.comment.body }}"
@@ -46,6 +46,8 @@ jobs:
           # Option 4: Pro Model (Advanced reasoning, lower daily quota)
           # gemini --yolo --skip-trust --model gemini-3.8-pro -p "${{ github.event.comment.body }}"
           
+          gemini --yolo --skip-trust --model Gemini-3.1-Pro -p "${{ github.event.comment.body }}"
+
           # Automatically commit and push any changes made by the AI agent
           git add -A
           git diff --cached --quiet || git commit -m "refactor: apply updates via @gemini-cli instruction"
