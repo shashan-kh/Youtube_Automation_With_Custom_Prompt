@@ -35,10 +35,10 @@ jobs:
           # =====================================================================
           
           # Option 1: Current Flash Model (Standard fast option)
-          gemini --yolo --skip-trust --model gemini-3.8-flash -p "${{ github.event.comment.body }}"
+          # gemini --yolo --skip-trust --model gemini-3.8-flash -p "${{ github.event.comment.body }}"
           
           # Option 2: Flash-Lite Alias (Fastest lower tier model for simple tasks/higher limits)
-          # gemini --yolo --skip-trust --model flash-lite -p "${{ github.event.comment.body }}"
+          gemini --yolo --skip-trust --model flash-lite -p "${{ github.event.comment.body }}"
           
           # Option 3: Previous Generation Flash (Lower version alternative if newer models hit limits)
           # gemini --yolo --skip-trust --model gemini-2.5-flash -p "${{ github.event.comment.body }}"
