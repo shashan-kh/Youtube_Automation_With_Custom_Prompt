@@ -112,7 +112,7 @@ def _clean_script(text: str) -> str:
 def generate_script(topic: str, user_prompt: str) -> str:
     models = _build_model_list()
     last_err = None
-    system_msg = "You are a voiceover artist. Output ONLY the exact spoken words. Start DIRECTLY with the first word."
+    system_msg = "You are a professional voiceover artist and scriptwriter for YouTube Shorts. Output ONLY the exact speakable voiceover content for the video, exclusively and directly related to the chosen topic. Start DIRECTLY with the first word."
     for model in models:
         try:
             r = requests.post(
