@@ -104,8 +104,9 @@ def _clean_script(text: str) -> str:
     text = re.sub(r"(?i)^(Title|Topic|Script|Intro|Hook|Body|CTA|Voiceover|The hook is|The script starts here):?\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"(?i)(Here is the script|Sure!|Certainly!|The topic is)", "", text)
     text = text.replace("**", "").strip('"\' ')
-    if not text.lower().endswith("thank you for watching. follow for more daily health tips."):
-        text = text.rstrip(".!? ") + ". Thank you for watching. Follow for more daily health tips."
+    conclusion = "Thank you for watching. Follow for more daily health tips."
+    if conclusion.lower() not in text.lower():
+        text = text.rstrip(".!? ") + f". {conclusion}"
     return text
 
 def generate_script(topic: str, user_prompt: str) -> str:
@@ -117,7 +118,7 @@ def generate_script(topic: str, user_prompt: str) -> str:
             r = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                json={"model": model, "messages": [{"role": "system", "content": system_msg}, {"role": "user", "content": user_prompt}], "temperature": 0.80, "max_tokens": 400},
+                json={"model": model, "messages": [{"role": "system", "content": system_msg}, {"role": "user", "content": user_prompt}], "temperature": 0.80, "max_tokens": 600},
                 timeout=120,
             )
             if r.status_code != 200:
@@ -308,18 +309,35 @@ def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_m
 
     raw_clips, cropped, merged, voice_clip = [], [], None, None
     try:
+        base_comps = []
         for p in local:
             try:
                 c = VideoFileClip(p)
                 raw_clips.append(c)
                 comp = smart_cover_crop(c.subclip(0, min(8, max(4, int(c.duration))))).set_audio(None)
-                cropped.append(comp)
+                base_comps.append(comp)
             except Exception: pass
-        if not cropped: raise RuntimeError("No clips loaded.")
+        if not base_comps: raise RuntimeError("No clips loaded.")
+
+        cropped = list(base_comps)
+        voice_clip = AudioFileClip(voice_mp3)
+        target_dur = voice_clip.duration
+
+        while sum(c.duration for c in cropped) < target_dur and len(cropped) < 50:
+            for p in local:
+                try:
+                    c = VideoFileClip(p)
+                    raw_clips.append(c)
+                    comp = smart_cover_crop(c.subclip(0, min(8, max(4, int(c.duration))))).set_audio(None)
+                    cropped.append(comp)
+                    if sum(c.duration for c in cropped) >= target_dur:
+                        break
+                except Exception: pass
+                if sum(c.duration for c in cropped) >= target_dur:
+                    break
 
         merged = concatenate_videoclips(cropped, method="compose")
-        voice_clip = AudioFileClip(voice_mp3)
-        end = max(0.2, min(PREVIEW_MAX, min(merged.duration, voice_clip.duration) - 0.01))
+        end = max(0.2, min(PREVIEW_MAX, target_dur))
         
         out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
         out_clip.write_videofile(temp_mp4, fps=30, codec="libx264", audio_codec="aac", threads=2, preset="fast", verbose=False, logger=None)
