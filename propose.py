@@ -169,22 +169,34 @@ Trending, actionable topics. Scheduled publish (IST): **{scheduled_ist.strftime(
 {numbered}
 
 ---
-**Reply with:**
-- `/approve-topic 1` (or 2-6) — approve a numbered topic
-- `/custom-topic Your Specific Topic` — use your own topic
-- `/reject-topic` — get fresh suggestions
+### ⚡ FASTEST: Approve & Start Building in ONE Comment
+Reply with one of these to skip the back-and-forth:
+- `/approve-topic 1 /use-default-prompt` — (Approves #1 and starts building with AI script)
+- `/approve-topic 1 /set-script [your text]` — (Approves #1 with your own custom text)
 
-> **After approval**, the bot will prompt you for the script text.
-> You can reply `/set-script [your voiceover text]` or `/use-default-prompt`.
+---
+**Standard Workflow (Multiple Steps):**
+- `/approve-topic 1` — Just approve the topic (bot will ask for script next)
+- `/custom-topic Your Specific Topic` — Use your own topic title
+- `/reject-topic` — Get 6 fresh suggestions
 
 {note}
 """
     meta_block = set_metadata_in_issue_body(body, {"slot": SLOT, "scheduled_ist": scheduled_ist.strftime("%Y-%m-%d %H:%M"), "topics": topics})
-    gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues", json={"title": title, "body": meta_block})
+    gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues", json={
+        "title": title, 
+        "body": meta_block,
+        "labels": [f"slot:{SLOT}", "await-approval"]
+    })
 
 def main() -> None:
     owner, repo = REPO.split("/", 1)
-    if open_issues_with_labels(owner, repo, [f"slot:{SLOT}", "await-topic-approval"]): return
+    
+    # Block if ANY previous issue for this slot is still open (not approved/closed)
+    pending = open_issues_with_labels(owner, repo, [f"slot:{SLOT}"])
+    if pending:
+        log.info(f"Slot '{SLOT}' has {len(pending)} open issue(s). Skipping new proposal until they are approved (closed).")
+        return
     
     approved = load_recent_approved_topics(owner, repo)
     pool = get_topics_pool(owner, repo)

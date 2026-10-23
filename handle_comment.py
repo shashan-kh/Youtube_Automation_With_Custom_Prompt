@@ -3,10 +3,13 @@ handle_comment.py — processes all /commands posted on GitHub Issues.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import random
 import re
 import shutil
+import edge_tts
 import subprocess
 import sys
 import tempfile
@@ -51,9 +54,9 @@ TTS_LANG       = os.getenv("TTS_LANG", "en")
 BGM_VOL        = 0.07
 
 IST         = timezone(timedelta(hours=5, minutes=30))
-TARGET_LOW  = 35.0
-TARGET_HIGH = 58.0
-PREVIEW_MAX = 57.3
+TARGET_LOW  = 45.0
+TARGET_HIGH = 59.8
+PREVIEW_MAX = 59.5
 PROMPT_REMINDER_HOURS = 1
 
 _PROMPT_FILE = Path(__file__).parent / "prompt.txt"
@@ -150,7 +153,24 @@ def _try_espeak(text: str, out_path: str, lang: str) -> bool:
         return os.path.exists(out_path) and os.path.getsize(out_path) > 512
     except Exception: return False
 
+def _try_edge_tts(text: str, out_path: str) -> bool:
+    try:
+        # en-US-ChristopherNeural or en-US-AriaNeural
+        voice = "en-US-ChristopherNeural"
+        # snappy Shorts pacing: +10%
+        communicate = edge_tts.Communicate(text, voice, rate="+10%")
+        asyncio.run(communicate.save(out_path))
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 1024
+    except Exception as exc:
+        log.warning("[edge-tts] failed: %s", exc)
+        return False
+
 def synthesize_speech(text: str, out_path: str, lang: str = "en") -> str:
+    # Try edge-tts first for high quality
+    if _try_edge_tts(text, out_path):
+        return out_path
+    
+    # Fallbacks
     for _ in range(3):
         if _try_gtts(text, out_path, lang): return out_path
         time.sleep(2)
@@ -231,7 +251,8 @@ def _ffmpeg_escape(s: str) -> str:
 
 def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
     srt_abs = str(Path(srt_path).resolve())
-    style = "Fontname=DejaVu Sans,Fontsize=12,Bold=1,PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=96,Spacing=0"
+    # MarginV=540 positions captions ~28% up from bottom (1920 * 0.28 = 537)
+    style = "Fontname=DejaVu Sans,Fontsize=12,Bold=1,PrimaryColour=&H0000FFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=540,Spacing=0"
     subprocess.run(["ffmpeg", "-y", "-i", in_mp4, "-vf", f"subtitles={_ffmpeg_escape(srt_abs)}:force_style={_ffmpeg_escape(style)}", "-c:a", "copy", "-pix_fmt", "yuv420p", out_mp4], check=True)
 
 # ── Video Processing ──────────────────────────────────────────────────────────
@@ -242,31 +263,70 @@ def smart_cover_crop(clip, target_w=1080, target_h=1920):
         try: _cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         except Exception: pass
     
-    scale = max(target_w / clip.w, target_h / clip.h)
-    resized = clip.resize(scale)
-    cx, cy = resized.w / 2, resized.h / 2
+    # Base scale to fill frame
+    base_scale = max(target_w / clip.w, target_h / clip.h)
     
+    # Ken Burns: Start at base_scale, zoom in slightly over time (+10% zoom)
+    def make_frame(t):
+        # We don't use a lambda for resize directly because we need smart cropping per frame
+        # Instead, we'll apply a simple zoompan-like effect by scaling the crop area
+        pass
+
+    # Simplified Ken Burns using MoviePy's resize(lambda)
+    # We first resize to fill, then apply the animated zoom, then crop.
+    resized = clip.resize(base_scale)
+    
+    # Apply a subtle slow zoom (1.0 to 1.1)
+    zoomed = resized.resize(lambda t: 1 + 0.05 * (t / clip.duration))
+    
+    cx, cy = zoomed.w / 2, zoomed.h / 2
     try:
         if cv2 is not None and _cascade is not None:
-            gray = cv2.cvtColor(resized.get_frame(resized.duration / 2), cv2.COLOR_RGB2GRAY)
+            # Detect face on middle frame of the original resized clip for stable centering
+            mid_frame = resized.get_frame(resized.duration / 2)
+            gray = cv2.cvtColor(mid_frame, cv2.COLOR_RGB2GRAY)
             faces = _cascade.detectMultiScale(gray, 1.1, 5, minSize=(60, 60))
             if len(faces):
                 best = max(faces, key=lambda f: f[2] * f[3])
-                cx = best[0] + best[2] / 2
-                cy = best[1] + best[3] / 2
+                cx = (best[0] + best[2] / 2) * (zoomed.w / resized.w)
+                cy = (best[1] + best[3] / 2) * (zoomed.h / resized.h)
     except Exception: pass
     
-    cx = max(target_w / 2, min(resized.w - target_w / 2, cx))
-    cy = max(target_h / 2, min(resized.h - target_h / 2, cy))
-    return resized.crop(x_center=cx, y_center=cy, width=target_w, height=target_h).set_audio(None)
+    # Ensure crop stays within bounds
+    # (Note: crop center might shift as 'zoomed' size changes, but MoviePy handles relative centering)
+    return zoomed.crop(x_center=cx, y_center=cy, width=target_w, height=target_h).set_audio(None)
 
-def fetch_broll(query: str, need: int = 6) -> list[str]:
+def fetch_broll(topic: str, script_text: str = "", need: int = 18) -> list[str]:
     headers = {"Authorization": PEXELS_API_KEY}
-    all_queries = [query, "healthy lifestyle", "fitness exercise", "meditation"]
+    
+    # Generate action-oriented visual keywords using LLM if script is available
+    visual_queries = [topic]
+    if script_text and GROQ_API_KEY:
+        try:
+            prompt = (
+                f"Analyze this health script and break it into a sequence of {need} specific visual scenes. "
+                f"For each scene, provide a highly specific Pexels search query (e.g., 'close up of fresh blueberries', 'person meditating on beach'). "
+                f"The sequence MUST follow the script's narrative chronological order perfectly. "
+                f"Output ONLY a JSON array of strings."
+                f"\n\nScript: {script_text}"
+            )
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.5},
+                timeout=30
+            )
+            if r.status_code == 200:
+                visual_queries = json.loads(extract_json_block(r.json()["choices"][0]["message"]["content"]))
+        except Exception: pass
+    
+    if not visual_queries or len(visual_queries) < 3:
+        visual_queries = [topic, f"{topic} health", "wellness habits", "healthy lifestyle", "fitness exercise", "nutrition health"]
+
     collected, seen = [], set()
     def _one(q):
         try:
-            r = requests.get("https://api.pexels.com/videos/search", headers=headers, params={"query": q, "per_page": 15, "min_height": 720, "orientation": "portrait"}, timeout=30)
+            r = requests.get("https://api.pexels.com/videos/search", headers=headers, params={"query": q, "per_page": 5, "min_height": 720, "orientation": "portrait"}, timeout=30)
             if r.status_code == 200:
                 links = []
                 for v in r.json().get("videos", []):
@@ -278,14 +338,25 @@ def fetch_broll(query: str, need: int = 6) -> list[str]:
         except Exception: pass
         return []
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        for fut in as_completed({ex.submit(_one, q): q for q in all_queries}):
-            for link in fut.result():
+    # Maintain strict chronological order
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        future_to_idx = {ex.submit(_one, q): i for i, q in enumerate(visual_queries)}
+        ordered_results = [[] for _ in range(len(visual_queries))]
+        for fut in as_completed(future_to_idx):
+            ordered_results[future_to_idx[fut]] = fut.result()
+        
+        for links in ordered_results:
+            for link in links:
                 if link not in seen:
                     seen.add(link)
                     collected.append(link)
-    import random
-    random.shuffle(collected)
+                    break # Take the first matching video per query for relevance
+    
+    # Fallback if too few
+    if len(collected) < need:
+        fallback = fetch_broll(f"{topic} wellness", script_text="", need=need - len(collected))
+        collected.extend(fallback)
+        
     return collected[:need]
 
 def _download_broll(urls: list[str], tmp: Path) -> list[str]:
@@ -308,18 +379,51 @@ def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_m
 
     raw_clips, cropped, merged, voice_clip = [], [], None, None
     try:
-        for p in local:
+        voice_clip = AudioFileClip(voice_mp3)
+        total_duration = voice_clip.duration
+        
+        # Chronological matching: distribute total duration across all clips
+        current_t = 0.0
+        clip_idx = 0
+        num_local = len(local)
+        
+        while current_t < total_duration and clip_idx < num_local:
+            p = local[clip_idx]
             try:
                 c = VideoFileClip(p)
                 raw_clips.append(c)
-                comp = smart_cover_crop(c.subclip(0, min(8, max(4, int(c.duration))))).set_audio(None)
+                
+                # Calculate target duration for this clip based on remaining time and clips
+                rem_dur = total_duration - current_t
+                rem_clips = num_local - clip_idx
+                target_cut = rem_dur / rem_clips if rem_clips > 0 else rem_dur
+                
+                # Add slight variation (±10%) but cap at clip's own length
+                cut_dur = random.uniform(target_cut * 0.9, target_cut * 1.1)
+                cut_dur = min(cut_dur, c.duration - 0.1, rem_dur)
+                
+                if cut_dur < 0.2: # Extremely short, skip
+                    clip_idx += 1
+                    continue
+                
+                # Start at a random point if clip is longer than needed, else start at 0
+                start_p = random.uniform(0, max(0, c.duration - cut_dur - 0.1))
+                sub = c.subclip(start_p, start_p + cut_dur)
+                
+                comp = smart_cover_crop(sub).set_audio(None)
                 cropped.append(comp)
-            except Exception: pass
+                
+                current_t += cut_dur
+                clip_idx += 1
+            except Exception as e:
+                log.warning(f"Failed to process clip {p}: {e}")
+                clip_idx += 1
+
         if not cropped: raise RuntimeError("No clips loaded.")
 
         merged = concatenate_videoclips(cropped, method="compose")
-        voice_clip = AudioFileClip(voice_mp3)
-        end = max(0.2, min(PREVIEW_MAX, min(merged.duration, voice_clip.duration) - 0.01))
+        # Final trim to match voice exactly (and stay under 60s)
+        end = min(PREVIEW_MAX, voice_clip.duration)
         
         out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
         out_clip.write_videofile(temp_mp4, fps=30, codec="libx264", audio_codec="aac", threads=2, preset="fast", verbose=False, logger=None)
@@ -388,8 +492,8 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
             voice_raw = f"voice_{attempt}.mp3"
             synthesize_speech(script_text, voice_raw, lang=TTS_LANG)
             
-            broll = fetch_broll(topic, need=6)
-            if not broll: broll = fetch_broll("healthy lifestyle", need=6)
+            broll = fetch_broll(topic, script_text=script_text, need=15)
+            if not broll: broll = fetch_broll("healthy lifestyle", script_text="", need=15)
             if not broll: continue
             
             temp_mp4, final_mp4 = f"temp_{attempt}.mp4", f"short_{attempt}.mp4"
@@ -424,11 +528,16 @@ def _package_and_upload(video_path, seo, topic, slot, issue_body, attempt, dur):
 # ── Command Handlers ──────────────────────────────────────────────────────────
 def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None:
     body = (
-        f"Topic approved: {topic}\n\n"
-        "Please provide your script text or generate one automatically.\n\n"
-        "Option A - Provide your own complete script:\n"
+        f"Topic approved: **{topic}**\n\n"
+        "### ⚡ TIP: You can do this in ONE comment next time!\n"
+        "Instead of separate steps, you can approve and set your script simultaneously by replying with:\n"
+        "- `/approve-topic N /use-default-prompt`\n"
+        "- `/approve-topic N /set-script [your full text]`\n\n"
+        "---\n\n"
+        "**For this issue, please reply with your script choice:**\n\n"
+        "**Option A - Custom Script:**\n"
         "Reply with: `/set-script` followed by your full voiceover text.\n\n"
-        "Option B - Use the AI to generate a script (default):\n"
+        "**Option B - AI Default Script:**\n"
         "Reply with exactly: `/use-default-prompt`\n\n"
         f"A reminder will be posted if no script is received within {PROMPT_REMINDER_HOURS} hour."
     )
@@ -445,10 +554,21 @@ def handle_reject_topic(ctx: Ctx) -> None:
     meta["topics"] = options
     new_body = set_metadata_in_issue_body(ctx.issue_body, meta)
     numbered = "\n".join(f"{i}) {t}" for i, t in enumerate(options, 1))
-    new_body += f"\n\nNew topic options:\n{numbered}\n\nReply with /approve-topic 1 (or 2-6), or /custom-topic Your Topic"
+    
+    instructions = (
+        f"\n\n### Fresh Topic Options:\n{numbered}\n\n"
+        "⚡ **FASTEST (One Comment):**\n"
+        "- `/approve-topic 1 /use-default-prompt` (Approve & build immediately with AI script)\n"
+        "- `/approve-topic 1 /set-script [your text]` (Approve & build with custom script)\n\n"
+        "**Standard:**\n"
+        "- `/approve-topic N` (Approve and pick script next)\n"
+        "- `/custom-topic Your Topic`"
+    )
+    
+    new_body += instructions
     
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
-    post_comment(ctx.owner, ctx.repo, ctx.number, f"Fresh topic options:\n{numbered}\n\nReply /approve-topic N or /custom-topic Your Topic")
+    post_comment(ctx.owner, ctx.repo, ctx.number, instructions)
 
 def _start_after_topic(ctx: Ctx, topic: str) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
@@ -468,8 +588,21 @@ def handle_custom_topic(ctx: Ctx) -> None:
 def handle_approve_topic(ctx: Ctx) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     topics = meta.get("topics", [])
-    parts = ctx.comment_body.split(maxsplit=1)
     
+    # Check for combined command
+    comment_body = ctx.comment_body
+    user_script = None
+    use_default = False
+    
+    if "/use-default-prompt" in comment_body.lower():
+        use_default = True
+        comment_body = re.sub(r"(?i)/use-default-prompt", "", comment_body).strip()
+    elif "/set-script" in comment_body.lower():
+        parts = re.split(r"(?i)/set-script", comment_body, 1)
+        comment_body = parts[0].strip()
+        user_script = parts[1].strip()
+
+    parts = comment_body.split(maxsplit=1)
     if len(parts) > 1 and not parts[1].strip().isdigit():
         topic = parts[1].strip()
     else:
@@ -478,7 +611,13 @@ def handle_approve_topic(ctx: Ctx) -> None:
             post_comment(ctx.owner, ctx.repo, ctx.number, f"Invalid index {idx}.")
             return
         topic = topics[idx - 1]
-    _start_after_topic(ctx, topic)
+    
+    if use_default:
+        _run_build_with_script(ctx, None, topic_override=topic)
+    elif user_script is not None:
+        _run_build_with_script(ctx, user_script, topic_override=topic)
+    else:
+        _start_after_topic(ctx, topic)
 
 def handle_use_default_prompt(ctx: Ctx) -> None:
     _run_build_with_script(ctx, None)
@@ -490,9 +629,9 @@ def handle_set_script(ctx: Ctx) -> None:
         return
     _run_build_with_script(ctx, user_script)
 
-def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
+def _run_build_with_script(ctx: Ctx, user_script: str | None, topic_override: str | None = None) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
-    topic = meta.get("topic", "")
+    topic = topic_override or meta.get("topic", "")
     if not topic:
         post_comment(ctx.owner, ctx.repo, ctx.number, "No approved topic found.")
         return
@@ -500,9 +639,13 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     if user_script: meta["user_script"] = user_script
     else: meta.pop("user_script", None)
     
+    if topic_override: meta["topic"] = topic
+    
     new_body = set_metadata_in_issue_body(ctx.issue_body, meta)
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
-    post_comment(ctx.owner, ctx.repo, ctx.number, f"Script received. Building video for: {topic}\nThis takes 5-10 mins.")
+    
+    status_msg = f"Building video for: {topic}\n(Script: {'Custom' if user_script else 'AI Generated'})\nThis takes 5-10 mins."
+    post_comment(ctx.owner, ctx.repo, ctx.number, status_msg)
 
     video_meta, new_body2 = build_preview(topic, user_script, ctx.slot, new_body)
     if not video_meta:

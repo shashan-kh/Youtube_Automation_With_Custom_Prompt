@@ -187,7 +187,7 @@ def _assemble_description(raw_desc: str, topic: str, topic_tags: list) -> str:
     if "like" not in desc.lower() and "subscribe" not in desc.lower():
         desc = desc.rstrip() + "\nLike and subscribe for daily health tips."
 
-    # Build 350 hashtags
+    # Build 5-8 highly relevant hashtags
     topic_specific = _generate_topic_hashtags(topic)
     all_tags: list[str] = []
     seen_lower: set[str] = set()
@@ -201,20 +201,10 @@ def _assemble_description(raw_desc: str, topic: str, topic_tags: list) -> str:
             continue
         seen_lower.add(key)
         all_tags.append(ht_clean)
-        if len(all_tags) >= 350:
+        if len(all_tags) >= 8:
             break
 
-    # Pad if needed
-    if len(all_tags) < 350:
-        for i in range(1, 500):
-            candidate = f"#HealthTip{i}"
-            if candidate.lower() not in seen_lower:
-                all_tags.append(candidate)
-                seen_lower.add(candidate.lower())
-            if len(all_tags) >= 350:
-                break
-
-    tag_block = "\n".join(all_tags[:350])
+    tag_block = " ".join(all_tags)
     return desc.rstrip() + "\n\n" + tag_block
 
 
@@ -234,63 +224,13 @@ def _generate_topic_hashtags(topic: str) -> list[str]:
     if words:
         full = "".join(w.capitalize() for w in words)
         tags.append(f"#{full}")
-
-        for i in range(len(words) - 1):
-            pair = words[i].capitalize() + words[i + 1].capitalize()
-            tags.append(f"#{pair}")
-
+        if len(words) >= 2:
+            tags.append(f"#{words[0].capitalize()}{words[1].capitalize()}")
         for w in words:
             if len(w) >= 4:
                 tags.append(f"#{w.capitalize()}")
 
-        root = words[0].capitalize()
-        suffixes = [
-            "Tips", "Hacks", "Facts", "Tricks", "Benefits", "Science",
-            "Routine", "Habit", "Method", "Technique", "Guide", "101",
-            "ForBeginners", "AtHome", "Daily", "Morning", "Night",
-            "ForMen", "ForWomen", "ForSeniors", "ForStudents",
-            "In5Minutes", "In2Minutes", "Instantly", "Naturally",
-            "WithoutMedicine", "Scientifically", "Backed", "Proven",
-            "EvidenceBased", "Research",
-        ]
-        full_no_space = full
-        for suf in suffixes:
-            tags.append(f"#{full_no_space}{suf}")
-            tags.append(f"#{root}{suf}")
-
-    adjacent = [
-        "HealthyHabits", "HealthyLifestyle", "HealthyLiving",
-        "WellnessTips", "WellnessJourney", "WellnessRoutine",
-        "FitnessMotivation", "FitnessTips", "FitnessLife",
-        "NutritionTips", "NutritionFacts", "NutritionScience",
-        "SelfCare", "SelfCareRoutine", "SelfCareDay",
-        "MindBodySoul", "MindBodyConnection", "MindBodyHealth",
-        "NaturalHealth", "NaturalRemedies", "NaturalWellness",
-        "PreventiveHealth", "PreventiveCare", "PreventiveMedicine",
-        "HealthyMindset", "HealthyBody", "HealthyFood",
-        "CleanEating", "EatHealthy", "EatClean",
-        "ViralHealth", "TrendingHealth", "HealthViral",
-        "HealthShorts", "WellnessShorts", "FitnessShorts",
-        "HealthContent", "HealthCreator", "HealthInfluencer",
-        "DailyHealth", "DailyWellness", "DailyFitness",
-        "HealthGoals", "WellnessGoals", "FitnessGoals",
-        "HealthIsWealth", "YourHealth", "MyHealth",
-        "GetHealthy", "StayHealthy", "BeHealthy",
-        "HealthMatters", "HealthFirst", "PutHealthFirst",
-        "ScienceBackedHealth", "EvidenceBasedHealth",
-        "DoctorApproved", "MedicalFacts", "HealthFacts",
-        "HealthMyths", "MythBusted", "HealthTruth",
-        "HealthAlert", "HealthWarning", "HealthReminder",
-        "HealthChallenge", "HealthJourney", "HealthTransformation",
-        "IndiaHealth", "IndianWellness", "IndianHealth",
-        "DesiHealth", "DesiWellness", "AyurvedaTips",
-        "YoutubeShorts", "Shorts", "ShortVideo",
-        "ViralShort", "TrendingShorts", "ReelsHealth",
-        "60Seconds", "QuickTips", "FastFacts",
-        "LearnSomethingNew", "DidYouKnow", "MindBlown",
-        "HealthMindBlown", "WellnessWednesday", "HealthMonday",
-        "TipOfTheDay", "FactOfTheDay", "HabitOfTheDay",
-    ]
+    adjacent = ["HealthTips", "Wellness", "Shorts", "HealthyHabits", "Science"]
     tags.extend([f"#{t}" for t in adjacent])
     return tags
 
@@ -299,7 +239,7 @@ def _clean_tags(raw: list, topic: str) -> str:
     out: list[str] = []
     seen: set[str] = set()
     topic_words = re.findall(r"[a-zA-Z0-9]+", topic or "")
-    candidates  = list(raw or []) + [topic] + [" ".join(topic_words[:3])]
+    candidates  = list(raw or []) + topic_words + ["health", "wellness"]
     for t in candidates:
         t = (str(t) or "").strip().lstrip("#")
         t = re.sub(r"[^a-zA-Z0-9 ]", "", t).strip()
@@ -307,25 +247,26 @@ def _clean_tags(raw: list, topic: str) -> str:
             continue
         seen.add(t.lower())
         out.append(t)
-        if len(out) >= 12:
+        if len(out) >= 8:
             break
-    return ",".join(out[:12])
+    return ",".join(out)
 
 
 def _fallback_seo(topic: str, script_text: str) -> dict:
     safe_topic = re.sub(r"[^\x00-\x7F]", "", topic or "Health Tips")
     title = f"{safe_topic[:75]} #Shorts"
+    
+    ht = _generate_topic_hashtags(safe_topic)[:5]
+    tag_block = " ".join(ht)
+
     description = (
         f"{safe_topic} - quick science-backed wellness tips for your daily routine.\n"
         "Like and subscribe for daily health tips.\n"
         "Educational only, not medical advice.\n\n"
-        + "\n".join(_generate_topic_hashtags(safe_topic)[:350])
+        + tag_block
     )
     words    = re.findall(r"[a-zA-Z0-9]+", safe_topic)
-    tags_csv = ",".join(
-        (words[:6] + ["health", "wellness", "shorts",
-                      "healthy habits", "fitness", "tips"])[:12]
-    )
+    tags_csv = ",".join((words[:5] + ["health", "wellness", "shorts"])[:8])
     return {
         "title": title,
         "description": description,
