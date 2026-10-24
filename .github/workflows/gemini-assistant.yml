@@ -41,7 +41,7 @@ jobs:
           # =========================================================================
           
           # 1. Gemini 3.5 Flash-Lite (Recommended right now since your 3.8 Flash hit limit!)
-          gemini --yolo --skip-trust --model gemini-3.5-flash-lite -p "${{ github.event.comment.body }}"
+          #gemini --yolo --skip-trust --model gemini-3.5-flash-lite -p "${{ github.event.comment.body }}"
           
           # 2. Gemini 3.6 Flash (Direct stable alternative to 3.8 Flash with separate quota)
           # gemini --yolo --skip-trust --model gemini-3.6-flash -p "${{ github.event.comment.body }}"
@@ -50,7 +50,7 @@ jobs:
           # gemini --yolo --skip-trust --model gemini-3.8-flash -p "${{ github.event.comment.body }}"
           
           # 4. Gemini 3.1 Flash-Lite (Ultra-lightweight backup for simple script/prompt edits)
-          # gemini --yolo --skip-trust --model gemini-3.1-flash-lite -p "${{ github.event.comment.body }}"
+          gemini --yolo --skip-trust --model gemini-3.1-flash-lite -p "${{ github.event.comment.body }}"
           
           # 5. Gemini 3.1 Pro Preview (High reasoning, strict free-tier limit)
           # gemini --yolo --skip-trust --model gemini-3.1-pro-preview -p "${{ github.event.comment.body }}"
