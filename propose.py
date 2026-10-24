@@ -169,22 +169,28 @@ Trending, actionable topics. Scheduled publish (IST): **{scheduled_ist.strftime(
 {numbered}
 
 ---
-**Reply with:**
-- `/approve-topic 1` (or 2-6) — approve a numbered topic
-- `/custom-topic Your Specific Topic` — use your own topic
-- `/reject-topic` — get fresh suggestions
+**Reply with either:**
+1. **Combined (Topic + Script in one comment):**
+   - `/approve-topic 1 /use-default-prompt` (or `/approve-topic 2 /set-script Your custom script text...`)
+   - `/custom-topic Your Topic /use-default-prompt` (or `/custom-topic Your Topic /set-script Your script text...`)
 
-> **After approval**, the bot will prompt you for the script text.
-> You can reply `/set-script [your voiceover text]` or `/use-default-prompt`.
+2. **Step-by-step:**
+   - `/approve-topic 1` (or 2-6) — approve a numbered topic (bot will then prompt for script)
+   - `/custom-topic Your Specific Topic` — use your own topic
+   - `/reject-topic` — get fresh suggestions
 
 {note}
 """
     meta_block = set_metadata_in_issue_body(body, {"slot": SLOT, "scheduled_ist": scheduled_ist.strftime("%Y-%m-%d %H:%M"), "topics": topics})
-    gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues", json={"title": title, "body": meta_block})
+    gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues", json={
+        "title": title,
+        "body": meta_block,
+        "labels": [f"slot:{SLOT}", "await-topic-approval"]
+    })
 
 def main() -> None:
     owner, repo = REPO.split("/", 1)
-    if open_issues_with_labels(owner, repo, [f"slot:{SLOT}", "await-topic-approval"]): return
+    if open_issues_with_labels(owner, repo, [f"slot:{SLOT}"]): return
     
     approved = load_recent_approved_topics(owner, repo)
     pool = get_topics_pool(owner, repo)

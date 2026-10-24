@@ -468,41 +468,57 @@ def handle_reject_topic(ctx: Ctx) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     post_comment(ctx.owner, ctx.repo, ctx.number, f"Fresh topic options:\n{numbered}\n\nReply /approve-topic N or /custom-topic Your Topic")
 
-def _start_after_topic(ctx: Ctx, topic: str) -> None:
+def _start_after_topic(ctx: Ctx, topic: str, post_prompt: bool = True) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     meta["topic"] = topic
     meta.pop("user_script", None)
     new_body = set_metadata_in_issue_body(ctx.issue_body, meta)
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
-    _post_script_request(ctx.owner, ctx.repo, ctx.number, topic)
+    ctx.issue_body = new_body
+    if post_prompt:
+        _post_script_request(ctx.owner, ctx.repo, ctx.number, topic)
 
-def handle_custom_topic(ctx: Ctx) -> None:
-    topic = ctx.comment_body[len("/custom-topic"):].strip()
+def handle_custom_topic(ctx: Ctx, post_prompt: bool = True) -> None:
+    body = ctx.comment_body
+    topic_raw = body[len("/custom-topic"):].strip()
+    for kw in ["/use-default-prompt", "/set-script"]:
+        idx = topic_raw.lower().find(kw)
+        if idx != -1:
+            topic_raw = topic_raw[:idx].strip()
+    topic = topic_raw
     if not topic:
-        post_comment(ctx.owner, ctx.repo, ctx.number, "Please provide a topic. Example: /custom-topic The 4-7-8 breathing trick")
+        if post_prompt:
+            post_comment(ctx.owner, ctx.repo, ctx.number, "Please provide a topic. Example: /custom-topic The 4-7-8 breathing trick")
         return
-    _start_after_topic(ctx, topic)
+    _start_after_topic(ctx, topic, post_prompt=post_prompt)
 
-def handle_approve_topic(ctx: Ctx) -> None:
+def handle_approve_topic(ctx: Ctx, post_prompt: bool = True) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     topics = meta.get("topics", [])
-    parts = ctx.comment_body.split(maxsplit=1)
-    
-    if len(parts) > 1 and not parts[1].strip().isdigit():
-        topic = parts[1].strip()
+    body_part = ctx.comment_body[len("/approve-topic"):].strip()
+    for kw in ["/use-default-prompt", "/set-script"]:
+        idx = body_part.lower().find(kw)
+        if idx != -1:
+            body_part = body_part[:idx].strip()
+
+    parts = body_part.split(maxsplit=1)
+    if len(parts) > 0 and not parts[0].strip().isdigit():
+        topic = body_part.strip()
     else:
-        idx = int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else 1
+        idx = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 1
         if not (1 <= idx <= len(topics)):
-            post_comment(ctx.owner, ctx.repo, ctx.number, f"Invalid index {idx}.")
+            if post_prompt:
+                post_comment(ctx.owner, ctx.repo, ctx.number, f"Invalid index {idx}.")
             return
         topic = topics[idx - 1]
-    _start_after_topic(ctx, topic)
+    _start_after_topic(ctx, topic, post_prompt=post_prompt)
 
 def handle_use_default_prompt(ctx: Ctx) -> None:
     _run_build_with_script(ctx, None)
 
 def handle_set_script(ctx: Ctx) -> None:
-    user_script = ctx.comment_body[len("/set-script"):].strip()
+    body = ctx.comment_body
+    user_script = body[len("/set-script"):].strip()
     if not user_script:
         post_comment(ctx.owner, ctx.repo, ctx.number, "Script was empty. Reply `/set-script your full text` or `/use-default-prompt`.")
         return
@@ -588,11 +604,65 @@ def main() -> None:
     if not is_authorized_commenter(event): return
     owner, repo = REPO.split("/", 1)
     ctx = Ctx(event, owner, repo)
-    comment_lower = ctx.comment_body.lower()
+    comment_body = ctx.comment_body
+    comment_lower = comment_body.lower()
+
+    if comment_lower.startswith("/approve-video"):
+        handle_approve_video(ctx)
+        return
+    if comment_lower.startswith("/reject-video"):
+        handle_reject_video(ctx)
+        return
+    if comment_lower.startswith("/regenerate-video"):
+        handle_regenerate_video(ctx)
+        return
+    if comment_lower.startswith("/reject-topic") or comment_lower.startswith("/new-topic"):
+        handle_reject_topic(ctx)
+        return
+
+    has_approve = "/approve-topic" in comment_lower
+    has_custom = "/custom-topic" in comment_lower
+    has_default = "/use-default-prompt" in comment_lower
+    has_set_script = "/set-script" in comment_lower
+
+    if (has_approve or has_custom) and (has_default or has_set_script):
+        topic_idx = comment_lower.find("/approve-topic")
+        if topic_idx == -1: topic_idx = comment_lower.find("/custom-topic")
+        
+        script_idx = comment_lower.find("/use-default-prompt")
+        if script_idx == -1: script_idx = comment_lower.find("/set-script")
+
+        if topic_idx != -1 and script_idx != -1:
+            if topic_idx < script_idx:
+                topic_part = comment_body[topic_idx:script_idx].strip()
+                script_part = comment_body[script_idx:].strip()
+            else:
+                script_part = comment_body[script_idx:topic_idx].strip()
+                topic_part = comment_body[topic_idx:].strip()
+
+            if topic_part.lower().startswith("/approve-topic"):
+                t_ctx = Ctx(dict(event), owner, repo)
+                t_ctx.comment_body = topic_part
+                handle_approve_topic(t_ctx, post_prompt=False)
+                ctx.issue_body = t_ctx.issue_body
+            elif topic_part.lower().startswith("/custom-topic"):
+                t_ctx = Ctx(dict(event), owner, repo)
+                t_ctx.comment_body = topic_part
+                handle_custom_topic(t_ctx, post_prompt=False)
+                ctx.issue_body = t_ctx.issue_body
+
+            if script_part.lower().startswith("/use-default-prompt"):
+                s_ctx = Ctx(dict(event), owner, repo)
+                s_ctx.issue["body"] = ctx.issue_body
+                handle_use_default_prompt(s_ctx)
+            elif script_part.lower().startswith("/set-script"):
+                s_ctx = Ctx(dict(event), owner, repo)
+                s_ctx.comment_body = script_part
+                s_ctx.issue["body"] = ctx.issue_body
+                handle_set_script(s_ctx)
+            return
+
     for prefix, handler in _COMMANDS:
         if comment_lower.startswith(prefix):
             handler(ctx)
             return
-
-if __name__ == "__main__":
-    main()
