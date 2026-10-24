@@ -47,6 +47,7 @@ GROQ_FALLBACKS = [
 ]
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+REGION         = os.getenv("REGION", "IN")
 TTS_LANG       = os.getenv("TTS_LANG", "en")
 BGM_VOL        = 0.07
 
