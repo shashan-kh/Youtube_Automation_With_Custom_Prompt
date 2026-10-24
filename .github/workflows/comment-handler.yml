@@ -78,7 +78,7 @@ jobs:
         shell: bash
         run: |
           missing=0
-          for v in GROQ_API_KEY PEXELS_API_KEY YT_CLIENT_ID YT_CLIENT_SECRET YT_REFRESH_TOKEN; do
+          for v in GROQ_API_KEY YT_CLIENT_ID YT_CLIENT_SECRET YT_REFRESH_TOKEN; do
             if [ -z "${!v}" ]; then
               echo "::error::Missing secret: $v"
               missing=1
@@ -86,6 +86,11 @@ jobs:
               echo "$v is set ✓"
             fi
           done
+          if [ -z "$PEXELS_API_KEY" ]; then
+            echo "::warning::PEXELS_API_KEY is not set (falling back to built-in stock B-roll URLs)."
+          else
+            echo "PEXELS_API_KEY is set ✓"
+          fi
           [ "$missing" -eq 0 ] || exit 1
         env:
           GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}

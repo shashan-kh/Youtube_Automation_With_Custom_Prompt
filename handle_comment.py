@@ -285,6 +285,20 @@ def fetch_broll(query: str, need: int = 6) -> list[str]:
                 if link not in seen:
                     seen.add(link)
                     collected.append(link)
+
+    fallback_urls = [
+        "https://assets.mixkit.co/videos/preview/mixkit-woman-doing-yoga-exercises-in-a-park-42289-large.mp4",
+        "https://assets.mixkit.co/videos/preview/mixkit-young-woman-running-on-a-path-in-a-park-41551-large.mp4",
+        "https://assets.mixkit.co/videos/preview/mixkit-healthy-food-ingredients-on-a-table-43178-large.mp4",
+        "https://assets.mixkit.co/videos/preview/mixkit-glass-of-water-being-poured-from-a-bottle-43171-large.mp4",
+        "https://assets.mixkit.co/videos/preview/mixkit-woman-stretching-her-arms-in-nature-41552-large.mp4",
+        "https://assets.mixkit.co/videos/preview/mixkit-man-meditating-in-nature-42288-large.mp4"
+    ]
+    for url in fallback_urls:
+        if url not in seen:
+            seen.add(url)
+            collected.append(url)
+
     import random
     random.shuffle(collected)
     return collected[:need]
@@ -515,8 +529,9 @@ def handle_custom_topic(ctx: Ctx) -> None:
     if not topic:
         post_comment(ctx.owner, ctx.repo, ctx.number, "Please provide a topic. Example: /custom-topic The 4-7-8 breathing trick")
         return
+    user_script = _extract_user_script_if_present(ctx.comment_body)
     _start_after_topic(ctx, topic)
-    _post_script_request(ctx.owner, ctx.repo, ctx.number, topic)
+    _run_build_with_script(ctx, user_script)
 
 def handle_approve_topic(ctx: Ctx) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
@@ -525,8 +540,9 @@ def handle_approve_topic(ctx: Ctx) -> None:
     if not topic:
         post_comment(ctx.owner, ctx.repo, ctx.number, f"Invalid topic selection.")
         return
+    user_script = _extract_user_script_if_present(ctx.comment_body)
     _start_after_topic(ctx, topic)
-    _post_script_request(ctx.owner, ctx.repo, ctx.number, topic)
+    _run_build_with_script(ctx, user_script)
 
 def handle_use_default_prompt(ctx: Ctx) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
