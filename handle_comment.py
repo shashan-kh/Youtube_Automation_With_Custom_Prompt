@@ -654,11 +654,13 @@ def main() -> None:
             if script_part.lower().startswith("/use-default-prompt"):
                 s_ctx = Ctx(dict(event), owner, repo)
                 s_ctx.issue["body"] = ctx.issue_body
+                s_ctx.issue_body = ctx.issue_body
                 handle_use_default_prompt(s_ctx)
             elif script_part.lower().startswith("/set-script"):
                 s_ctx = Ctx(dict(event), owner, repo)
                 s_ctx.comment_body = script_part
                 s_ctx.issue["body"] = ctx.issue_body
+                s_ctx.issue_body = ctx.issue_body
                 handle_set_script(s_ctx)
             return
 
