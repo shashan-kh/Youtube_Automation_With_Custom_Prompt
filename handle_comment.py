@@ -488,10 +488,25 @@ def _start_after_topic(ctx: Ctx, topic: str) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     ctx.issue_body = new_body
 
+def _parse_topic_from_approve(comment_body: str, topics: list[str]) -> str | None:
+    body_part = comment_body[len("/approve-topic"):].strip()
+    for kw in ["/use-default-prompt", "/set-script"]:
+        idx = body_part.lower().find(kw)
+        if idx != -1:
+            body_part = body_part[:idx].strip()
+
+    parts = body_part.split(maxsplit=1)
+    if len(parts) > 0 and not parts[0].strip().isdigit():
+        return body_part.strip()
+    else:
+        idx = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 1
+        if not (1 <= idx <= len(topics)):
+            return None
+        return topics[idx - 1]
+
 def handle_custom_topic(ctx: Ctx) -> None:
     body = ctx.comment_body
     topic_raw = body[len("/custom-topic"):].strip()
-    user_script = _extract_user_script_if_present(topic_raw)
     for kw in ["/use-default-prompt", "/set-script"]:
         idx = topic_raw.lower().find(kw)
         if idx != -1:
@@ -501,32 +516,22 @@ def handle_custom_topic(ctx: Ctx) -> None:
         post_comment(ctx.owner, ctx.repo, ctx.number, "Please provide a topic. Example: /custom-topic The 4-7-8 breathing trick")
         return
     _start_after_topic(ctx, topic)
-    _run_build_with_script(ctx, user_script)
+    _post_script_request(ctx.owner, ctx.repo, ctx.number, topic)
 
 def handle_approve_topic(ctx: Ctx) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     topics = meta.get("topics", [])
-    body_part = ctx.comment_body[len("/approve-topic"):].strip()
-    user_script = _extract_user_script_if_present(body_part)
-    for kw in ["/use-default-prompt", "/set-script"]:
-        idx = body_part.lower().find(kw)
-        if idx != -1:
-            body_part = body_part[:idx].strip()
-
-    parts = body_part.split(maxsplit=1)
-    if len(parts) > 0 and not parts[0].strip().isdigit():
-        topic = body_part.strip()
-    else:
-        idx = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 1
-        if not (1 <= idx <= len(topics)):
-            post_comment(ctx.owner, ctx.repo, ctx.number, f"Invalid index {idx}.")
-            return
-        topic = topics[idx - 1]
+    topic = _parse_topic_from_approve(ctx.comment_body, topics)
+    if not topic:
+        post_comment(ctx.owner, ctx.repo, ctx.number, f"Invalid topic selection.")
+        return
     _start_after_topic(ctx, topic)
-    _run_build_with_script(ctx, user_script)
+    _post_script_request(ctx.owner, ctx.repo, ctx.number, topic)
 
 def handle_use_default_prompt(ctx: Ctx) -> None:
-    _run_build_with_script(ctx, None)
+    meta = get_metadata_from_issue_body(ctx.issue_body) or {}
+    user_script = meta.get("user_script")
+    _run_build_with_script(ctx, user_script)
 
 def handle_set_script(ctx: Ctx) -> None:
     body = ctx.comment_body
@@ -550,7 +555,13 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     post_comment(ctx.owner, ctx.repo, ctx.number, f"Script received. Building video for: {topic}\nThis takes 5-10 mins.")
 
-    video_meta, new_body2 = build_preview(topic, user_script, ctx.slot, new_body)
+    try:
+        video_meta, new_body2 = build_preview(topic, user_script, ctx.slot, new_body)
+    except Exception as exc:
+        log.error("[build] error: %s", exc, exc_info=True)
+        post_comment(ctx.owner, ctx.repo, ctx.number, f"Error building preview: {exc}")
+        return
+
     if not video_meta:
         post_comment(ctx.owner, ctx.repo, ctx.number, "Could not produce a valid preview. Try /regenerate-video.")
         return
@@ -670,28 +681,26 @@ def main() -> None:
                 script_part = comment_body[script_idx:topic_idx].strip()
                 topic_part = comment_body[topic_idx:].strip()
 
-            if topic_part.lower().startswith("/approve-topic"):
-                t_ctx = Ctx(dict(event), owner, repo)
-                t_ctx.comment_body = topic_part
-                handle_approve_topic(t_ctx, post_prompt=False)
-                ctx.issue_body = t_ctx.issue_body
-            elif topic_part.lower().startswith("/custom-topic"):
-                t_ctx = Ctx(dict(event), owner, repo)
-                t_ctx.comment_body = topic_part
-                handle_custom_topic(t_ctx, post_prompt=False)
-                ctx.issue_body = t_ctx.issue_body
+            meta = get_metadata_from_issue_body(ctx.issue_body) or {}
+            topics = meta.get("topics", [])
 
-            if script_part.lower().startswith("/use-default-prompt"):
-                s_ctx = Ctx(dict(event), owner, repo)
-                s_ctx.issue["body"] = ctx.issue_body
-                s_ctx.issue_body = ctx.issue_body
-                handle_use_default_prompt(s_ctx)
-            elif script_part.lower().startswith("/set-script"):
-                s_ctx = Ctx(dict(event), owner, repo)
-                s_ctx.comment_body = script_part
-                s_ctx.issue["body"] = ctx.issue_body
-                s_ctx.issue_body = ctx.issue_body
-                handle_set_script(s_ctx)
+            topic = None
+            if topic_part.lower().startswith("/approve-topic"):
+                topic = _parse_topic_from_approve(topic_part, topics)
+            elif topic_part.lower().startswith("/custom-topic"):
+                t_raw = topic_part[len("/custom-topic"):].strip()
+                for kw in ["/use-default-prompt", "/set-script"]:
+                    idx = t_raw.lower().find(kw)
+                    if idx != -1: t_raw = t_raw[:idx].strip()
+                topic = t_raw
+
+            if not topic:
+                post_comment(ctx.owner, ctx.repo, ctx.number, "Could not parse topic from combined command.")
+                return
+
+            user_script = _extract_user_script_if_present(script_part)
+            _start_after_topic(ctx, topic)
+            _run_build_with_script(ctx, user_script)
             return
 
     for prefix, handler in _COMMANDS:
