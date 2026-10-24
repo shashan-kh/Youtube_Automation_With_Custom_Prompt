@@ -452,6 +452,18 @@ def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None
     )
     post_comment(owner, repo, number, body)
 
+def _clean_issue_title_to_topic(title: str) -> str:
+    s = re.sub(r"(?i)#?shorts?|\[[^\]]+\]|\([^)]+\)", "", (title or "").strip())
+    s = re.split(r"\s+[|\-–—]\s+", s)[0].strip()
+    return (s[0].upper() + s[1:])[:120].rstrip() if s else "Health and wellness tips"
+
+def _extract_user_script_if_present(comment_body: str) -> str | None:
+    idx = comment_body.lower().find("/set-script")
+    if idx != -1:
+        script = comment_body[idx + len("/set-script"):].strip()
+        return script if script else None
+    return None
+
 def handle_reject_topic(ctx: Ctx) -> None:
     try:
         from propose import gather_topics
@@ -468,34 +480,34 @@ def handle_reject_topic(ctx: Ctx) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     post_comment(ctx.owner, ctx.repo, ctx.number, f"Fresh topic options:\n{numbered}\n\nReply /approve-topic N or /custom-topic Your Topic")
 
-def _start_after_topic(ctx: Ctx, topic: str, post_prompt: bool = True) -> None:
+def _start_after_topic(ctx: Ctx, topic: str) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     meta["topic"] = topic
     meta.pop("user_script", None)
     new_body = set_metadata_in_issue_body(ctx.issue_body, meta)
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     ctx.issue_body = new_body
-    if post_prompt:
-        _post_script_request(ctx.owner, ctx.repo, ctx.number, topic)
 
-def handle_custom_topic(ctx: Ctx, post_prompt: bool = True) -> None:
+def handle_custom_topic(ctx: Ctx) -> None:
     body = ctx.comment_body
     topic_raw = body[len("/custom-topic"):].strip()
+    user_script = _extract_user_script_if_present(topic_raw)
     for kw in ["/use-default-prompt", "/set-script"]:
         idx = topic_raw.lower().find(kw)
         if idx != -1:
             topic_raw = topic_raw[:idx].strip()
     topic = topic_raw
     if not topic:
-        if post_prompt:
-            post_comment(ctx.owner, ctx.repo, ctx.number, "Please provide a topic. Example: /custom-topic The 4-7-8 breathing trick")
+        post_comment(ctx.owner, ctx.repo, ctx.number, "Please provide a topic. Example: /custom-topic The 4-7-8 breathing trick")
         return
-    _start_after_topic(ctx, topic, post_prompt=post_prompt)
+    _start_after_topic(ctx, topic)
+    _run_build_with_script(ctx, user_script)
 
-def handle_approve_topic(ctx: Ctx, post_prompt: bool = True) -> None:
+def handle_approve_topic(ctx: Ctx) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     topics = meta.get("topics", [])
     body_part = ctx.comment_body[len("/approve-topic"):].strip()
+    user_script = _extract_user_script_if_present(body_part)
     for kw in ["/use-default-prompt", "/set-script"]:
         idx = body_part.lower().find(kw)
         if idx != -1:
@@ -507,11 +519,11 @@ def handle_approve_topic(ctx: Ctx, post_prompt: bool = True) -> None:
     else:
         idx = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 1
         if not (1 <= idx <= len(topics)):
-            if post_prompt:
-                post_comment(ctx.owner, ctx.repo, ctx.number, f"Invalid index {idx}.")
+            post_comment(ctx.owner, ctx.repo, ctx.number, f"Invalid index {idx}.")
             return
         topic = topics[idx - 1]
-    _start_after_topic(ctx, topic, post_prompt=post_prompt)
+    _start_after_topic(ctx, topic)
+    _run_build_with_script(ctx, user_script)
 
 def handle_use_default_prompt(ctx: Ctx) -> None:
     _run_build_with_script(ctx, None)
@@ -575,7 +587,25 @@ def handle_regenerate_video(ctx: Ctx) -> None:
 def handle_approve_video(ctx: Ctx) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     vid_id = meta.get("preview_video_id")
-    if not vid_id: return
+    if not vid_id:
+        topic = meta.get("topic")
+        if not topic:
+            issue_title = ctx.issue.get("title", "")
+            topic = _clean_issue_title_to_topic(issue_title)
+            meta["topic"] = topic
+        
+        user_script = meta.get("user_script")
+        post_comment(ctx.owner, ctx.repo, ctx.number, f"Building video preview for: {topic}...")
+        video_meta, new_body = build_preview(topic, user_script, ctx.slot, ctx.issue_body)
+        if not video_meta:
+            post_comment(ctx.owner, ctx.repo, ctx.number, "Could not produce a valid preview. Try /regenerate-video.")
+            return
+        
+        ctx.issue_body = new_body
+        meta = get_metadata_from_issue_body(new_body) or {}
+        vid_id = meta.get("preview_video_id")
+        if not vid_id:
+            return
     
     yt = _yt_client()
     tomorrow = datetime.now(IST).date() + timedelta(days=1)
