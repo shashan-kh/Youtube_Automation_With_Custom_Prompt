@@ -503,33 +503,54 @@ def _start_after_topic(ctx: Ctx, topic: str) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     ctx.issue_body = new_body
 
-def _parse_topic_from_approve(comment_body: str, topics: list[str]) -> str | None:
-    body_part = comment_body[len("/approve-topic"):].strip()
+def _parse_topic_from_approve(comment_body: str, topics: list[str], issue_title: str = "") -> str | None:
+    lower = comment_body.lower()
+    idx_kw = lower.find("/approve-topic")
+    if idx_kw == -1:
+        idx_kw = 0
+    else:
+        idx_kw += len("/approve-topic")
+
+    body_part = comment_body[idx_kw:].strip()
     for kw in ["/use-default-prompt", "/set-script"]:
         idx = body_part.lower().find(kw)
         if idx != -1:
             body_part = body_part[:idx].strip()
 
+    if not body_part:
+        if topics:
+            return topics[0]
+        return _clean_issue_title_to_topic(issue_title)
+
     parts = body_part.split(maxsplit=1)
     if len(parts) > 0 and not parts[0].strip().isdigit():
         return body_part.strip()
     else:
-        idx = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 1
-        if not (1 <= idx <= len(topics)):
-            return None
-        return topics[idx - 1]
+        try:
+            idx = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 1
+            if topics and 1 <= idx <= len(topics):
+                return topics[idx - 1]
+            elif topics:
+                return topics[0]
+        except Exception:
+            pass
+        if topics:
+            return topics[0]
+        return _clean_issue_title_to_topic(issue_title)
 
 def handle_custom_topic(ctx: Ctx) -> None:
     body = ctx.comment_body
-    topic_raw = body[len("/custom-topic"):].strip()
+    lower = body.lower()
+    idx_c = lower.find("/custom-topic")
+    topic_raw = body[idx_c + len("/custom-topic"):].strip() if idx_c != -1 else body
     for kw in ["/use-default-prompt", "/set-script"]:
-        idx = topic_raw.lower().find(kw)
-        if idx != -1:
-            topic_raw = topic_raw[:idx].strip()
+        pos = topic_raw.lower().find(kw)
+        if pos != -1:
+            topic_raw = topic_raw[:pos].strip()
     topic = topic_raw
     if not topic:
-        post_comment(ctx.owner, ctx.repo, ctx.number, "Please provide a topic. Example: /custom-topic The 4-7-8 breathing trick")
-        return
+        issue_title = ctx.issue.get("title", "")
+        topic = _clean_issue_title_to_topic(issue_title)
     user_script = _extract_user_script_if_present(ctx.comment_body)
     _start_after_topic(ctx, topic)
     _run_build_with_script(ctx, user_script)
@@ -537,10 +558,10 @@ def handle_custom_topic(ctx: Ctx) -> None:
 def handle_approve_topic(ctx: Ctx) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     topics = meta.get("topics", [])
-    topic = _parse_topic_from_approve(ctx.comment_body, topics)
+    issue_title = ctx.issue.get("title", "")
+    topic = _parse_topic_from_approve(ctx.comment_body, topics, issue_title)
     if not topic:
-        post_comment(ctx.owner, ctx.repo, ctx.number, f"Invalid topic selection.")
-        return
+        topic = _clean_issue_title_to_topic(issue_title)
     user_script = _extract_user_script_if_present(ctx.comment_body)
     _start_after_topic(ctx, topic)
     _run_build_with_script(ctx, user_script)
@@ -552,7 +573,8 @@ def handle_use_default_prompt(ctx: Ctx) -> None:
 
 def handle_set_script(ctx: Ctx) -> None:
     body = ctx.comment_body
-    user_script = body[len("/set-script"):].strip()
+    idx_s = body.lower().find("/set-script")
+    user_script = body[idx_s + len("/set-script"):].strip() if idx_s != -1 else body
     if not user_script:
         post_comment(ctx.owner, ctx.repo, ctx.number, "Script was empty. Reply `/set-script your full text` or `/use-default-prompt`.")
         return
@@ -562,8 +584,9 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     topic = meta.get("topic", "")
     if not topic:
-        post_comment(ctx.owner, ctx.repo, ctx.number, "No approved topic found.")
-        return
+        issue_title = ctx.issue.get("title", "")
+        topic = _clean_issue_title_to_topic(issue_title)
+        meta["topic"] = topic
 
     if user_script: meta["user_script"] = user_script
     else: meta.pop("user_script", None)
@@ -599,7 +622,9 @@ def handle_reject_video(ctx: Ctx) -> None:
 
 def handle_regenerate_video(ctx: Ctx) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
-    if not meta.get("topic"): return
+    if not meta.get("topic"):
+        issue_title = ctx.issue.get("title", "")
+        meta["topic"] = _clean_issue_title_to_topic(issue_title)
     vid_id = meta.get("preview_video_id")
     if vid_id:
         try: _yt_client().videos().delete(id=vid_id).execute()
@@ -665,16 +690,16 @@ def main() -> None:
     comment_body = ctx.comment_body
     comment_lower = comment_body.lower()
 
-    if comment_lower.startswith("/approve-video"):
+    if "/approve-video" in comment_lower:
         handle_approve_video(ctx)
         return
-    if comment_lower.startswith("/reject-video"):
+    if "/reject-video" in comment_lower:
         handle_reject_video(ctx)
         return
-    if comment_lower.startswith("/regenerate-video"):
+    if "/regenerate-video" in comment_lower:
         handle_regenerate_video(ctx)
         return
-    if comment_lower.startswith("/reject-topic") or comment_lower.startswith("/new-topic"):
+    if "/reject-topic" in comment_lower or "/new-topic" in comment_lower:
         handle_reject_topic(ctx)
         return
 
@@ -702,25 +727,38 @@ def main() -> None:
             topics = meta.get("topics", [])
 
             topic = None
-            if topic_part.lower().startswith("/approve-topic"):
-                topic = _parse_topic_from_approve(topic_part, topics)
-            elif topic_part.lower().startswith("/custom-topic"):
-                t_raw = topic_part[len("/custom-topic"):].strip()
+            if "/approve-topic" in topic_part.lower():
+                topic = _parse_topic_from_approve(topic_part, topics, ctx.issue.get("title", ""))
+            elif "/custom-topic" in topic_part.lower():
+                idx_c = topic_part.lower().find("/custom-topic")
+                t_raw = topic_part[idx_c + len("/custom-topic"):].strip() if idx_c != -1 else topic_part
                 for kw in ["/use-default-prompt", "/set-script"]:
                     idx = t_raw.lower().find(kw)
                     if idx != -1: t_raw = t_raw[:idx].strip()
                 topic = t_raw
 
             if not topic:
-                post_comment(ctx.owner, ctx.repo, ctx.number, "Could not parse topic from combined command.")
-                return
+                topic = _clean_issue_title_to_topic(ctx.issue.get("title", ""))
 
             user_script = _extract_user_script_if_present(script_part)
             _start_after_topic(ctx, topic)
             _run_build_with_script(ctx, user_script)
             return
 
+    if has_approve:
+        handle_approve_topic(ctx)
+        return
+    if has_custom:
+        handle_custom_topic(ctx)
+        return
+    if has_default:
+        handle_use_default_prompt(ctx)
+        return
+    if has_set_script:
+        handle_set_script(ctx)
+        return
+
     for prefix, handler in _COMMANDS:
-        if comment_lower.startswith(prefix):
+        if prefix in comment_lower:
             handler(ctx)
             return
