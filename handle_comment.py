@@ -1,7 +1,7 @@
 """
 handle_comment.py — Processes all /commands posted on GitHub Issues, sanitizes spoken scripts
-to be clean, curious, and informative, maximizes duration just below 59 seconds (PREVIEW_MAX = 58.5s),
-appends a proper 'Thank you' conclusion strictly once, renders the vertical video, and uploads to YouTube.
+with precise punctuation for natural TTS pausing, synchronizes visual B-roll cuts 1:1 with spoken
+sentence timestamps, maximizes duration just below 59 seconds, and uploads to YouTube.
 """
 from __future__ import annotations
 
@@ -144,10 +144,8 @@ def _build_model_list() -> list[str]:
 
 def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks: bool = False) -> str:
     """
-    Sanitizes spoken narration:
-    1. Strips markdown, stage directions, and timestamps.
-    2. Strips all duplicate sign-offs.
-    3. Appends UNIFIED_SINGLE_OUTRO strictly ONCE at the end containing the proper 'Thank you' conclusion.
+    Sanitizes spoken narration with proper rhythmic punctuation and appends
+    UNIFIED_SINGLE_OUTRO strictly ONCE at the end.
     """
     text = raw_text or ""
 
@@ -192,7 +190,6 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
     body_text = " ".join(deduped_sentences).strip()
     body_text = enforce_policy_guardrails(body_text)
 
-    # Append UNIFIED_SINGLE_OUTRO strictly ONCE (contains proper Thank You conclusion)
     final_spoken = body_text.rstrip(".!? ") + ". " + UNIFIED_SINGLE_OUTRO
     final_spoken = re.sub(r"\s+", " ", final_spoken).strip()
     return final_spoken
@@ -219,7 +216,7 @@ def build_viral_shorts_segments(spoken_script: str, topic: str) -> list[dict]:
         },
         {
             "segment": "2. High-Retention Informative Body (0:03–0:50)",
-            "visual_direction": "Fast-paced 2.4s B-roll cuts showing healthy habits, nutrition, and research highlights.",
+            "visual_direction": "Voice-synchronized B-roll cuts matching exact sentence timing.",
             "on_screen_text": "SCIENCE-BACKED WELLNESS",
             "spoken_narration": body_sents or hook_sent,
             "audio_cue": "Steady rhythmic ambient pulse supporting spoken cadence",
@@ -243,6 +240,7 @@ def generate_script(topic: str, user_prompt: str) -> str:
     system_msg = (
         "You are an elite, engaging YouTube Shorts scriptwriter for health and wellness. "
         "Write a rich, detailed, high-retention script (~140-150 words) that maximizes duration up to 57 seconds. "
+        "Use precise English punctuation (commas for breath pauses, periods for full stops). "
         f"Cite {source_orgs} naturally in speech. "
         "Output ONLY the raw speakable body sentences. Do NOT include <think> tags, markdown, "
         "speaker labels, timestamps, or sign-offs.\n"
@@ -340,11 +338,35 @@ def ensure_bgm_track(duration: float, out_path: str = "bgm_src.m4a") -> str:
     return out_path
 
 
-# ── Captions ──────────────────────────────────────────────────────────────────
+# ── Captions & Whisper Sentence Timestamps ────────────────────────────────────
 def _fmt_time(t: float) -> str:
     h, m, s = int(t // 3600), int((t % 3600) // 60), int(t % 60)
     ms = int((t - int(t)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def get_sentence_timestamps(audio_path: str, lang: str = "en") -> list[tuple[float, float]]:
+    """Extracts exact sentence start and end timestamps from Whisper for 1:1 visual synchronization."""
+    try:
+        audio_dur = get_audio_duration(audio_path)
+        from faster_whisper import WhisperModel
+        model = WhisperModel(os.getenv("WHISPER_MODEL", "tiny.en"), device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(audio_path, language=lang, beam_size=5, vad_filter=True, word_timestamps=True)
+
+        intervals = []
+        for seg in segments:
+            seg_start = float(seg.start)
+            seg_end = float(seg.end)
+            if seg_end > seg_start:
+                intervals.append((seg_start, seg_end))
+        if intervals:
+            return intervals
+    except Exception as exc:
+        log.warning("[whisper] sentence timestamp extraction failed (%s), using fallback intervals", exc)
+
+    dur = get_audio_duration(audio_path)
+    step = 4.0
+    return [(t, min(dur, t + step)) for t in [i * step for i in range(int(dur // step) + 1)] if t < dur]
 
 
 def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
@@ -389,7 +411,7 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
             f.writelines(out)
         return True
     except Exception as exc:
-        log.warning("[srt] Whisper failed (%s), falling back to blank SRT", exc)
+        log.warning("[srt] failed: %s", exc)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(f"1\n{_fmt_time(0.0)} --> {_fmt_time(max(0.8, get_audio_duration(audio_path)))}\n \n\n")
         return False
@@ -416,7 +438,7 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
     )
 
 
-# ── Video Processing ──────────────────────────────────────────────────────────
+# ── Video Processing (Voice-Synchronized Visual Cuts) ─────────────────────────
 _cascade = None
 
 
@@ -546,7 +568,8 @@ def render_and_cap(
     thumb_out_path: str = "thumbnail.jpg",
 ) -> float:
     """
-    Renders video maximized to just below 59 seconds (PREVIEW_MAX = 58.5s) to capture maximum retention.
+    Renders video where visual B-roll cuts match spoken sentence timestamps 1:1,
+    maximizing duration just below 59 seconds.
     """
     tmp = Path(tempfile.mkdtemp())
     local = _download_broll(broll_urls, tmp)
@@ -563,41 +586,52 @@ def render_and_cap(
     except Exception as tex:
         log.warning("[thumbnail] Thumbnail generation failed (%s)", tex)
 
-    raw_clips, cropped, merged, voice_clip = [], [], None, None
+    raw_clips, voice_clip = [], None
     try:
-        base_comps = []
-        for p in local:
-            try:
-                c = VideoFileClip(p)
-                raw_clips.append(c)
-                clip_dur = float(c.duration)
-                step = 2.4
-                t_cursor = 0.0
-                while t_cursor + 1.8 <= min(clip_dur, 8.5):
-                    sub_end = min(clip_dur, t_cursor + step)
-                    comp = smart_cover_crop(c.subclip(t_cursor, sub_end)).set_audio(None)
-                    base_comps.append(comp)
-                    t_cursor += step
-                if not base_comps and clip_dur > 0.5:
-                    comp = smart_cover_crop(c.subclip(0, min(clip_dur, 2.5))).set_audio(None)
-                    base_comps.append(comp)
-            except Exception as exc:
-                log.warning("[render] clip load error on %s: %s", p, exc)
-
-        if not base_comps:
-            raise RuntimeError("No valid video clips could be decoded by MoviePy.")
-
-        cropped = list(base_comps)
+        # Get exact sentence timestamps from Whisper so visuals match spoken voice 1:1
+        sentence_intervals = get_sentence_timestamps(voice_mp3, lang=TTS_LANG)
         voice_clip = AudioFileClip(voice_mp3)
         target_dur = float(voice_clip.duration)
 
-        while sum(c.duration for c in cropped) < target_dur and len(cropped) < 80:
-            for comp in base_comps:
-                cropped.append(comp)
-                if sum(c.duration for c in cropped) >= target_dur:
-                    break
+        # Load source video clips
+        source_video_objs = []
+        for p in local:
+            try:
+                vc = VideoFileClip(p)
+                raw_clips.append(vc)
+                source_video_objs.append(vc)
+            except Exception as exc:
+                log.warning("[render] failed to load video file %s: %s", p, exc)
 
-        merged = concatenate_videoclips(cropped, method="compose")
+        if not source_video_objs:
+            raise RuntimeError("No valid source video objects could be loaded.")
+
+        # Build sentence-aligned visual cuts
+        matched_clips = []
+        source_idx = 0
+        for start_t, end_t in sentence_intervals:
+            seg_dur = max(0.5, end_t - start_t)
+            src_c = source_video_objs[source_idx % len(source_video_objs)]
+            source_idx += 1
+
+            src_dur = float(src_c.duration)
+            if src_dur >= seg_dur:
+                clip_start = random.uniform(0, max(0.0, src_dur - seg_dur))
+                sub = src_c.subclip(clip_start, clip_start + seg_dur)
+            else:
+                sub = src_c.subclip(0, src_dur)
+
+            cropped_sub = smart_cover_crop(sub, 1080, 1920).set_audio(None)
+            matched_clips.append(cropped_sub)
+
+        # Ensure total visual duration matches audio duration
+        current_visual_dur = sum(c.duration for c in matched_clips)
+        if current_visual_dur < target_dur:
+            diff = target_dur - current_visual_dur
+            extra_comp = smart_cover_crop(source_video_objs[0].subclip(0, min(float(source_video_objs[0].duration), diff)), 1080, 1920).set_audio(None)
+            matched_clips.append(extra_comp)
+
+        merged = concatenate_videoclips(matched_clips, method="compose")
         end = max(45.0, min(PREVIEW_MAX, target_dur))
 
         out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
@@ -612,7 +646,7 @@ def render_and_cap(
             logger=None,
         )
     finally:
-        for c in raw_clips + cropped:
+        for c in raw_clips:
             try:
                 c.close()
             except Exception:
@@ -620,11 +654,6 @@ def render_and_cap(
         if voice_clip:
             try:
                 voice_clip.close()
-            except Exception:
-                pass
-        if merged:
-            try:
-                merged.close()
             except Exception:
                 pass
         shutil.rmtree(tmp, ignore_errors=True)
@@ -836,8 +865,8 @@ def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None
 def _clean_issue_title_to_topic(title: str) -> str:
     s = re.sub(r"(?:^|\s)#\w+", " ", (title or "").strip())
     s = re.sub(r"(?i)\bshorts?\b|\[[^\]]*\]|\([^)]*\)", " ", s)
-    s = re.split(r"\s+\|\s+|\s+[-–—]{1,2}\s+", s)[0].strip()
-    s = re.sub(r"\s+", " ", s).strip(" :;,-–—.!\"'")
+    s = re.split(r"\s+\|\s+", s)[0].strip()
+    s = re.sub(r"\s+", " ", s).strip(" \t\n\r\"'")
     if len(re.findall(r"[a-zA-Z]{2,}", s)) < 3:
         return "Daily Health and Wellness Habits"
     return (s[0].upper() + s[1:])[:120].rstrip()
@@ -938,7 +967,7 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"🎬 Building max-retention video preview for **{topic}** (using {mode_str}).\nThis takes ~3–5 minutes...",
+        f"🎬 Building voice-synchronized video preview for **{topic}** (using {mode_str}).\nThis takes ~3–5 minutes...",
     )
 
     try:
@@ -987,7 +1016,7 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
         f"- **Thumbnail Status:** `{thumb_status}`\n"
         f"- **AI Thumbnail Prompt:** `{video_meta.get('thumbnail_prompt', '')}`\n"
         f"- **2026 Synthetic Media Flag:** `containsSyntheticMedia = True`\n\n"
-        f"### 🎙️ Shorts Script Breakdown\n"
+        f"### 🎙️ Shorts Script Breakdown (Voice-Synchronized Visuals)\n"
         f"{seg_table}\n\n"
         "Reply with:\n"
         "- `/approve-video` — schedule for publication\n"
