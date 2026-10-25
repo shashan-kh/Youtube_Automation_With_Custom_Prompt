@@ -1,8 +1,8 @@
 """
 handle_comment.py — Processes all /commands posted on GitHub Issues, sanitizes spoken scripts,
 programmatically expands acronyms (CDC -> Centers for Disease Control and Prevention), ensures
-duration is strictly less than 59 seconds (PREVIEW_MAX = 58.0s), and appends a guaranteed
-'Thank you' conclusion strictly once.
+duration matches the natural script length up to 58.8s (just less than 59 seconds), and appends
+a guaranteed 'Thank you' conclusion strictly once.
 """
 from __future__ import annotations
 
@@ -75,8 +75,8 @@ BGM_VOL = 0.07
 
 IST = timezone(timedelta(hours=5, minutes=30))
 TARGET_LOW = 45.0
-TARGET_HIGH = 58.0
-PREVIEW_MAX = 58.0  # Strictly less than 59 seconds
+TARGET_HIGH = 58.8
+PREVIEW_MAX = 58.8  # Maximized to just less than 59 seconds
 
 _PROMPT_FILE = Path(__file__).parent / "prompt.txt"
 
@@ -144,7 +144,6 @@ def _build_model_list() -> list[str]:
 
 
 def expand_full_forms(text: str) -> str:
-    """Programmatically converts acronyms into full formal organization names."""
     if not text:
         return ""
     expanded = text
@@ -156,13 +155,6 @@ def expand_full_forms(text: str) -> str:
 
 
 def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks: bool = False) -> str:
-    """
-    Sanitizes spoken narration:
-    1. Expands acronyms (CDC -> Centers for Disease Control and Prevention).
-    2. Strips markdown, stage directions, and timestamps.
-    3. Strips all duplicate sign-offs.
-    4. Appends UNIFIED_SINGLE_OUTRO strictly ONCE at the end containing the proper 'Thank you' conclusion.
-    """
     text = raw_text or ""
 
     text = re.sub(r"<think>.*?</think>", " ", text, flags=re.DOTALL | re.IGNORECASE)
@@ -208,7 +200,7 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
     body_text = " ".join(deduped_sentences).strip()
     body_text = enforce_policy_guardrails(body_text)
 
-    # Append UNIFIED_SINGLE_OUTRO strictly ONCE (Guaranteed Thank You conclusion)
+    # Append UNIFIED_SINGLE_OUTRO strictly ONCE
     final_spoken = body_text.rstrip(".!? ") + ". " + UNIFIED_SINGLE_OUTRO
     final_spoken = re.sub(r"\s+", " ", final_spoken).strip()
     return final_spoken
@@ -258,7 +250,7 @@ def generate_script(topic: str, user_prompt: str) -> str:
 
     system_msg = (
         "You are an elite, engaging YouTube Shorts scriptwriter for health and wellness. "
-        "Write a rich, detailed, high-retention script (~140-150 words) that maximizes duration up to 57 seconds. "
+        "Write a rich, detailed, high-retention script (~140-150 words) that maximizes duration up to 58 seconds. "
         "Use precise English punctuation (commas for breath pauses, periods for full stops). "
         f"Spell out full organization names (e.g., {source_orgs}). NEVER use acronyms like CDC or NIH. "
         "Output ONLY the raw speakable body sentences. Do NOT include <think> tags, markdown, "
@@ -585,7 +577,8 @@ def render_and_cap(
     thumb_out_path: str = "thumbnail.jpg",
 ) -> float:
     """
-    Renders video strictly under 59 seconds (PREVIEW_MAX = 58.0s) with 1:1 voice-synchronized cuts.
+    Renders video matching full script duration naturally up to 58.8s (strictly less than 59s),
+    with 1:1 voice-synchronized visual cuts.
     """
     tmp = Path(tempfile.mkdtemp())
     local = _download_broll(broll_urls, tmp)
@@ -644,7 +637,7 @@ def render_and_cap(
             matched_clips.append(extra_comp)
 
         merged = concatenate_videoclips(matched_clips, method="compose")
-        # STRICTLY less than 59 seconds
+        # Strictly less than 59 seconds (bounded by PREVIEW_MAX = 58.8)
         end = max(45.0, min(PREVIEW_MAX, target_dur))
 
         out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
@@ -796,7 +789,7 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
             if not os.path.exists(thumb_path):
                 thumb_path = None
 
-            score = abs(57.0 - dur)
+            score = abs(57.5 - dur)
             if score < best["score"]:
                 best_path = f"best_{attempt}.mp4"
                 shutil.copyfile(final_mp4, best_path)
@@ -1029,7 +1022,7 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
         f"- **Thumbnail Status:** `{thumb_status}`\n"
         f"- **AI Thumbnail Prompt:** `{video_meta.get('thumbnail_prompt', '')}`\n"
         f"- **2026 Synthetic Media Flag:** `containsSyntheticMedia = True`\n\n"
-        f"### 🎙️ Shorts Script Breakdown (Voice-Synchronized Visuals & Full Forms)\n"
+        f"### 🎙️ Shorts Script Breakdown (Voice-Synchronized Visuals & Full-Form Acronyms)\n"
         f"{seg_table}\n\n"
         "Reply with:\n"
         "- `/approve-video` — schedule for publication\n"
