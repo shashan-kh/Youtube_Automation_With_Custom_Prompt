@@ -1,7 +1,7 @@
 """
 propose.py — Discovers health and wellness topics aligned with the 4 Weekly Content Pillars
 (Daily Habits, Nutrition & Metabolism, Rest & Recovery, Movement & Longevity Science)
-and manages topics_pool.json.
+and manages topics_pool.json while fully preserving punctuation (colons, hyphens, question marks).
 """
 from __future__ import annotations
 
@@ -49,15 +49,15 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 BUILTIN_SAFE_TOPICS = [
     "How 10 Minutes of Morning Sunlight Optimizes Your Circadian Clock",
-    "Why Delaying Morning Caffeine by 60 Minutes Prevents Afternoon Crashes",
+    "Why Delaying Morning Caffeine by 60 Minutes Prevents Afternoon Crashes?",
     "Zone 2 Cardio: The Science Behind Longevity and Mitochondrial Health",
     "Magnesium Glycinate and Its Role in Deep Restorative Sleep Architecture",
-    "How Walking 10 Minutes After Meals Regulates Postprandial Glucose",
-    "Prebiotic Fiber and the Gut Microbiome: What Harvard Research Shows",
+    "How Walking 10 Minutes After Meals Regulates Postprandial Glucose?",
+    "Prebiotic Fiber and the Gut Microbiome: What Harvard Research Shows?",
     "How Cold Water Immersion Triggers Norepinephrine and Alertness",
-    "The Science of Deep Sleep: What Happens in Your Brain at Night",
+    "The Science of Deep Sleep: What Happens in Your Brain at Night?",
     "How Box Breathing Regulates Autonomic Heart Rate Variability",
-    "Protein Pacing: Why Distributing Protein Intake Maximizes Recovery",
+    "Protein Pacing: Why Distributing Protein Intake Maximizes Recovery?",
 ]
 
 
@@ -69,15 +69,27 @@ def is_valid_topic(text: str) -> bool:
 
 
 def clean_to_topic(title: str) -> str:
+    """
+    Cleans raw YouTube/LLM titles into crisp topic strings while fully preserving
+    punctuation symbols like colons (:), hyphens (-), and question marks (?).
+    """
     s = html.unescape((title or "").strip())
+    # Remove leading numbering or bullets like "1) ", "1. ", "- "
     s = re.sub(r"^\s*(?:\d+[\)\.\:]|\-|\*)\s*", "", s)
+    # Remove standalone hashtags
     s = re.sub(r"(?:^|\s)#\w+", " ", s)
+    # Remove standalone "shorts" word
     s = re.sub(r"(?i)\bshorts?\b", " ", s)
+    # Remove bracketed or parenthesized tags
     s = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", s)
+    # Remove non-ASCII characters
     s = re.sub(r"[^\x00-\x7F]+", " ", s)
-    s = re.split(r"\s+\|\s+|\s+[-–—]{1,2}\s+", s)[0].strip()
+    # Only split on pipes '|' for channel suffixes, preserving hyphens, colons, and question marks
+    s = re.split(r"\s+\|\s+", s)[0].strip()
+    # Apply YMYL policy guardrails
     s = enforce_policy_guardrails(s)
-    s = re.sub(r"\s+", " ", s).strip(" :;,-–—.!\"'")
+    # Clean whitespace and quotes, but PRESERVE all internal and ending punctuation (?, :, -, !)
+    s = re.sub(r"\s+", " ", s).strip(" \t\n\r\"'")
     if not is_valid_topic(s):
         return ""
     return (s[0].upper() + s[1:])[:110].rstrip()
@@ -231,7 +243,8 @@ def refine_topics_with_llm(raw: list[str], pillar: dict) -> list[str]:
         f"You are a YouTube Health & Wellness Content Strategist.\n"
         f"Scheduled Content Pillar: **{pillar['name']}** — {pillar['framing']}\n\n"
         f"{NEGATIVE_PROMPT_RULES}\n\n"
-        "Convert these raw signals into 6 specific, high-retention, engaging YouTube Shorts wellness topics.\n"
+        "Convert these raw signals into 6 specific, high-retention, engaging YouTube Shorts wellness topics. "
+        "Keep proper punctuation (colons, hyphens, question marks) in the titles.\n"
         f"Raw Signals: {cleaned_raw[:20]}\n\n"
         "Output ONLY a valid JSON array of 6 strings."
     )
