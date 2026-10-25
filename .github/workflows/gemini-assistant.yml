@@ -44,10 +44,10 @@ jobs:
           #gemini --yolo --skip-trust --model gemini-3.5-flash-lite -p "${{ github.event.comment.body }}"
           
           # 2. Gemini 3.6 Flash (Direct stable alternative to 3.8 Flash with separate quota)
-          # gemini --yolo --skip-trust --model gemini-3.6-flash -p "${{ github.event.comment.body }}"
+          gemini --yolo --skip-trust --model gemini-3.6-flash -p "${{ github.event.comment.body }}"
           
           # 3. Gemini 3.8 Flash (Flagship coding Flash model - use when quota resets)
-          gemini --yolo --skip-trust --model gemini-3.8-flash -p "${{ github.event.comment.body }}"
+          #gemini --yolo --skip-trust --model gemini-3.8-flash -p "${{ github.event.comment.body }}"
           
           # 4. Gemini 3.1 Flash-Lite (Ultra-lightweight backup for simple script/prompt edits)
           #gemini --yolo --skip-trust --model gemini-3.1-flash-lite -p "${{ github.event.comment.body }}"
