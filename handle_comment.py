@@ -1,8 +1,7 @@
 """
 handle_comment.py — Processes all /commands posted on GitHub Issues, sanitizes spoken scripts
-to be clean, curious, and informative (without spoken disclaimers), builds the 4-Attribute Viral
-Shorts Script Package, renders the vertical video under 59s, and uploads to YouTube with 2026
-Synthetic Media disclosure and custom Pillow JPEG thumbnail.
+to be clean, curious, and informative, maximizes duration just below 59 seconds (PREVIEW_MAX = 58.5s),
+appends a proper 'Thank you' conclusion strictly once, renders the vertical video, and uploads to YouTube.
 """
 from __future__ import annotations
 
@@ -74,20 +73,19 @@ TTS_LANG = os.getenv("TTS_LANG", "en")
 BGM_VOL = 0.07
 
 IST = timezone(timedelta(hours=5, minutes=30))
-TARGET_LOW = 35.0
-TARGET_HIGH = 58.0
-PREVIEW_MAX = 57.3  # Strictly under 59 seconds
+TARGET_LOW = 45.0
+TARGET_HIGH = 58.5
+PREVIEW_MAX = 58.5  # Maximized to just below 59 seconds
 
 _PROMPT_FILE = Path(__file__).parent / "prompt.txt"
 
 _OUTRO_STRIP_PATTERNS = [
     r"(?i)\bthank\s+you\s+(so\s+much\s+)?for\s+(watching|listening|tuning\s+in)[^.!?]*[.!?]?",
     r"(?i)\bthanks\s+for\s+(watching|listening)[^.!?]*[.!?]?",
-    r"(?i)\bfollow\s+for\s+more\s+(daily\s+)?health\s+tips[^.!?]*[.!?]?",
+    r"(?i)\bfollow\s+for\s+more\s+(daily\s+)?(health|wellness)\s+tips[^.!?]*[.!?]?",
     r"(?i)\bdon'?t\s+forget\s+to\s+(like\s+and\s+)?subscribe[^.!?]*[.!?]?",
     r"(?i)\blike\s+and\s+subscribe\s+for\s+more[^.!?]*[.!?]?",
-    r"(?i)\bsubscribe\s+for\s+more\s+(daily\s+)?(health|science)[^.!?]*[.!?]?",
-    r"(?i)\bkeep\s+monitoring\s+your\s+health[^.!?]*[.!?]?",
+    r"(?i)\bsubscribe\s+for\s+more\s+(daily\s+)?(wellness|health|science)[^.!?]*[.!?]?",
 ]
 
 
@@ -98,7 +96,7 @@ def load_default_prompt() -> str:
             return content
     except Exception:
         pass
-    return "Write a spoken voiceover script for a 50-second educational YouTube Short about: {topic}"
+    return "Write a spoken voiceover script for a 55-second health and wellness YouTube Short about: {topic}"
 
 
 class Ctx:
@@ -114,7 +112,6 @@ class Ctx:
         self.slot = get_slot_from_labels(self.labels)
 
 
-# ── LLM & Strict Spoken Script Sanitization ───────────────────────────────────
 def _list_groq_models() -> list[str]:
     if not GROQ_API_KEY:
         return []
@@ -147,11 +144,10 @@ def _build_model_list() -> list[str]:
 
 def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks: bool = False) -> str:
     """
-    100% clean, curious, and informative spoken narration sanitizer:
-    1. Strips <think> tags, markdown, stage directions, timestamps, and speaker labels.
-    2. Strips ALL LLM-generated sign-offs.
-    3. Keeps voiceover purely engaging and informative without spoken disclaimers,
-       appending a single clean closing thought.
+    Sanitizes spoken narration:
+    1. Strips markdown, stage directions, and timestamps.
+    2. Strips all duplicate sign-offs.
+    3. Appends UNIFIED_SINGLE_OUTRO strictly ONCE at the end containing the proper 'Thank you' conclusion.
     """
     text = raw_text or ""
 
@@ -196,7 +192,7 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
     body_text = " ".join(deduped_sentences).strip()
     body_text = enforce_policy_guardrails(body_text)
 
-    # Append single clean informative closing thought strictly once
+    # Append UNIFIED_SINGLE_OUTRO strictly ONCE (contains proper Thank You conclusion)
     final_spoken = body_text.rstrip(".!? ") + ". " + UNIFIED_SINGLE_OUTRO
     final_spoken = re.sub(r"\s+", " ", final_spoken).strip()
     return final_spoken
@@ -208,33 +204,30 @@ def build_viral_shorts_segments(spoken_script: str, topic: str) -> list[dict]:
     outro_sents = " ".join(sentences[-2:]) if len(sentences) >= 3 else UNIFIED_SINGLE_OUTRO
     body_sents = " ".join(sentences[1:-2]) if len(sentences) > 3 else " ".join(sentences[1:-1])
 
-    short_topic_words = " ".join(re.findall(r"[a-zA-Z0-9]+", topic or "Body Signal")[:3]).upper()
+    short_topic_words = " ".join(re.findall(r"[a-zA-Z0-9]+", topic or "Wellness Habit")[:3]).upper()
 
     return [
         {
             "segment": "1. Curiosity Hook (0:00–0:03)",
             "visual_direction": (
-                f"High-contrast 9:16 close-up lifestyle or subtle 3D anatomical highlight of {topic} "
+                f"High-contrast 9:16 wellness B-roll highlighting {topic} "
                 f"in clinical navy ({VISUAL_IDENTITY['color_palette']['deep_clinical_navy']}) with dynamic zoom."
             ),
-            "on_screen_text": f"WHY {short_topic_words} HAPPENS",
+            "on_screen_text": f"WHY {short_topic_words} MATTERS",
             "spoken_narration": hook_sent,
             "audio_cue": "Subtle low-frequency whoosh transition into calm ambient clinical pad",
         },
         {
-            "segment": "2. Informative Physiological Insights (0:03–0:48)",
-            "visual_direction": (
-                "Fast-paced 2-second B-roll cuts showing physiological mechanisms, hydration/posture/sleep habits, "
-                "and peer-reviewed research callout badge."
-            ),
-            "on_screen_text": "WHAT CLINICAL RESEARCH SAYS",
+            "segment": "2. High-Retention Informative Body (0:03–0:50)",
+            "visual_direction": "Fast-paced 2.4s B-roll cuts showing healthy habits, nutrition, and research highlights.",
+            "on_screen_text": "SCIENCE-BACKED WELLNESS",
             "spoken_narration": body_sents or hook_sent,
             "audio_cue": "Steady rhythmic ambient pulse supporting spoken cadence",
         },
         {
-            "segment": "3. Clean Concluding Thought (0:48–End)",
-            "visual_direction": "Clean clinical summary card with subtle loop fade.",
-            "on_screen_text": "Stay informed • Subscribe for daily science facts.",
+            "segment": "3. Proper Thank You Conclusion (0:50–End)",
+            "visual_direction": "Clean wellness summary card with subscriber callout.",
+            "on_screen_text": "Subscribe for daily wellness tips.",
             "spoken_narration": outro_sents,
             "audio_cue": "Gentle 1.0s audio fade-out",
         },
@@ -248,11 +241,11 @@ def generate_script(topic: str, user_prompt: str) -> str:
     source_orgs = f"{sources[0]['org']} or {sources[1]['org']}"
 
     system_msg = (
-        "You are an objective, engaging YouTube Health Shorts scriptwriter. "
-        "Keep narration clean, curious, and informative. "
+        "You are an elite, engaging YouTube Shorts scriptwriter for health and wellness. "
+        "Write a rich, detailed, high-retention script (~140-150 words) that maximizes duration up to 57 seconds. "
         f"Cite {source_orgs} naturally in speech. "
         "Output ONLY the raw speakable body sentences. Do NOT include <think> tags, markdown, "
-        "speaker labels, timestamps, spoken disclaimers, or 'Thank you for watching' sign-offs.\n"
+        "speaker labels, timestamps, or sign-offs.\n"
         f"{NEGATIVE_PROMPT_RULES}"
     )
     for model in models:
@@ -267,8 +260,8 @@ def generate_script(topic: str, user_prompt: str) -> str:
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.70,
-                    "max_tokens": 700,
+                    "temperature": 0.72,
+                    "max_tokens": 800,
                 },
                 timeout=120,
             )
@@ -277,7 +270,7 @@ def generate_script(topic: str, user_prompt: str) -> str:
                 continue
             raw = r.json()["choices"][0]["message"]["content"].strip()
             cleaned = sanitize_spoken_script(raw, topic=topic, enforce_policy_blocks=False)
-            if len(cleaned.split()) < 40:
+            if len(cleaned.split()) < 50:
                 last_err = RuntimeError(f"Too few words ({len(cleaned.split())}) from {model}")
                 continue
             log.info("[script] Generated %d sanitized spoken words using %s", len(cleaned.split()), model)
@@ -328,7 +321,7 @@ def get_audio_duration(path: str) -> float:
         a.close()
         return dur
     except Exception:
-        return 45.0
+        return 50.0
 
 
 def ensure_bgm_track(duration: float, out_path: str = "bgm_src.m4a") -> str:
@@ -423,7 +416,7 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
     )
 
 
-# ── Video Processing (Clean Video Start without Thumbnail Flash) ───────────────
+# ── Video Processing ──────────────────────────────────────────────────────────
 _cascade = None
 
 
@@ -457,9 +450,8 @@ def smart_cover_crop(clip, target_w=1080, target_h=1920):
 
 def fetch_broll(query: str, need: int = 6) -> list[str]:
     clean_q = re.sub(r"[^a-zA-Z0-9\s]", " ", query or "")
-    clean_q = re.sub(r"(?i)\b(blood|surgery|disease|wound|tumor|infection)\b", "wellness", clean_q)
-    clean_q = " ".join(clean_q.split()[:4]) or "healthy lifestyle"
-    all_queries = [clean_q, "healthy lifestyle", "fitness exercise", "meditation", "wellness nature"]
+    clean_q = " ".join(clean_q.split()[:4]) or "healthy lifestyle wellness"
+    all_queries = [clean_q, "healthy lifestyle", "morning sunlight", "wellness nature", "nutrition fresh"]
     collected, seen = [], set()
 
     if PEXELS_API_KEY:
@@ -506,7 +498,7 @@ def _generate_fallback_video_clips(tmp: Path, count: int = 3) -> list[str]:
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-f", "lavfi",
-                    "-i", f"color=c={color}:s=1080x1920:r=30:d=8",
+                    "-i", f"color=c={color}:s=1080x1920:r=30:d=10",
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast",
                     str(out_p),
                 ],
@@ -539,7 +531,7 @@ def _download_broll(urls: list[str], tmp: Path) -> list[str]:
             log.warning("[broll] download failed for %s: %s", u, exc)
 
     if not local:
-        log.warning("[broll] No remote B-roll downloaded; generating clinical palette synthetic vertical clips.")
+        log.warning("[broll] No remote B-roll downloaded; generating synthetic vertical clips.")
         local = _generate_fallback_video_clips(tmp, count=3)
     return local
 
@@ -554,16 +546,13 @@ def render_and_cap(
     thumb_out_path: str = "thumbnail.jpg",
 ) -> float:
     """
-    Downloads B-roll, generates the standalone 9:16 Pillow thumbnail for YouTube API upload,
-    renders the vertical video starting immediately with B-roll (no thumbnail flash in video),
-    and burns captions + BGM. Duration is strictly capped under 59 seconds.
+    Renders video maximized to just below 59 seconds (PREVIEW_MAX = 58.5s) to capture maximum retention.
     """
     tmp = Path(tempfile.mkdtemp())
     local = _download_broll(broll_urls, tmp)
     if not local:
         raise RuntimeError("No B-roll clips could be downloaded or synthesized.")
 
-    # 1. Generate standalone 9:16 Pillow thumbnail for YouTube API upload
     try:
         generate_shorts_thumbnail(
             thumbnail_text=thumbnail_text,
@@ -584,7 +573,7 @@ def render_and_cap(
                 clip_dur = float(c.duration)
                 step = 2.4
                 t_cursor = 0.0
-                while t_cursor + 1.8 <= min(clip_dur, 7.5):
+                while t_cursor + 1.8 <= min(clip_dur, 8.5):
                     sub_end = min(clip_dur, t_cursor + step)
                     comp = smart_cover_crop(c.subclip(t_cursor, sub_end)).set_audio(None)
                     base_comps.append(comp)
@@ -602,16 +591,15 @@ def render_and_cap(
         voice_clip = AudioFileClip(voice_mp3)
         target_dur = float(voice_clip.duration)
 
-        while sum(c.duration for c in cropped) < target_dur and len(cropped) < 60:
+        while sum(c.duration for c in cropped) < target_dur and len(cropped) < 80:
             for comp in base_comps:
                 cropped.append(comp)
                 if sum(c.duration for c in cropped) >= target_dur:
                     break
 
         merged = concatenate_videoclips(cropped, method="compose")
-        end = max(0.5, min(PREVIEW_MAX, target_dur))
+        end = max(45.0, min(PREVIEW_MAX, target_dur))
 
-        # 2. Render video starting immediately with clean B-roll (no thumbnail overlay)
         out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
         out_clip.write_videofile(
             temp_mp4,
@@ -671,7 +659,7 @@ def render_and_cap(
     return round(end, 2)
 
 
-# ── YouTube Upload (with 2026 Synthetic Media Disclosure & Custom Thumbnail) ──
+# ── YouTube Upload ────────────────────────────────────────────────────────────
 def _yt_client():
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -720,9 +708,9 @@ def upload_unlisted(
             thumb_media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg", resumable=False)
             yt.thumbnails().set(videoId=vid_id, media_body=thumb_media).execute()
             thumb_uploaded = True
-            log.info("[upload] Custom 3-word Pillow thumbnail uploaded for video %s", vid_id)
+            log.info("[upload] Custom Pillow thumbnail uploaded for video %s", vid_id)
         except Exception as exc:
-            log.warning("[upload] Custom thumbnail upload skipped/failed (%s)", exc)
+            log.warning("[upload] Custom thumbnail upload failed (%s)", exc)
 
     return vid_id, f"https://youtu.be/{vid_id}", thumb_uploaded
 
@@ -766,7 +754,7 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
             if not os.path.exists(thumb_path):
                 thumb_path = None
 
-            score = 0.0 if TARGET_LOW <= dur < TARGET_HIGH else abs(dur - 45.0)
+            score = abs(57.5 - dur)
             if score < best["score"]:
                 best_path = f"best_{attempt}.mp4"
                 shutil.copyfile(final_mp4, best_path)
@@ -780,7 +768,7 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
                     "thumb": thumb_path,
                 })
 
-            if TARGET_LOW <= dur < TARGET_HIGH or user_script:
+            if TARGET_LOW <= dur <= TARGET_HIGH or user_script:
                 return _package_and_upload(final_mp4, seo, segments, topic, slot, issue_body, attempt, dur, thumb_path)
         except Exception as exc:
             last_error = exc
@@ -836,7 +824,7 @@ def _package_and_upload(video_path, seo, segments, topic, slot, issue_body, atte
 def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None:
     body = (
         f"✅ **Topic approved:** {topic}\n\n"
-        "Please provide your script text or generate a clean, informative script automatically:\n\n"
+        "Please provide your script text or generate a wellness script automatically:\n\n"
         "- **Option A — Use AI Default Prompt:**\n"
         "  Reply with: `/use-default-prompt`\n\n"
         "- **Option B — Provide Your Own Script:**\n"
@@ -851,7 +839,7 @@ def _clean_issue_title_to_topic(title: str) -> str:
     s = re.split(r"\s+\|\s+|\s+[-–—]{1,2}\s+", s)[0].strip()
     s = re.sub(r"\s+", " ", s).strip(" :;,-–—.!\"'")
     if len(re.findall(r"[a-zA-Z]{2,}", s)) < 3:
-        return "Daily Health and Symptom Awareness"
+        return "Daily Health and Wellness Habits"
     return (s[0].upper() + s[1:])[:120].rstrip()
 
 
@@ -945,12 +933,12 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     ctx.issue_body = new_body
 
-    mode_str = "custom script (sanitized)" if user_script else "AI informative script"
+    mode_str = "custom script (sanitized)" if user_script else "AI wellness script"
     post_comment(
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"🎬 Building video preview for **{topic}** (using {mode_str}).\nThis takes ~2–5 minutes...",
+        f"🎬 Building max-retention video preview for **{topic}** (using {mode_str}).\nThis takes ~3–5 minutes...",
     )
 
     try:
@@ -978,13 +966,13 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
             f"| **{seg['segment']}** | {seg['on_screen_text']} | {seg['spoken_narration']} | *{seg['audio_cue']}* |"
         )
     seg_table = (
-        "| Segment | On-Screen Hook/Text | Spoken Narration (Clean & Informative) | Audio Cue |\n"
+        "| Segment | On-Screen Hook/Text | Spoken Narration | Audio Cue |\n"
         "|---|---|---|---|\n" + "\n".join(seg_rows)
         if seg_rows
         else ""
     )
 
-    thumb_status = "Uploaded via YouTube API (Description has Disclaimer) ✓" if video_meta.get("thumbnail_uploaded") else "Generated locally ✓"
+    thumb_status = "Uploaded via YouTube API ✓" if video_meta.get("thumbnail_uploaded") else "Generated locally ✓"
 
     post_comment(
         ctx.owner,
@@ -1017,12 +1005,12 @@ def handle_reject_topic(ctx: Ctx) -> None:
 
     if len(options) < 6:
         options = [
-            "5 Subtle Dehydration Signals People Often Ignore",
-            "Why Your Neck Hurts at a Desk: Forward Head Posture Explained",
-            "How 10 Minutes of Morning Sunlight Resets Your Circadian Clock",
-            "Why Your Neck Hurts at a Desk: Forward Head Posture Explained",
-            "How the Vagus Nerve Calms Your Heart Rate in 20 Seconds",
-            "Walking 10 Minutes After Meals: What Blood Sugar Research Says",
+            "How 10 Minutes of Morning Sunlight Optimizes Your Circadian Clock",
+            "Why Delaying Morning Caffeine by 60 Minutes Prevents Afternoon Crashes",
+            "Zone 2 Cardio: The Science Behind Longevity and Mitochondrial Health",
+            "Magnesium Glycinate and Its Role in Deep Restorative Sleep Architecture",
+            "How Walking 10 Minutes After Meals Regulates Postprandial Glucose",
+            "Prebiotic Fiber and the Gut Microbiome: What Harvard Research Shows",
         ]
 
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
@@ -1036,7 +1024,7 @@ def handle_reject_topic(ctx: Ctx) -> None:
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"🔄 **Fresh Topic Options:**\n{numbered}\n\n"
+        f"🔄 **Fresh Wellness Topic Options:**\n{numbered}\n\n"
         "Reply `/approve-topic N` (or `/approve-topic N /use-default-prompt`) or `/custom-topic Your Topic`.",
     )
 
