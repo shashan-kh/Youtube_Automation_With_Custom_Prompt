@@ -1,26 +1,18 @@
 """
-seo.py — Policy-Safe YouTube Health SEO, High-CTR Title & 3-Word Complementary Thumbnail Matrix,
-E-E-A-T Source Citations, YMYL Description Box Builder, and 350-Hashtag Generator.
+seo.py — SEO title, description, and 350-tag generation for YouTube Shorts.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
+import json
 import requests
-
-from brand_config import (
-    NEGATIVE_PROMPT_RULES,
-    VISUAL_IDENTITY,
-    enforce_policy_guardrails,
-    select_credible_sources,
-)
-from common import extract_json_block, get_logger
+from common import get_logger, extract_json_block
 
 log = get_logger("seo")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 FALLBACK_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
@@ -35,7 +27,7 @@ _BASE_TAGS = [
     "natural health", "holistic health", "healthy living", "self care",
     "wellbeing", "mind body", "preventive health", "health education",
     "health facts", "health shorts", "viral health", "health motivation",
-    "health awareness", "symptom awareness", "morning routine",
+    "health hack", "life hack", "productivity", "morning routine",
     "evening routine", "sleep better", "sleep tips", "deep sleep",
     "stress relief", "anxiety relief", "mental health", "mental wellness",
     "brain health", "focus tips", "memory improvement", "gut health",
@@ -45,39 +37,58 @@ _BASE_TAGS = [
     "stretching", "mobility", "flexibility", "yoga", "meditation",
     "breathing exercises", "mindfulness", "cold shower benefits",
     "morning sunlight", "circadian rhythm", "melatonin", "cortisol",
-    "hormone balance", "intermittent fasting", "weight management",
-    "metabolism", "energy boost", "fatigue relief", "physiology",
+    "hormone balance", "intermittent fasting", "weight loss tips",
+    "metabolism boost", "energy boost", "fatigue relief", "no caffeine",
     "healthy diet", "balanced diet", "plant based", "protein intake",
     "fiber foods", "healthy snacks", "meal prep", "clean eating",
-    "blood sugar", "heart health", "cardio fitness", "strength training",
-    "bodyweight exercise", "home workout", "walking benefits",
-    "steps per day", "active lifestyle", "desk job health", "ergonomics",
-    "eye strain", "screen time", "digital detox", "skin health",
-    "bone health", "joint health", "india health", "indian wellness",
+    "sugar free", "insulin resistance", "blood sugar", "heart health",
+    "cardio fitness", "strength training", "bodyweight exercise",
+    "home workout", "gym tips", "walking benefits", "running tips",
+    "steps per day", "active lifestyle", "sedentary lifestyle",
+    "desk job health", "ergonomics", "eye strain", "screen time",
+    "digital detox", "skin health", "hair health", "bone health",
+    "joint pain", "india health", "indian wellness", "ayurveda",
+    "desi health tips", "shorts india", "health india", "wellness india",
     "educational", "informative", "science backed", "evidence based",
-    "medical facts", "health myths busted", "how the body works",
-    "trending health", "viral wellness", "short video", "60 second health",
+    "doctor tips", "medical facts", "health myths busted",
+    "health 2025", "trending health", "viral wellness",
+    "reels", "short video", "quick tips", "60 second health",
 ]
 
 _SEO_PROMPT = """\
-You are an elite, policy-safe YouTube Health & Symptoms Niche Strategist.
+You are an elite YouTube SEO strategist for health content.
 
 Topic: "{topic}"
-Spoken Script Excerpt: "{script_excerpt}"
-Credible Sources Cited: {sources_names}
+Script excerpt: "{script_excerpt}"
 
-{negative_rules}
-
-Return ONLY a valid JSON object with these exact keys (no markdown fences, no extra commentary):
+Return ONLY a valid JSON object with exactly these three keys.
+No markdown fences, no extra text, no trailing commas.
 
 {{
-  "title": "Curiosity-driven, policy-safe title (max 82 chars) ending with #Shorts. Use proven frameworks like 'Why Does This Happen? [Topic] Explained #Shorts' or 'Is [Symptom] Serious? What Research Says #Shorts'",
-  "punchy_short_title": "Punchy curiosity title under 6 words",
-  "thumbnail_text_3_words": "EXACTLY 3 words for the thumbnail overlay. STRICT COMPLEMENTARITY RULE: Must NEVER repeat ANY word from 'title' or 'punchy_short_title'. Must complete the thought or raise a second curiosity question (e.g., 'CHECK THIS NOW', 'YOUR BODY REACTS', 'WHAT SCIENCE SAYS').",
-  "thumbnail_image_prompt": "Clean 3D educational anatomical or bright studio lifestyle image prompt in clinical navy and teal, zero medical gore, no text",
-  "summary": "2-3 sentence educational summary explaining the physiological mechanism covered in the video without diagnosing the viewer.",
+  "title": "keyword-first title in Title Case, max 90 chars, ends with #Shorts, no emojis",
+  "description": "2-4 sentence description. First 157 chars must contain main keyword. Include CTA and disclaimer: Educational only, not medical advice.",
   "topic_tags": ["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7", "tag8", "tag9", "tag10", "tag11", "tag12"]
 }}
+
+Title rules:
+- First 3 words must be the main keyword phrase
+- Include one power word: Secret, Science, Proven, Hack, Fix, Boost, Stop, Start, Why, How, Best, Simple
+- End with #Shorts
+- Max 90 characters
+- No emojis, English only
+
+Description rules:
+- Keep under 800 characters (excluding hashtags)
+- First line: hook sentence with main keyword
+- Include: Like and subscribe for daily health tips.
+- Include: Educational only, not medical advice.
+- English only, no emojis
+
+topic_tags rules:
+- Exactly 12 items
+- Short keyword phrases, no # symbol
+- Most specific first
+- English only
 """
 
 
@@ -88,64 +99,25 @@ def _call_groq(prompt: str, model: str) -> requests.Response:
         json={
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.65,
+            "temperature": 0.7,
         },
         timeout=120,
     )
 
 
-def _enforce_thumbnail_complementarity(title: str, punchy_title: str, raw_thumb_text: str) -> str:
-    """
-    Guarantees the 3-word thumbnail text NEVER repeats any word from the video title.
-    """
-    title_words = {
-        w.lower()
-        for w in re.findall(r"[a-zA-Z0-9]+", f"{title} {punchy_title}")
-        if len(w) >= 2
-    }
-    candidate_words = [
-        w.upper()
-        for w in re.findall(r"[a-zA-Z0-9]+", raw_thumb_text or "")
-        if w.lower() not in title_words
-    ]
-    if len(candidate_words) == 3:
-        return " ".join(candidate_words)
-
-    # Safe complementary 3-word fallbacks tested against title_words
-    complementary_pool = [
-        ["WHAT", "RESEARCH", "REVEALS"],
-        ["INSIDE", "YOUR", "BODY"],
-        ["WATCH", "FOR", "THIS"],
-        ["SCIENCE", "EXPLAINS", "WHY"],
-        ["OFTEN", "OVERLOOKED", "SIGNALS"],
-        ["CHECK", "THESE", "CLUES"],
-        ["HOW", "IT", "WORKS"],
-        ["KNOW", "THE", "FACTS"],
-    ]
-    for phrase in complementary_pool:
-        if all(w.lower() not in title_words for w in phrase):
-            return " ".join(phrase)
-    return "LOOK CLOSER TODAY"
-
-
 def generate_seo_package(topic: str, script_text: str) -> dict:
     """
-    Returns dict with keys:
-      title, punchy_short_title, thumbnail_text, thumbnail_prompt,
-      description, tags_csv, sources
-    Never raises — always returns a policy-safe package.
+    Returns dict with keys: title, description, tags_csv
+    Never raises — always returns a valid fallback.
     """
-    sources = select_credible_sources(topic, script_text, count=3)
-    sources_names = ", ".join(s["org"] for s in sources)
+    excerpt = (script_text or "")[:200].replace("\n", " ")
+    # Remove any characters that could break JSON parsing
+    excerpt = re.sub(r'["\\\x00-\x1f]', " ", excerpt)
+    topic_safe = re.sub(r'["\\\x00-\x1f]', " ", topic or "")
 
-    excerpt = re.sub(r'["\\\x00-\x1f]', " ", (script_text or "")[:280].replace("\n", " "))
-    topic_safe = re.sub(r'["\\\x00-\x1f]', " ", topic or "Health Awareness")
-
-    prompt = _SEO_PROMPT.format(
+    prompt  = _SEO_PROMPT.format(
         topic=topic_safe,
         script_excerpt=excerpt,
-        sources_names=sources_names,
-        negative_rules=NEGATIVE_PROMPT_RULES,
     )
 
     models = [GROQ_MODEL] + [m for m in FALLBACK_MODELS if m != GROQ_MODEL]
@@ -158,55 +130,45 @@ def generate_seo_package(topic: str, script_text: str) -> dict:
                 log.warning("[SEO] model %s HTTP %s", model, r.status_code)
                 continue
             content = r.json()["choices"][0]["message"]["content"].strip()
+            log.debug("[SEO] raw response: %s", content[:300])
+
+            # Try to extract JSON
             raw = extract_json_block(content) or content
+            # Strip any BOM or weird chars before parsing
             raw = raw.strip().lstrip("\ufeff")
             data = json.loads(raw)
 
-            title = _clean_title(data.get("title", ""), topic_safe)
-            punchy = enforce_policy_guardrails(str(data.get("punchy_short_title", "")).strip())[:55]
-            if not punchy:
-                punchy = "What Research Says"
-
-            thumb_text = _enforce_thumbnail_complementarity(
-                title, punchy, str(data.get("thumbnail_text_3_words", ""))
+            title       = _clean_title(data.get("title", ""), topic)
+            description = _assemble_description(
+                data.get("description", ""), topic, data.get("topic_tags", [])
             )
-            thumb_prompt = str(data.get("thumbnail_image_prompt", "")).strip() or (
-                VISUAL_IDENTITY["thumbnail_prompt_template"].format(topic=topic_safe)
-            )
-
-            summary = enforce_policy_guardrails(str(data.get("summary", "")).strip())
-            description = _assemble_policy_safe_description(
-                summary=summary,
-                topic=topic_safe,
-                sources=sources,
-            )
-            tags_csv = _clean_tags(data.get("topic_tags", []), topic_safe)
+            tags_csv    = _clean_tags(data.get("topic_tags", []), topic)
 
             log.info("[SEO] success with model: %s", model)
             return {
                 "title": title,
-                "punchy_short_title": punchy,
-                "thumbnail_text": thumb_text,
-                "thumbnail_prompt": thumb_prompt,
                 "description": description,
                 "tags_csv": tags_csv,
-                "sources": sources,
             }
+
+        except json.JSONDecodeError as exc:
+            log.warning("[SEO] JSON parse error [%s]: %s", model, exc)
+            continue
         except Exception as exc:
-            log.warning("[SEO] model %s failed: %s", model, exc)
+            log.warning("[SEO] error [%s]: %s", model, exc)
             continue
 
-    log.error("[SEO] all models failed, using policy-safe fallback")
-    return _fallback_seo(topic_safe, script_text, sources)
+    log.error("[SEO] all models failed, using fallback")
+    return _fallback_seo(topic, script_text)
 
 
 def _clean_title(raw: str, topic: str) -> str:
-    t = enforce_policy_guardrails((raw or "").strip())
-    t = re.sub(r"[^\x00-\x7F]", "", t)
+    t = (raw or "").strip()
+    t = re.sub(r"[^\x00-\x7F]", "", t)   # ASCII only
     t = re.sub(r"\s+", " ", t).strip()
     if not t:
-        t = f"Why Does This Happen? {topic[:45]} Explained"
-    if "#Shorts" not in t and "#shorts" not in t:
+        t = topic or "Health Tips"
+    if "#Shorts" not in t:
         t = t.rstrip(" .!?,;:") + " #Shorts"
     if len(t) > 90:
         keep = 90 - len(" #Shorts")
@@ -214,15 +176,16 @@ def _clean_title(raw: str, topic: str) -> str:
     return t
 
 
-def _assemble_policy_safe_description(summary: str, topic: str, sources: list[dict]) -> str:
-    clean_sum = re.sub(r"[^\x00-\x7F]", "", (summary or "").strip())
-    if not clean_sum:
-        clean_sum = (
-            f"{topic}: Explore the physiological mechanisms and peer-reviewed research behind "
-            "how your body responds to everyday habits and signals."
-        )
+def _assemble_description(raw_desc: str, topic: str, topic_tags: list) -> str:
+    desc = (raw_desc or "").strip()
+    desc = re.sub(r"[^\x00-\x7F]", "", desc)  # ASCII only
 
-    sources_lines = "\n".join(f"- {s['name']}: {s['url']}" for s in sources)
+    disclaimer = "Educational only, not medical advice."
+    if disclaimer.lower() not in desc.lower():
+        desc = desc.rstrip() + "\n" + disclaimer
+
+    if "like" not in desc.lower() and "subscribe" not in desc.lower():
+        desc = desc.rstrip() + "\nLike and subscribe for daily health tips."
 
     # Build 350 hashtags
     topic_specific = _generate_topic_hashtags(topic)
@@ -241,9 +204,10 @@ def _assemble_policy_safe_description(summary: str, topic: str, sources: list[di
         if len(all_tags) >= 350:
             break
 
+    # Pad if needed
     if len(all_tags) < 350:
         for i in range(1, 500):
-            candidate = f"#HealthAwareness{i}"
+            candidate = f"#HealthTip{i}"
             if candidate.lower() not in seen_lower:
                 all_tags.append(candidate)
                 seen_lower.add(candidate.lower())
@@ -251,21 +215,7 @@ def _assemble_policy_safe_description(summary: str, topic: str, sources: list[di
                 break
 
     tag_block = "\n".join(all_tags[:350])
-
-    structured_desc = (
-        f"{clean_sum}\n\n"
-        "⚠️ Disclaimer: This video is for general informational and educational purposes only. "
-        "It is not intended as medical advice. Always consult a licensed healthcare provider "
-        "for diagnosis and treatment.\n\n"
-        f"📚 Sources:\n{sources_lines}\n\n"
-        "⏱️ Timestamps:\n"
-        "0:00 Curiosity Hook\n"
-        "0:04 Educational Disclaimer & Context\n"
-        "0:10 Physiological Mechanism & Research\n"
-        "0:48 Key Takeaway & Consultation Reminder\n\n"
-        f"{tag_block}"
-    )
-    return structured_desc[:4900]
+    return desc.rstrip() + "\n\n" + tag_block
 
 
 def _to_hashtag(s: str) -> str:
@@ -295,22 +245,51 @@ def _generate_topic_hashtags(topic: str) -> list[str]:
 
         root = words[0].capitalize()
         suffixes = [
-            "Awareness", "Science", "Facts", "Explained", "Physiology",
-            "Research", "Education", "Tips", "Habits", "Routine",
-            "Guide", "101", "ForBeginners", "Daily", "Morning",
-            "Night", "Naturally", "EvidenceBased", "Backed", "Health",
+            "Tips", "Hacks", "Facts", "Tricks", "Benefits", "Science",
+            "Routine", "Habit", "Method", "Technique", "Guide", "101",
+            "ForBeginners", "AtHome", "Daily", "Morning", "Night",
+            "ForMen", "ForWomen", "ForSeniors", "ForStudents",
+            "In5Minutes", "In2Minutes", "Instantly", "Naturally",
+            "WithoutMedicine", "Scientifically", "Backed", "Proven",
+            "EvidenceBased", "Research",
         ]
+        full_no_space = full
         for suf in suffixes:
-            tags.append(f"#{full}{suf}")
+            tags.append(f"#{full_no_space}{suf}")
             tags.append(f"#{root}{suf}")
 
     adjacent = [
-        "SymptomAwareness", "HealthEducation", "HowTheBodyWorks",
-        "PreventiveHealth", "MedicalFacts", "ScienceBackedHealth",
-        "EvidenceBasedHealth", "HealthyHabits", "HealthyLifestyle",
-        "WellnessTips", "WellnessJourney", "MindBodyConnection",
-        "NaturalWellness", "DailyHealth", "DailyWellness",
-        "HealthShorts", "WellnessShorts", "YoutubeShorts", "Shorts",
+        "HealthyHabits", "HealthyLifestyle", "HealthyLiving",
+        "WellnessTips", "WellnessJourney", "WellnessRoutine",
+        "FitnessMotivation", "FitnessTips", "FitnessLife",
+        "NutritionTips", "NutritionFacts", "NutritionScience",
+        "SelfCare", "SelfCareRoutine", "SelfCareDay",
+        "MindBodySoul", "MindBodyConnection", "MindBodyHealth",
+        "NaturalHealth", "NaturalRemedies", "NaturalWellness",
+        "PreventiveHealth", "PreventiveCare", "PreventiveMedicine",
+        "HealthyMindset", "HealthyBody", "HealthyFood",
+        "CleanEating", "EatHealthy", "EatClean",
+        "ViralHealth", "TrendingHealth", "HealthViral",
+        "HealthShorts", "WellnessShorts", "FitnessShorts",
+        "HealthContent", "HealthCreator", "HealthInfluencer",
+        "DailyHealth", "DailyWellness", "DailyFitness",
+        "HealthGoals", "WellnessGoals", "FitnessGoals",
+        "HealthIsWealth", "YourHealth", "MyHealth",
+        "GetHealthy", "StayHealthy", "BeHealthy",
+        "HealthMatters", "HealthFirst", "PutHealthFirst",
+        "ScienceBackedHealth", "EvidenceBasedHealth",
+        "DoctorApproved", "MedicalFacts", "HealthFacts",
+        "HealthMyths", "MythBusted", "HealthTruth",
+        "HealthAlert", "HealthWarning", "HealthReminder",
+        "HealthChallenge", "HealthJourney", "HealthTransformation",
+        "IndiaHealth", "IndianWellness", "IndianHealth",
+        "DesiHealth", "DesiWellness", "AyurvedaTips",
+        "YoutubeShorts", "Shorts", "ShortVideo",
+        "ViralShort", "TrendingShorts", "ReelsHealth",
+        "60Seconds", "QuickTips", "FastFacts",
+        "LearnSomethingNew", "DidYouKnow", "MindBlown",
+        "HealthMindBlown", "WellnessWednesday", "HealthMonday",
+        "TipOfTheDay", "FactOfTheDay", "HabitOfTheDay",
     ]
     tags.extend([f"#{t}" for t in adjacent])
     return tags
@@ -320,7 +299,7 @@ def _clean_tags(raw: list, topic: str) -> str:
     out: list[str] = []
     seen: set[str] = set()
     topic_words = re.findall(r"[a-zA-Z0-9]+", topic or "")
-    candidates = list(raw or []) + [topic] + [" ".join(topic_words[:3])]
+    candidates  = list(raw or []) + [topic] + [" ".join(topic_words[:3])]
     for t in candidates:
         t = (str(t) or "").strip().lstrip("#")
         t = re.sub(r"[^a-zA-Z0-9 ]", "", t).strip()
@@ -333,27 +312,22 @@ def _clean_tags(raw: list, topic: str) -> str:
     return ",".join(out[:12])
 
 
-def _fallback_seo(topic: str, script_text: str, sources: list[dict]) -> dict:
-    safe_topic = re.sub(r"[^\x00-\x7F]", "", topic or "Health Awareness").strip()
-    title = _clean_title(f"Why Does This Happen? {safe_topic[:45]} Explained", safe_topic)
-    punchy = "What Science Says"
-    thumb_text = _enforce_thumbnail_complementarity(title, punchy, "INSIDE YOUR BODY")
-    thumb_prompt = VISUAL_IDENTITY["thumbnail_prompt_template"].format(topic=safe_topic)
-    summary = (
-        f"Explore what clinical research from {sources[0]['org']} and {sources[1]['org']} reveals "
-        f"about {safe_topic} and how your body responds."
+def _fallback_seo(topic: str, script_text: str) -> dict:
+    safe_topic = re.sub(r"[^\x00-\x7F]", "", topic or "Health Tips")
+    title = f"{safe_topic[:75]} #Shorts"
+    description = (
+        f"{safe_topic} - quick science-backed wellness tips for your daily routine.\n"
+        "Like and subscribe for daily health tips.\n"
+        "Educational only, not medical advice.\n\n"
+        + "\n".join(_generate_topic_hashtags(safe_topic)[:350])
     )
-    description = _assemble_policy_safe_description(summary, safe_topic, sources)
-    words = re.findall(r"[a-zA-Z0-9]+", safe_topic)
+    words    = re.findall(r"[a-zA-Z0-9]+", safe_topic)
     tags_csv = ",".join(
-        (words[:6] + ["health education", "symptom awareness", "shorts", "physiology", "wellness", "science"])[:12]
+        (words[:6] + ["health", "wellness", "shorts",
+                      "healthy habits", "fitness", "tips"])[:12]
     )
     return {
         "title": title,
-        "punchy_short_title": punchy,
-        "thumbnail_text": thumb_text,
-        "thumbnail_prompt": thumb_prompt,
         "description": description,
         "tags_csv": tags_csv,
-        "sources": sources,
     }
