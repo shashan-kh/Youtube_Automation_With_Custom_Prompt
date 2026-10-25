@@ -1,7 +1,8 @@
 """
-handle_comment.py — Processes all /commands posted on GitHub Issues, sanitizes spoken scripts
-with precise punctuation for natural TTS pausing, synchronizes visual B-roll cuts 1:1 with spoken
-sentence timestamps, maximizes duration just below 59 seconds, and uploads to YouTube.
+handle_comment.py — Processes all /commands posted on GitHub Issues, sanitizes spoken scripts,
+programmatically expands acronyms (CDC -> Centers for Disease Control and Prevention), ensures
+duration is strictly less than 59 seconds (PREVIEW_MAX = 58.0s), and appends a guaranteed
+'Thank you' conclusion strictly once.
 """
 from __future__ import annotations
 
@@ -74,8 +75,8 @@ BGM_VOL = 0.07
 
 IST = timezone(timedelta(hours=5, minutes=30))
 TARGET_LOW = 45.0
-TARGET_HIGH = 58.5
-PREVIEW_MAX = 58.5  # Maximized to just below 59 seconds
+TARGET_HIGH = 58.0
+PREVIEW_MAX = 58.0  # Strictly less than 59 seconds
 
 _PROMPT_FILE = Path(__file__).parent / "prompt.txt"
 
@@ -142,10 +143,25 @@ def _build_model_list() -> list[str]:
     return ordered[:12]
 
 
+def expand_full_forms(text: str) -> str:
+    """Programmatically converts acronyms into full formal organization names."""
+    if not text:
+        return ""
+    expanded = text
+    expanded = re.sub(r"\bCDC\b", "Centers for Disease Control and Prevention", expanded)
+    expanded = re.sub(r"\bNIH\b", "National Institutes of Health", expanded)
+    expanded = re.sub(r"\bWHO\b", "World Health Organization", expanded)
+    expanded = re.sub(r"\bFDA\b", "Food and Drug Administration", expanded)
+    return expanded
+
+
 def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks: bool = False) -> str:
     """
-    Sanitizes spoken narration with proper rhythmic punctuation and appends
-    UNIFIED_SINGLE_OUTRO strictly ONCE at the end.
+    Sanitizes spoken narration:
+    1. Expands acronyms (CDC -> Centers for Disease Control and Prevention).
+    2. Strips markdown, stage directions, and timestamps.
+    3. Strips all duplicate sign-offs.
+    4. Appends UNIFIED_SINGLE_OUTRO strictly ONCE at the end containing the proper 'Thank you' conclusion.
     """
     text = raw_text or ""
 
@@ -177,6 +193,8 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
     for pat in _OUTRO_STRIP_PATTERNS:
         text = re.sub(pat, " ", text)
 
+    text = expand_full_forms(text)
+
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     deduped_sentences: list[str] = []
     seen_norm: set[str] = set()
@@ -190,6 +208,7 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
     body_text = " ".join(deduped_sentences).strip()
     body_text = enforce_policy_guardrails(body_text)
 
+    # Append UNIFIED_SINGLE_OUTRO strictly ONCE (Guaranteed Thank You conclusion)
     final_spoken = body_text.rstrip(".!? ") + ". " + UNIFIED_SINGLE_OUTRO
     final_spoken = re.sub(r"\s+", " ", final_spoken).strip()
     return final_spoken
@@ -222,7 +241,7 @@ def build_viral_shorts_segments(spoken_script: str, topic: str) -> list[dict]:
             "audio_cue": "Steady rhythmic ambient pulse supporting spoken cadence",
         },
         {
-            "segment": "3. Proper Thank You Conclusion (0:50–End)",
+            "segment": "3. Guaranteed Thank You Conclusion (0:50–End)",
             "visual_direction": "Clean wellness summary card with subscriber callout.",
             "on_screen_text": "Subscribe for daily wellness tips.",
             "spoken_narration": outro_sents,
@@ -235,13 +254,13 @@ def generate_script(topic: str, user_prompt: str) -> str:
     models = _build_model_list()
     last_err = None
     sources = select_credible_sources(topic, count=2)
-    source_orgs = f"{sources[0]['org']} or {sources[1]['org']}"
+    source_orgs = f"{sources[0]['org']} and {sources[1]['org']}"
 
     system_msg = (
         "You are an elite, engaging YouTube Shorts scriptwriter for health and wellness. "
         "Write a rich, detailed, high-retention script (~140-150 words) that maximizes duration up to 57 seconds. "
         "Use precise English punctuation (commas for breath pauses, periods for full stops). "
-        f"Cite {source_orgs} naturally in speech. "
+        f"Spell out full organization names (e.g., {source_orgs}). NEVER use acronyms like CDC or NIH. "
         "Output ONLY the raw speakable body sentences. Do NOT include <think> tags, markdown, "
         "speaker labels, timestamps, or sign-offs.\n"
         f"{NEGATIVE_PROMPT_RULES}"
@@ -346,9 +365,7 @@ def _fmt_time(t: float) -> str:
 
 
 def get_sentence_timestamps(audio_path: str, lang: str = "en") -> list[tuple[float, float]]:
-    """Extracts exact sentence start and end timestamps from Whisper for 1:1 visual synchronization."""
     try:
-        audio_dur = get_audio_duration(audio_path)
         from faster_whisper import WhisperModel
         model = WhisperModel(os.getenv("WHISPER_MODEL", "tiny.en"), device="cpu", compute_type="int8")
         segments, _ = model.transcribe(audio_path, language=lang, beam_size=5, vad_filter=True, word_timestamps=True)
@@ -438,7 +455,7 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
     )
 
 
-# ── Video Processing (Voice-Synchronized Visual Cuts) ─────────────────────────
+# ── Video Processing ──────────────────────────────────────────────────────────
 _cascade = None
 
 
@@ -568,8 +585,7 @@ def render_and_cap(
     thumb_out_path: str = "thumbnail.jpg",
 ) -> float:
     """
-    Renders video where visual B-roll cuts match spoken sentence timestamps 1:1,
-    maximizing duration just below 59 seconds.
+    Renders video strictly under 59 seconds (PREVIEW_MAX = 58.0s) with 1:1 voice-synchronized cuts.
     """
     tmp = Path(tempfile.mkdtemp())
     local = _download_broll(broll_urls, tmp)
@@ -588,12 +604,10 @@ def render_and_cap(
 
     raw_clips, voice_clip = [], None
     try:
-        # Get exact sentence timestamps from Whisper so visuals match spoken voice 1:1
         sentence_intervals = get_sentence_timestamps(voice_mp3, lang=TTS_LANG)
         voice_clip = AudioFileClip(voice_mp3)
         target_dur = float(voice_clip.duration)
 
-        # Load source video clips
         source_video_objs = []
         for p in local:
             try:
@@ -606,7 +620,6 @@ def render_and_cap(
         if not source_video_objs:
             raise RuntimeError("No valid source video objects could be loaded.")
 
-        # Build sentence-aligned visual cuts
         matched_clips = []
         source_idx = 0
         for start_t, end_t in sentence_intervals:
@@ -624,7 +637,6 @@ def render_and_cap(
             cropped_sub = smart_cover_crop(sub, 1080, 1920).set_audio(None)
             matched_clips.append(cropped_sub)
 
-        # Ensure total visual duration matches audio duration
         current_visual_dur = sum(c.duration for c in matched_clips)
         if current_visual_dur < target_dur:
             diff = target_dur - current_visual_dur
@@ -632,6 +644,7 @@ def render_and_cap(
             matched_clips.append(extra_comp)
 
         merged = concatenate_videoclips(matched_clips, method="compose")
+        # STRICTLY less than 59 seconds
         end = max(45.0, min(PREVIEW_MAX, target_dur))
 
         out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
@@ -783,7 +796,7 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
             if not os.path.exists(thumb_path):
                 thumb_path = None
 
-            score = abs(57.5 - dur)
+            score = abs(57.0 - dur)
             if score < best["score"]:
                 best_path = f"best_{attempt}.mp4"
                 shutil.copyfile(final_mp4, best_path)
@@ -1016,7 +1029,7 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
         f"- **Thumbnail Status:** `{thumb_status}`\n"
         f"- **AI Thumbnail Prompt:** `{video_meta.get('thumbnail_prompt', '')}`\n"
         f"- **2026 Synthetic Media Flag:** `containsSyntheticMedia = True`\n\n"
-        f"### 🎙️ Shorts Script Breakdown (Voice-Synchronized Visuals)\n"
+        f"### 🎙️ Shorts Script Breakdown (Voice-Synchronized Visuals & Full Forms)\n"
         f"{seg_table}\n\n"
         "Reply with:\n"
         "- `/approve-video` — schedule for publication\n"
