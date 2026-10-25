@@ -26,15 +26,19 @@ jobs:
   handle:
     runs-on: ubuntu-latest
     if: |
-      contains(github.event.comment.body, '/approve-topic')    ||
-      contains(github.event.comment.body, '/reject-topic')     ||
-      contains(github.event.comment.body, '/approve-video')    ||
-      contains(github.event.comment.body, '/reject-video')     ||
-      contains(github.event.comment.body, '/regenerate-video') ||
-      contains(github.event.comment.body, '/new-topic')        ||
-      contains(github.event.comment.body, '/custom-topic')     ||
-      contains(github.event.comment.body, '/set-script')       ||
-      contains(github.event.comment.body, '/use-default-prompt')
+      github.event.issue.pull_request == null &&
+      github.event.comment.user.type != 'Bot' &&
+      (
+        contains(github.event.comment.body, '/approve-topic')      ||
+        contains(github.event.comment.body, '/reject-topic')       ||
+        contains(github.event.comment.body, '/approve-video')      ||
+        contains(github.event.comment.body, '/reject-video')       ||
+        contains(github.event.comment.body, '/regenerate-video')   ||
+        contains(github.event.comment.body, '/new-topic')          ||
+        contains(github.event.comment.body, '/custom-topic')       ||
+        contains(github.event.comment.body, '/set-script')         ||
+        contains(github.event.comment.body, '/use-default-prompt')
+      )
 
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +91,7 @@ jobs:
             fi
           done
           if [ -z "$PEXELS_API_KEY" ]; then
-            echo "::warning::PEXELS_API_KEY is not set (falling back to built-in stock B-roll URLs)."
+            echo "::warning::PEXELS_API_KEY is not set (falling back to built-in synthetic B-roll)."
           else
             echo "PEXELS_API_KEY is set ✓"
           fi
@@ -99,9 +103,6 @@ jobs:
           YT_CLIENT_SECRET:  ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN:  ${{ secrets.YT_REFRESH_TOKEN }}
 
-      - name: Dump event payload (debug)
-        run: cat "$GITHUB_EVENT_PATH"
-
       - name: Handle comment
         env:
           REGION:               IN
@@ -112,10 +113,10 @@ jobs:
           YT_CLIENT_SECRET:     ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN:     ${{ secrets.YT_REFRESH_TOKEN }}
           TTS_LANG:             en
-          GROQ_MODEL:           qwen/qwen3-32b
+          GROQ_MODEL:           llama-3.3-70b-versatile
           GROQ_FALLBACK_MODELS: >-
             llama-3.3-70b-versatile,llama-3.1-8b-instant,
-            openai/gpt-oss-20b,openai/gpt-oss-120b,
+            qwen/qwen3-32b,openai/gpt-oss-20b,openai/gpt-oss-120b,
             groq/compound-mini,moonshotai/kimi-k2-instruct
-          DEBUG:                "0"
+          DEBUG:                "1"
         run: python handle_comment.py
