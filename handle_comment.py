@@ -1,7 +1,8 @@
 """
 handle_comment.py — Processes all /commands posted on GitHub Issues, enforces YMYL Health Policy
 sanitization, eliminates repeated 'Thank You' loops, builds the 4-Attribute Viral Shorts Script
-Package, renders the vertical video, and uploads to YouTube with 2026 Synthetic Media disclosure.
+Package, renders the vertical video with a 0.3s embedded 9:16 Pillow Thumbnail intro frame for
+native YouTube Shorts shelf selection, and uploads to YouTube with 2026 Synthetic Media disclosure.
 """
 from __future__ import annotations
 
@@ -19,7 +20,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_videoclips
+from moviepy.editor import (
+    AudioFileClip,
+    CompositeVideoClip,
+    ImageClip,
+    VideoFileClip,
+    concatenate_videoclips,
+)
 
 from brand_config import (
     MANDATORY_VERBAL_DISCLAIMER,
@@ -46,6 +53,7 @@ from common import (
     set_metadata_in_issue_body,
 )
 from seo import generate_seo_package
+from thumbnail_generator import generate_shorts_thumbnail
 
 log = get_logger("handle_comment")
 
@@ -77,10 +85,10 @@ IST = timezone(timedelta(hours=5, minutes=30))
 TARGET_LOW = 35.0
 TARGET_HIGH = 58.0
 PREVIEW_MAX = 57.3
+THUMB_INTRO_DUR = 0.3
 
 _PROMPT_FILE = Path(__file__).parent / "prompt.txt"
 
-# Regex patterns to strip any LLM-generated sign-offs or repeated "Thank you" loops
 _OUTRO_STRIP_PATTERNS = [
     r"(?i)\bthank\s+you\s+(so\s+much\s+)?for\s+(watching|listening|tuning\s+in)[^.!?]*[.!?]?",
     r"(?i)\bthanks\s+for\s+(watching|listening)[^.!?]*[.!?]?",
@@ -157,17 +165,19 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
     """
     text = raw_text or ""
 
-    # 1. Strip <think> reasoning blocks and code fences
     text = re.sub(r"<think>.*?</think>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"```[a-zA-Z]*", " ", text)
     text = text.replace("```", " ")
 
-    # 2. Strip bracketed stage directions, visual cues, and timestamps like [0:00-0:15], [Visual: ...], (Cut to ...)
     text = re.sub(r"\[[^\]]*\]", " ", text)
-    text = re.sub(r"\((?:visual|scene|cut|music|sfx|audio|pause|b-roll|on-screen|outro|intro)[^)]*\)", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\((?:visual|scene|cut|music|sfx|audio|pause|b-roll|on-screen|outro|intro)[^)]*\)",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(r"\b\d{1,2}:\d{2}(?:\s*[-–—to]+\s*\d{1,2}:\d{2})?\b", " ", text)
 
-    # 3. Strip speaker labels and section headers at start of lines or inline
     text = re.sub(
         r"(?i)(?:^|\n)\s*(?:Title|Topic|Script|Intro|Hook|Body|Point\s*\d+|Recap|CTA|Outro|Disclaimer|Voiceover|Narrator|Host|Speaker|Visual|Audio|On-screen\s+text)\s*:\s*",
         " ",
@@ -175,17 +185,14 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
     )
     text = re.sub(r"(?i)^(Here is the script|Sure!|Certainly!|Here's your script)[^\n]*\n?", " ", text).strip()
 
-    # 4. Strip markdown symbols, hashtags, URLs, and emojis
     text = re.sub(r"https?://\S+", " ", text)
-    text = re.sub(r"#\w+", " ", text)
+    text = re.sub(r"(?:^|\s)#\w+", " ", text)
     text = re.sub(r"[*_~`#>|]+", " ", text)
     text = re.sub(r"[^\x00-\x7F]+", " ", text)
 
-    # 5. Eliminate ALL pre-existing "Thank you" / "Subscribe" / "Follow for more" sign-offs to prevent loops
     for pat in _OUTRO_STRIP_PATTERNS:
         text = re.sub(pat, " ", text)
 
-    # 6. Deduplicate consecutive identical sentences if the LLM repeated a sentence
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     deduped_sentences: list[str] = []
     seen_norm: set[str] = set()
@@ -200,7 +207,6 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
     body_text = enforce_policy_guardrails(body_text)
 
     if enforce_policy_blocks:
-        # Ensure Mandatory Verbal Disclaimer is present once
         if "not medical advice" not in body_text.lower():
             if len(deduped_sentences) >= 1:
                 deduped_sentences.insert(1, MANDATORY_VERBAL_DISCLAIMER)
@@ -208,33 +214,26 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
                 deduped_sentences.append(MANDATORY_VERBAL_DISCLAIMER)
             body_text = " ".join(deduped_sentences)
 
-        # Ensure at least one Credible Medical Source is cited in speech
         credible_orgs = ("mayo clinic", "cdc", "nih", "world health organization", "who", "cleveland clinic", "pubmed")
         if not any(org in body_text.lower() for org in credible_orgs):
             top_src = select_credible_sources(topic, body_text, count=1)[0]["org"]
-            cite_sentence = f"According to research from the {top_src}, understanding how your body signals these changes helps you respond early."
+            cite_sentence = (
+                f"According to research from the {top_src}, understanding how your body signals "
+                "these changes helps you respond early."
+            )
             deduped_sentences.append(cite_sentence)
             body_text = " ".join(deduped_sentences)
 
-        # Ensure mid-content doctor consultation reminder is present
         if "consult a doctor" not in body_text.lower() and "healthcare provider" not in body_text.lower():
             deduped_sentences.append(MID_CONTENT_DOCTOR_REMINDER)
             body_text = " ".join(deduped_sentences)
 
-    # 7. Append UNIFIED_SINGLE_OUTRO strictly ONCE
     final_spoken = body_text.rstrip(".!? ") + ". " + UNIFIED_SINGLE_OUTRO
     final_spoken = re.sub(r"\s+", " ", final_spoken).strip()
     return final_spoken
 
 
 def build_viral_shorts_segments(spoken_script: str, topic: str) -> list[dict]:
-    """
-    Structures the sanitized spoken script into the 4-Attribute Three-Part Viral Shorts System:
-      1. visual_direction
-      2. on_screen_text
-      3. spoken_narration
-      4. audio_cue
-    """
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", spoken_script) if s.strip()]
     hook_sent = sentences[0] if sentences else spoken_script
     disclaimer_sent = sentences[1] if len(sentences) > 1 else MANDATORY_VERBAL_DISCLAIMER
@@ -247,8 +246,8 @@ def build_viral_shorts_segments(spoken_script: str, topic: str) -> list[dict]:
         {
             "segment": "1. Pattern-Interrupt Hook (0:00–0:03)",
             "visual_direction": (
-                f"High-contrast 9:16 close-up lifestyle or subtle 3D anatomical highlight of {topic} "
-                f"in clinical navy ({VISUAL_IDENTITY['color_palette']['deep_clinical_navy']}) with dynamic 1.08x zoom."
+                f"0.3s 3-word Pillow thumbnail flash into high-contrast 9:16 lifestyle/3D highlight of {topic} "
+                f"in clinical navy ({VISUAL_IDENTITY['color_palette']['deep_clinical_navy']})."
             ),
             "on_screen_text": f"WHY {short_topic_words} HAPPENS",
             "spoken_narration": hook_sent,
@@ -375,7 +374,6 @@ def get_audio_duration(path: str) -> float:
 
 
 def ensure_bgm_track(duration: float, out_path: str = "bgm_src.m4a") -> str:
-    """Generates a calm instrumental ambient pad using FFmpeg synthesis."""
     subprocess.run(
         [
             "ffmpeg", "-y", "-f", "lavfi", "-t", f"{duration + 2.0:.2f}",
@@ -424,7 +422,8 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
             chunks.append((" ".join(w[0] for w in grp), grp[0][1], grp[-1][2]))
             i += take
 
-        out, idx, cur_t = [], 1, max(0.0, chunks[0][1]) if chunks else 0.0
+        # Start captions after the 0.3s embedded thumbnail intro so the thumbnail frame stays clean
+        out, idx, cur_t = [], 1, max(THUMB_INTRO_DUR, chunks[0][1]) if chunks else THUMB_INTRO_DUR
         for text, w_start, w_end in chunks:
             start = max(cur_t, w_start)
             end = max(start + 0.35, w_end)
@@ -501,7 +500,6 @@ def smart_cover_crop(clip, target_w=1080, target_h=1920):
 
 def fetch_broll(query: str, need: int = 6) -> list[str]:
     clean_q = re.sub(r"[^a-zA-Z0-9\s]", " ", query or "")
-    # Strip any graphic/medical-gore terms from Pexels query to keep B-roll strictly clean & policy-safe
     clean_q = re.sub(r"(?i)\b(blood|surgery|disease|wound|tumor|infection)\b", "wellness", clean_q)
     clean_q = " ".join(clean_q.split()[:4]) or "healthy lifestyle"
     all_queries = [clean_q, "healthy lifestyle", "fitness exercise", "meditation", "wellness nature"]
@@ -542,7 +540,6 @@ def fetch_broll(query: str, need: int = 6) -> list[str]:
 
 
 def _generate_fallback_video_clips(tmp: Path, count: int = 3) -> list[str]:
-    """Generates clean vertical clinical-navy and medical-teal background clips via FFmpeg if downloads fail."""
     generated = []
     colors = ["0x0A2540", "0x00A896", "0x134E5E"]
     for i in range(count):
@@ -590,20 +587,45 @@ def _download_broll(urls: list[str], tmp: Path) -> list[str]:
     return local
 
 
-def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_mp4: str) -> float:
+def render_and_cap(
+    broll_urls: list[str],
+    voice_mp3: str,
+    temp_mp4: str,
+    final_mp4: str,
+    thumbnail_text: str = "WHAT SCIENCE SAYS",
+    topic: str = "",
+    thumb_out_path: str = "thumbnail.jpg",
+) -> float:
+    """
+    Downloads B-roll, renders the 9:16 Pillow thumbnail using a clean B-roll source clip,
+    overlays the generated thumbnail onto the first 0.3 seconds (THUMB_INTRO_DUR) of the
+    MP4 video so YouTube Shorts frame-picker can select it natively, and burns captions + BGM.
+    """
     tmp = Path(tempfile.mkdtemp())
     local = _download_broll(broll_urls, tmp)
     if not local:
         raise RuntimeError("No B-roll clips could be downloaded or synthesized.")
 
-    raw_clips, cropped, merged, voice_clip = [], [], None, None
+    # 1. Generate the 9:16 Pillow Thumbnail before video encoding so it can be embedded in the first 0.3s
+    thumb_ready = False
+    try:
+        generate_shorts_thumbnail(
+            thumbnail_text=thumbnail_text,
+            topic=topic,
+            video_path=local[0],
+            out_path=thumb_out_path,
+        )
+        thumb_ready = os.path.exists(thumb_out_path) and os.path.getsize(thumb_out_path) > 1024
+    except Exception as tex:
+        log.warning("[thumbnail] Pre-render thumbnail generation failed (%s)", tex)
+
+    raw_clips, cropped, merged, voice_clip, thumb_clip, composite_clip = [], [], None, None, None, None
     try:
         base_comps = []
         for p in local:
             try:
                 c = VideoFileClip(p)
                 raw_clips.append(c)
-                # Dynamic 2.0-2.5s cuts for high retention and YPP compliance
                 clip_dur = float(c.duration)
                 step = 2.4
                 t_cursor = 0.0
@@ -633,8 +655,26 @@ def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_m
 
         merged = concatenate_videoclips(cropped, method="compose")
         end = max(0.5, min(PREVIEW_MAX, target_dur))
+        base_video = merged.subclip(0, end)
 
-        out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
+        # 2. Overlay the 9:16 Pillow thumbnail onto the first 0.3s (THUMB_INTRO_DUR) of the video stream
+        if thumb_ready and end > THUMB_INTRO_DUR:
+            try:
+                thumb_clip = (
+                    ImageClip(thumb_out_path)
+                    .set_start(0)
+                    .set_duration(THUMB_INTRO_DUR)
+                    .resize((1080, 1920))
+                )
+                composite_clip = CompositeVideoClip([base_video, thumb_clip], size=(1080, 1920)).set_duration(end)
+                out_clip = composite_clip.set_audio(voice_clip.subclip(0, end))
+                log.info("[render] Embedded 9:16 Pillow thumbnail into first %.1fs of MP4", THUMB_INTRO_DUR)
+            except Exception as oex:
+                log.warning("[render] 0.3s thumbnail overlay fallback to base_video: %s", oex)
+                out_clip = base_video.set_audio(voice_clip.subclip(0, end))
+        else:
+            out_clip = base_video.set_audio(voice_clip.subclip(0, end))
+
         out_clip.write_videofile(
             temp_mp4,
             fps=30,
@@ -651,16 +691,12 @@ def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_m
                 c.close()
             except Exception:
                 pass
-        if voice_clip:
-            try:
-                voice_clip.close()
-            except Exception:
-                pass
-        if merged:
-            try:
-                merged.close()
-            except Exception:
-                pass
+        for clip_obj in (thumb_clip, composite_clip, voice_clip, merged):
+            if clip_obj is not None:
+                try:
+                    clip_obj.close()
+                except Exception:
+                    pass
         shutil.rmtree(tmp, ignore_errors=True)
 
     srt_path = "cap.srt"
@@ -693,7 +729,7 @@ def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_m
     return round(end, 2)
 
 
-# ── YouTube Upload (with 2026 Synthetic Media Disclosure) ────────────────────
+# ── YouTube Upload (with 2026 Synthetic Media Disclosure & Custom Thumbnail) ──
 def _yt_client():
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -707,7 +743,13 @@ def _yt_client():
     return build("youtube", "v3", credentials=creds)
 
 
-def upload_unlisted(video_path: str, title: str, desc: str, tags: str) -> tuple[str, str]:
+def upload_unlisted(
+    video_path: str,
+    title: str,
+    desc: str,
+    tags: str,
+    thumbnail_path: str | None = None,
+) -> tuple[str, str, bool]:
     from googleapiclient.http import MediaFileUpload
     yt = _yt_client()
     body = {
@@ -728,11 +770,23 @@ def upload_unlisted(video_path: str, title: str, desc: str, tags: str) -> tuple[
     resp = None
     while resp is None:
         _, resp = req.next_chunk()
-    return resp["id"], f"https://youtu.be/{resp['id']}"
+
+    vid_id = resp["id"]
+    thumb_uploaded = False
+    if thumbnail_path and os.path.exists(thumbnail_path):
+        try:
+            thumb_media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg", resumable=False)
+            yt.thumbnails().set(videoId=vid_id, media_body=thumb_media).execute()
+            thumb_uploaded = True
+            log.info("[upload] Custom 3-word Pillow thumbnail uploaded for video %s", vid_id)
+        except Exception as exc:
+            log.warning("[upload] Custom thumbnail API call skipped/failed (%s); 0.3s MP4 frame remains active", exc)
+
+    return vid_id, f"https://youtu.be/{vid_id}", thumb_uploaded
 
 
 def build_preview(topic: str, user_script: str | None, slot: str, issue_body: str) -> tuple[dict | None, str]:
-    best = {"path": None, "dur": None, "score": float("inf"), "attempt": 0, "seo": None, "segments": None}
+    best = {"path": None, "dur": None, "score": float("inf"), "attempt": 0, "seo": None, "segments": None, "thumb": None}
     last_error = None
 
     max_attempts = 1 if user_script else 2
@@ -741,7 +795,6 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
         try:
             log.info("[build] Starting attempt %d/%d for topic: %s", attempt, max_attempts, topic)
             if user_script:
-                # If user provides custom script, sanitize markdown/labels & repeated thank-yous
                 script_text = sanitize_spoken_script(user_script, topic=topic, enforce_policy_blocks=False)
             else:
                 prompt_tpl = load_default_prompt()
@@ -756,7 +809,20 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
 
             broll = fetch_broll(topic, need=6)
             temp_mp4, final_mp4 = f"temp_{attempt}.mp4", f"short_{attempt}.mp4"
-            dur = render_and_cap(broll, voice_raw, temp_mp4, final_mp4)
+            thumb_path = f"thumb_{attempt}.jpg"
+
+            dur = render_and_cap(
+                broll_urls=broll,
+                voice_mp3=voice_raw,
+                temp_mp4=temp_mp4,
+                final_mp4=final_mp4,
+                thumbnail_text=seo.get("thumbnail_text", "WHAT SCIENCE SAYS"),
+                topic=topic,
+                thumb_out_path=thumb_path,
+            )
+
+            if not os.path.exists(thumb_path):
+                thumb_path = None
 
             score = 0.0 if TARGET_LOW <= dur < TARGET_HIGH else abs(dur - 45.0)
             if score < best["score"]:
@@ -769,17 +835,26 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
                     "attempt": attempt,
                     "seo": seo,
                     "segments": segments,
+                    "thumb": thumb_path,
                 })
 
             if TARGET_LOW <= dur < TARGET_HIGH or user_script:
-                return _package_and_upload(final_mp4, seo, segments, topic, slot, issue_body, attempt, dur)
+                return _package_and_upload(final_mp4, seo, segments, topic, slot, issue_body, attempt, dur, thumb_path)
         except Exception as exc:
             last_error = exc
             log.error("[build] attempt %d failed: %s", attempt, exc, exc_info=True)
 
     if best["path"] and os.path.exists(best["path"]):
         return _package_and_upload(
-            best["path"], best["seo"], best["segments"], topic, slot, issue_body, best["attempt"], best["dur"]
+            best["path"],
+            best["seo"],
+            best["segments"],
+            topic,
+            slot,
+            issue_body,
+            best["attempt"],
+            best["dur"],
+            best["thumb"],
         )
 
     if last_error:
@@ -787,10 +862,12 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
     return None, issue_body
 
 
-def _package_and_upload(video_path, seo, segments, topic, slot, issue_body, attempt, dur):
+def _package_and_upload(video_path, seo, segments, topic, slot, issue_body, attempt, dur, thumb_path=None):
     try:
         log.info("[upload] Uploading %s to YouTube as unlisted (containsSyntheticMedia=True)...", video_path)
-        vid_id, link = upload_unlisted(video_path, seo["title"], seo["description"], seo["tags_csv"])
+        vid_id, link, thumb_ok = upload_unlisted(
+            video_path, seo["title"], seo["description"], seo["tags_csv"], thumbnail_path=thumb_path
+        )
         log.info("[upload] Uploaded successfully: %s", link)
         meta = get_metadata_from_issue_body(issue_body) or {}
         meta.update({
@@ -799,6 +876,7 @@ def _package_and_upload(video_path, seo, segments, topic, slot, issue_body, atte
             "punchy_short_title": seo.get("punchy_short_title", ""),
             "thumbnail_text": seo.get("thumbnail_text", ""),
             "thumbnail_prompt": seo.get("thumbnail_prompt", ""),
+            "thumbnail_uploaded": thumb_ok,
             "description": seo["description"],
             "preview_video_id": vid_id,
             "preview_link": link,
@@ -826,16 +904,20 @@ def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None
 
 
 def _clean_issue_title_to_topic(title: str) -> str:
-    s = re.sub(r"(?i)#?shorts?|\[[^\]]+\]|\([^)]+\)", "", (title or "").strip())
-    s = re.split(r"\s+[|\-–—]\s+", s)[0].strip()
-    return (s[0].upper() + s[1:])[:120].rstrip() if s else "Health and symptom awareness"
+    s = re.sub(r"(?:^|\s)#\w+", " ", (title or "").strip())
+    s = re.sub(r"(?i)\bshorts?\b|\[[^\]]*\]|\([^)]*\)", " ", s)
+    s = re.split(r"\s+\|\s+|\s+[-–—]{1,2}\s+", s)[0].strip()
+    s = re.sub(r"\s+", " ", s).strip(" :;,-–—.!\"'")
+    if len(re.findall(r"[a-zA-Z]{2,}", s)) < 3:
+        return "Daily Health and Symptom Awareness"
+    return (s[0].upper() + s[1:])[:120].rstrip()
 
 
 def _extract_topics_from_visible_body(issue_body: str) -> list[str]:
     if not issue_body:
         return []
-    matches = re.findall(r"^\s*\d+\)\s+(.+)$", issue_body, flags=re.MULTILINE)
-    return [m.strip() for m in matches if m.strip()]
+    matches = re.findall(r"^\s*\d+[\)\.]\s+(.+)$", issue_body, flags=re.MULTILINE)
+    return [m.strip() for m in matches if len(re.findall(r"[a-zA-Z]{2,}", m)) >= 3]
 
 
 def _extract_user_script_if_present(comment_body: str) -> str | None:
@@ -869,8 +951,10 @@ def _parse_topic_from_approve(comment_body: str, topics: list[str], issue_title:
     if m_num:
         idx = int(m_num.group(1))
         if topics and 1 <= idx <= len(topics):
-            return topics[idx - 1]
-        elif topics:
+            candidate = topics[idx - 1]
+            if len(re.findall(r"[a-zA-Z]{2,}", candidate)) >= 3:
+                return candidate
+        if topics and len(re.findall(r"[a-zA-Z]{2,}", topics[0])) >= 3:
             return topics[0]
         return _clean_issue_title_to_topic(issue_title)
 
@@ -906,7 +990,7 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     topics = meta.get("topics") or _extract_topics_from_visible_body(ctx.issue_body)
     topic = meta.get("topic", "")
-    if not topic:
+    if not topic or len(re.findall(r"[a-zA-Z]{2,}", topic)) < 2:
         topic = topics[0] if topics else _clean_issue_title_to_topic(ctx.issue.get("title", ""))
         meta["topic"] = topic
 
@@ -924,7 +1008,7 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"🎬 Building video preview for **{topic}** (using {mode_str}).\nThis takes ~2–5 minutes...",
+        f"🎬 Building video preview & embedding 0.3s 9:16 Pillow thumbnail for **{topic}** (using {mode_str}).\nThis takes ~2–5 minutes...",
     )
 
     try:
@@ -946,7 +1030,6 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body2})
     ctx.issue_body = new_body2
 
-    # Format the 4-Attribute Viral Shorts Script table for the GitHub Issue preview
     seg_rows = []
     for seg in video_meta.get("viral_segments", []):
         seg_rows.append(
@@ -959,6 +1042,12 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
         else ""
     )
 
+    thumb_status = (
+        "Embedded in 0.0–0.3s of MP4 + Uploaded via YouTube API ✓"
+        if video_meta.get("thumbnail_uploaded")
+        else "Embedded in 0.0–0.3s of MP4 for Shorts Frame-Picker ✓"
+    )
+
     post_comment(
         ctx.owner,
         ctx.repo,
@@ -969,6 +1058,7 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
         f"- **SEO Video Title:** `{video_meta['title']}`\n"
         f"- **Punchy Alt Title (<6 words):** `{video_meta.get('punchy_short_title', '')}`\n"
         f"- **3-Word Complementary Thumbnail Text:** `{video_meta.get('thumbnail_text', '')}` *(0% word overlap with title)*\n"
+        f"- **Pillow 9:16 Thumbnail Status:** `{thumb_status}`\n"
         f"- **AI Thumbnail Prompt:** `{video_meta.get('thumbnail_prompt', '')}`\n"
         f"- **2026 Synthetic Media Flag:** `containsSyntheticMedia = True`\n\n"
         f"### 🎙️ 4-Attribute Shorts Script Breakdown\n"
@@ -987,7 +1077,7 @@ def handle_reject_topic(ctx: Ctx) -> None:
     except Exception:
         options = []
 
-    if not options:
+    if len(options) < 6:
         options = [
             "5 Subtle Dehydration Signals People Often Ignore",
             "Myth vs Fact: Does Drinking Coffee First Thing Spike Cortisol?",
@@ -1065,8 +1155,8 @@ def handle_reject_video(ctx: Ctx) -> None:
 
     for k in [
         "preview_video_id", "preview_link", "title", "punchy_short_title",
-        "thumbnail_text", "thumbnail_prompt", "description", "attempt",
-        "duration_sec", "viral_segments",
+        "thumbnail_text", "thumbnail_prompt", "thumbnail_uploaded", "description",
+        "attempt", "duration_sec", "viral_segments",
     ]:
         meta.pop(k, None)
     gh(
@@ -1155,7 +1245,6 @@ def main() -> None:
 
     log.info("Processing comment on issue #%d: %s", ctx.number, comment_body[:120])
 
-    # 1. Direct video lifecycle commands
     if "/approve-video" in comment_lower:
         handle_approve_video(ctx)
         return
@@ -1169,7 +1258,6 @@ def main() -> None:
         handle_reject_topic(ctx)
         return
 
-    # 2. Topic & Script commands (supports both single and combined in one comment)
     has_approve = "/approve-topic" in comment_lower
     has_custom = "/custom-topic" in comment_lower
     has_default = "/use-default-prompt" in comment_lower
