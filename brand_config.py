@@ -1,6 +1,6 @@
 """
 brand_config.py — Health and Wellness Channel Positioning, Daily Habit Pillars,
-E-E-A-T Credible Sources, and Visual Identity Constants.
+E-E-A-T Credible Sources with Full-Form Institution Names, and Visual Identity Constants.
 """
 from __future__ import annotations
 
@@ -18,14 +18,9 @@ CHANNEL_SEO_DESCRIPTIONS = [
     (
         "Welcome to your daily destination for science-backed health and wellness mastery. "
         "Every 60-second Short breaks down actionable daily habits, metabolic nutrition science, "
-        "sleep optimization, and longevity research cited from institutions like the Mayo Clinic, CDC, WHO, and NIH. "
+        "sleep optimization, and longevity research cited from institutions like the Mayo Clinic, "
+        "the Centers for Disease Control and Prevention, the World Health Organization, and the National Institutes of Health. "
         "Subscribe for daily wellness insights! "
-        f"{CHANNEL_POSITIONING_STATEMENT}"
-    ),
-    (
-        "Unlock your body's full potential with clear, evidence-based health and wellness education. "
-        "We translate peer-reviewed research from PubMed, Harvard Health, and the NIH into engaging, "
-        "high-retention Shorts on nutrition, biohacking, restorative sleep, and sustainable fitness. "
         f"{CHANNEL_POSITIONING_STATEMENT}"
     ),
 ]
@@ -99,7 +94,7 @@ def get_pillar_for_date(target_date: date | datetime | None = None) -> dict:
     return {"key": key, **CONTENT_PILLARS[key]}
 
 
-# ── 4. Credible E-E-A-T Medical Sources ───────────────────────────────────────
+# ── 4. Credible E-E-A-T Medical Sources (Full-Form Names Only) ─────────────────
 CREDIBLE_SOURCES_POOL = [
     {
         "org": "Mayo Clinic",
@@ -108,22 +103,28 @@ CREDIBLE_SOURCES_POOL = [
         "keywords": ["sleep", "nutrition", "fitness", "wellness", "habit", "stress"],
     },
     {
-        "org": "CDC",
-        "name": "Centers for Disease Control and Prevention (CDC) — Healthy Living",
+        "org": "Centers for Disease Control and Prevention",
+        "name": "Centers for Disease Control and Prevention — Healthy Living",
         "url": "https://www.cdc.gov/healthy-weight-growth/about/index.html",
         "keywords": ["hydration", "activity", "sleep", "nutrition", "prevention"],
     },
     {
-        "org": "NIH",
-        "name": "National Institutes of Health (NIH) — Wellness Research",
+        "org": "National Institutes of Health",
+        "name": "National Institutes of Health — Wellness Research",
         "url": "https://health.nih.gov/",
         "keywords": ["brain", "longevity", "metabolism", "circadian", "vitamin", "mitochondria"],
     },
     {
-        "org": "Harvard Health",
+        "org": "Harvard Health Publishing",
         "name": "Harvard Health Publishing — Daily Health & Nutrition",
         "url": "https://www.health.harvard.edu/",
         "keywords": ["diet", "heart", "gut", "exercise", "mindfulness", "longevity"],
+    },
+    {
+        "org": "World Health Organization",
+        "name": "World Health Organization — Health Topics",
+        "url": "https://www.who.int/health-topics",
+        "keywords": ["global", "lifestyle", "cardio", "mental", "wellbeing", "diet"],
     },
 ]
 
@@ -138,12 +139,12 @@ def select_credible_sources(topic: str, script_text: str = "", count: int = 2) -
     return [item[2] for item in scored[:max(1, min(count, len(CREDIBLE_SOURCES_POOL)))]]
 
 
-# ── 5. Guardrails ─────────────────────────────────────────────────────────────
 NEGATIVE_PROMPT_RULES = """
 STRICT HEALTH & WELLNESS GUIDELINES:
 1. Focus entirely on positive lifestyle optimization, vitality, nutrition, sleep, and longevity.
 2. Avoid disease diagnosis or medical scaremongering.
-3. Maintain an inspiring, curious, high-retention educational tone.
+3. NEVER use abbreviations like CDC, WHO, or NIH in the spoken script. Always use their full names
+   (e.g., Centers for Disease Control and Prevention, World Health Organization, National Institutes of Health).
 """
 
 
@@ -151,7 +152,6 @@ def enforce_policy_guardrails(text: str) -> str:
     return text or ""
 
 
-# ── 6. Visual Identity Constants ──────────────────────────────────────────────
 VISUAL_IDENTITY = {
     "color_palette": {
         "deep_clinical_navy": "#0A2540",
