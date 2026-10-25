@@ -1,29 +1,35 @@
-# Wellness Wonders: Policy-Safe YouTube Health Shorts Automation
+# Wellness Wonders: YouTube Shorts Automation
 
-This project automates the creation, packaging, and scheduling of educational **Health & Symptoms Niche YouTube Shorts**. It strictly enforces YouTube YMYL (Your Money Your Life) medical policies, E-E-A-T credible sourcing, 2026 Synthetic Media disclosures, and a single-outro audio pipeline.
+This project automates the creation and scheduling of health and wellness YouTube Shorts. It leverages AI for scriptwriting, SEO, and transcription, while fetching high-quality vertical B-roll and rendering the final video using FFmpeg.
 
 ## Architecture Overview
 - **Language & Runtime:** Python 3.11+ executed via GitHub Actions workflows (`.github/workflows/`).
-- **Channel Positioning:** Strict **Awareness, NOT Diagnosis** positioning (`brand_config.py`). Never uses a fake "Dr. AI" persona or makes diagnostic/cure claims.
-- **Weekly Content Pillars (`propose.py` & `brand_config.py`):**
-  - **Mon/Tue:** Symptom Awareness (*"5 subtle signals people often ignore — consult a doctor"*)
-  - **Wed/Thu:** Myth vs. Fact (*High engagement, low legal risk*)
-  - **Fri/Sun:** Lifestyle & Prevention (*Evergreen, advertiser-friendly habits*)
-  - **Sat:** Explainer / How the Body Works (*Physiological curiosity*)
-- **Sanitized Spoken Script Pipeline (`handle_comment.py` & `prompt.txt`):**
-  - Strips all markdown (`**`, `##`), stage directions (`[Visual]`), timestamps (`[0:00]`), and speaker labels (`Narrator:`).
-  - Eliminates LLM-generated "Thank you for watching" loops and appends `UNIFIED_SINGLE_OUTRO` **strictly once**.
-  - Structures every Short into the **4-Attribute Viral Shorts System**: `visual_direction`, `on_screen_text`, `spoken_narration`, and `audio_cue`.
-- **High-CTR Title & 3-Word Complementary Thumbnail Matrix (`seo.py`):**
-  - Generates curiosity-driven titles alongside a **3-word thumbnail overlay** that is programmatically verified to share **zero overlapping words** with the video title.
-  - Formats descriptions with `⚠️ Disclaimer`, `📚 Sources` (Mayo Clinic, CDC, NIH, WHO, Cleveland Clinic, PubMed), and `⏱️ Timestamps`.
-- **2026 YouTube AI Disclosure:** Automatically sets `containsSyntheticMedia = True` on all YouTube Data API v3 uploads and updates.
+- **Control Mechanism:** Triggered via scheduled cron jobs and GitHub Issue comments (e.g., `/approve-topic`, `/set-script`, `/approve-video`).
+- **Script & SEO Generation:** Uses the Groq API (`llama-3.3-70b-versatile`) to generate high-retention Shorts scripts, titles, descriptions, and tags from a dynamic topics pool.
+- **Audio Pipeline:** Automated Text-to-Speech (TTS) using `gTTS` or `espeak-ng` mixed with background audio via FFmpeg.
+- **Visual Pipeline:** Vertical (9:16) stock B-roll fetched dynamically via the Pexels API, processed with MoviePy and FFmpeg.
+- **Captions:** Automated word/phrase-level subtitle generation using `faster-whisper` and burned into the video via FFmpeg.
+- **Publishing:** Automated YouTube Data API v3 upload with SEO metadata and scheduling.
+
+## Commands (GitHub Issues)
+The system is controlled via GitHub Issue comments:
+- `/approve-topic <N>`: Selects a proposed topic.
+- `/set-script <text>`: Provides a custom script for the video.
+- `/use-default-prompt`: Generates a script based on `prompt.txt`.
+- `/approve-video`: Final approval to upload/schedule to YouTube.
+- `/regenerate-video`: Re-renders the current video (e.g., to get different B-roll).
+
+## Coding & Optimization Guidelines
+1. **Retention & Monetization Compliance:** Avoid static, uncut B-roll. When updating FFmpeg video filters, prefer dynamic cuts (every 1.5–2.5 seconds), subtle zoompan (Ken Burns) effects, and high-contrast highlighted captions so videos pass YouTube Partner Program "Reused/Repetitious Content" checks.
+2. **Script Structure:** All Groq prompts must enforce a 0–3s pattern-interrupt hook (never repeating the title verbatim), actionable body steps, and a seamless loop ending.
+3. **Workflow Stability:** Ensure all external API calls (Groq, Pexels, YouTube) include proper error handling, retries, and clean logging for GitHub Actions debugging.
+4. **Technical Standards:** Use `ThreadPoolExecutor` for parallel asset downloads. Final video must be 1080x1920, 30fps, and < 58 seconds.
 
 ## Key Files
-- `brand_config.py`: Channel positioning, 4 content pillars, E-E-A-T source registry, red-flag regex guardrails, and visual identity constants.
-- `common.py`: Shared utilities for GitHub API and issue metadata handling.
-- `prompt.txt`: Policy-safe 60-second Shorts scriptwriter prompt (no LLM outro generation).
-- `handle_comment.py`: Central command processor, script sanitizer, MoviePy/FFmpeg renderer, and YouTube uploader.
-- `propose.py`: Pillar-aware topic discovery and refinement.
-- `seo.py`: SEO title, complementary 3-word thumbnail text, AI thumbnail prompt, and YMYL description builder.
-- `topics_pool.json`: Sanitized persistent fallback pool of policy-safe topics.
+- `common.py`: Shared utilities for GitHub API and metadata handling.
+- `topics_pool.json`: Persistent storage for fallback topics.
+- `requirements.txt`: Project dependencies (MoviePy, gTTS, faster-whisper, etc.).
+- `.github/workflows/`: Automation schedules and comment listeners.
+- `handle_comment.py`: The central logic for processing issue commands.
+- `propose.py`: Topic discovery and refinement.
+- `seo.py`: SEO package generation.
