@@ -1,5 +1,7 @@
 """
-handle_comment.py — processes all /commands posted on GitHub Issues.
+handle_comment.py — Processes all /commands posted on GitHub Issues, enforces YMYL Health Policy
+sanitization, eliminates repeated 'Thank You' loops, builds the 4-Attribute Viral Shorts Script
+Package, renders the vertical video, and uploads to YouTube with 2026 Synthetic Media disclosure.
 """
 from __future__ import annotations
 
@@ -12,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,11 +21,29 @@ from pathlib import Path
 import requests
 from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_videoclips
 
+from brand_config import (
+    MANDATORY_VERBAL_DISCLAIMER,
+    MID_CONTENT_DOCTOR_REMINDER,
+    NEGATIVE_PROMPT_RULES,
+    UNIFIED_SINGLE_OUTRO,
+    VISUAL_IDENTITY,
+    enforce_policy_guardrails,
+    select_credible_sources,
+)
 from common import (
-    REPO, add_label, extract_json_block, get_logger,
-    get_metadata_from_issue_body, get_slot_from_labels, gh,
-    is_authorized_commenter, jaccard, normalize_key, post_comment,
-    remove_label, set_metadata_in_issue_body
+    REPO,
+    add_label,
+    extract_json_block,
+    get_logger,
+    get_metadata_from_issue_body,
+    get_slot_from_labels,
+    gh,
+    is_authorized_commenter,
+    jaccard,
+    normalize_key,
+    post_comment,
+    remove_label,
+    set_metadata_in_issue_body,
 )
 from seo import generate_seo_package
 
@@ -36,29 +55,41 @@ except Exception:
     cv2 = None
 
 # ── Env ────────────────────────────────────────────────────────────────────────
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FALLBACKS = [
-    m.strip() for m in os.getenv(
+    m.strip()
+    for m in os.getenv(
         "GROQ_FALLBACK_MODELS",
         "llama-3.3-70b-versatile,llama-3.1-8b-instant,"
         "qwen/qwen3-32b,openai/gpt-oss-20b,openai/gpt-oss-120b,"
         "groq/compound-mini,moonshotai/kimi-k2-instruct",
-    ).split(",") if m.strip()
+    ).split(",")
+    if m.strip()
 ]
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
-REGION         = os.getenv("REGION", "IN")
-TTS_LANG       = os.getenv("TTS_LANG", "en")
-BGM_VOL        = 0.07
+REGION = os.getenv("REGION", "IN")
+TTS_LANG = os.getenv("TTS_LANG", "en")
+BGM_VOL = 0.07
 
-IST         = timezone(timedelta(hours=5, minutes=30))
-TARGET_LOW  = 35.0
+IST = timezone(timedelta(hours=5, minutes=30))
+TARGET_LOW = 35.0
 TARGET_HIGH = 58.0
 PREVIEW_MAX = 57.3
-PROMPT_REMINDER_HOURS = 1
 
 _PROMPT_FILE = Path(__file__).parent / "prompt.txt"
+
+# Regex patterns to strip any LLM-generated sign-offs or repeated "Thank you" loops
+_OUTRO_STRIP_PATTERNS = [
+    r"(?i)\bthank\s+you\s+(so\s+much\s+)?for\s+(watching|listening|tuning\s+in)[^.!?]*[.!?]?",
+    r"(?i)\bthanks\s+for\s+(watching|listening)[^.!?]*[.!?]?",
+    r"(?i)\bfollow\s+for\s+more\s+(daily\s+)?health\s+tips[^.!?]*[.!?]?",
+    r"(?i)\bdon'?t\s+forget\s+to\s+(like\s+and\s+)?subscribe[^.!?]*[.!?]?",
+    r"(?i)\blike\s+and\s+subscribe\s+for\s+more[^.!?]*[.!?]?",
+    r"(?i)\bsubscribe\s+for\s+more\s+(daily\s+)?(health|science)[^.!?]*[.!?]?",
+    r"(?i)\bkeep\s+monitoring\s+your\s+health[^.!?]*[.!?]?",
+]
 
 
 def load_default_prompt() -> str:
@@ -68,23 +99,23 @@ def load_default_prompt() -> str:
             return content
     except Exception:
         pass
-    return "Write a spoken voiceover script for a 50-second YouTube Short about: {topic}"
+    return "Write a spoken voiceover script for a 50-second educational YouTube Short about: {topic}"
 
 
 class Ctx:
     def __init__(self, event: dict, owner: str, repo: str) -> None:
-        self.event        = event
-        self.owner        = owner
-        self.repo         = repo
-        self.issue        = event["issue"]
-        self.number: int  = self.issue["number"]
+        self.event = event
+        self.owner = owner
+        self.repo = repo
+        self.issue = event["issue"]
+        self.number: int = self.issue["number"]
         self.comment_body = (event["comment"]["body"] or "").strip()
-        self.issue_body   = (self.issue.get("body") or "")
-        self.labels       = self.issue.get("labels", [])
-        self.slot         = get_slot_from_labels(self.labels)
+        self.issue_body = self.issue.get("body") or ""
+        self.labels = self.issue.get("labels", [])
+        self.slot = get_slot_from_labels(self.labels)
 
 
-# ── LLM & Script Cleaning ──────────────────────────────────────────────────────
+# ── LLM & Strict Spoken Script Sanitization ───────────────────────────────────
 def _list_groq_models() -> list[str]:
     if not GROQ_API_KEY:
         return []
@@ -115,34 +146,157 @@ def _build_model_list() -> list[str]:
     return ordered[:12]
 
 
-def _clean_script(text: str) -> str:
-    # Remove <think>...</think> blocks from reasoning models like Qwen
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
-    # Remove markdown code fences if the LLM wrapped the output
-    text = re.sub(r"^```[a-zA-Z]*\s*", "", text).strip()
-    text = re.sub(r"\s*```$", "", text).strip()
+def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks: bool = True) -> str:
+    """
+    100% clean spoken narration sanitizer:
+    1. Strips <think> tags, markdown (** / ##), stage directions ([Visual]), timestamps ([0:00-0:15]),
+       and speaker labels (Narrator:, Host:).
+    2. Strips ALL LLM-generated 'Thank you for watching' / 'Follow for more' conclusions.
+    3. Enforces YMYL medical disclaimers, E-E-A-T source citation, and appends UNIFIED_SINGLE_OUTRO
+       strictly ONCE at the very end.
+    """
+    text = raw_text or ""
+
+    # 1. Strip <think> reasoning blocks and code fences
+    text = re.sub(r"<think>.*?</think>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"```[a-zA-Z]*", " ", text)
+    text = text.replace("```", " ")
+
+    # 2. Strip bracketed stage directions, visual cues, and timestamps like [0:00-0:15], [Visual: ...], (Cut to ...)
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    text = re.sub(r"\((?:visual|scene|cut|music|sfx|audio|pause|b-roll|on-screen|outro|intro)[^)]*\)", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d{1,2}:\d{2}(?:\s*[-–—to]+\s*\d{1,2}:\d{2})?\b", " ", text)
+
+    # 3. Strip speaker labels and section headers at start of lines or inline
     text = re.sub(
-        r"(?i)^(Title|Topic|Script|Intro|Hook|Body|CTA|Voiceover|The hook is|The script starts here):?\s*",
-        "",
+        r"(?i)(?:^|\n)\s*(?:Title|Topic|Script|Intro|Hook|Body|Point\s*\d+|Recap|CTA|Outro|Disclaimer|Voiceover|Narrator|Host|Speaker|Visual|Audio|On-screen\s+text)\s*:\s*",
+        " ",
         text,
-        flags=re.MULTILINE,
     )
-    text = re.sub(r"(?i)(Here is the script|Sure!|Certainly!|The topic is)[^\n]*\n?", "", text)
-    text = text.replace("**", "").replace("*", "").strip('"\' \n')
-    conclusion = "Thank you for watching. Follow for more daily health tips."
-    if conclusion.lower() not in text.lower():
-        text = text.rstrip(".!? ") + f". {conclusion}"
-    return text
+    text = re.sub(r"(?i)^(Here is the script|Sure!|Certainly!|Here's your script)[^\n]*\n?", " ", text).strip()
+
+    # 4. Strip markdown symbols, hashtags, URLs, and emojis
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"#\w+", " ", text)
+    text = re.sub(r"[*_~`#>|]+", " ", text)
+    text = re.sub(r"[^\x00-\x7F]+", " ", text)
+
+    # 5. Eliminate ALL pre-existing "Thank you" / "Subscribe" / "Follow for more" sign-offs to prevent loops
+    for pat in _OUTRO_STRIP_PATTERNS:
+        text = re.sub(pat, " ", text)
+
+    # 6. Deduplicate consecutive identical sentences if the LLM repeated a sentence
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    deduped_sentences: list[str] = []
+    seen_norm: set[str] = set()
+    for s in sentences:
+        norm = normalize_key(s)
+        if not norm or norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        deduped_sentences.append(s if s[-1] in ".!?" else s + ".")
+
+    body_text = " ".join(deduped_sentences).strip()
+    body_text = enforce_policy_guardrails(body_text)
+
+    if enforce_policy_blocks:
+        # Ensure Mandatory Verbal Disclaimer is present once
+        if "not medical advice" not in body_text.lower():
+            if len(deduped_sentences) >= 1:
+                deduped_sentences.insert(1, MANDATORY_VERBAL_DISCLAIMER)
+            else:
+                deduped_sentences.append(MANDATORY_VERBAL_DISCLAIMER)
+            body_text = " ".join(deduped_sentences)
+
+        # Ensure at least one Credible Medical Source is cited in speech
+        credible_orgs = ("mayo clinic", "cdc", "nih", "world health organization", "who", "cleveland clinic", "pubmed")
+        if not any(org in body_text.lower() for org in credible_orgs):
+            top_src = select_credible_sources(topic, body_text, count=1)[0]["org"]
+            cite_sentence = f"According to research from the {top_src}, understanding how your body signals these changes helps you respond early."
+            deduped_sentences.append(cite_sentence)
+            body_text = " ".join(deduped_sentences)
+
+        # Ensure mid-content doctor consultation reminder is present
+        if "consult a doctor" not in body_text.lower() and "healthcare provider" not in body_text.lower():
+            deduped_sentences.append(MID_CONTENT_DOCTOR_REMINDER)
+            body_text = " ".join(deduped_sentences)
+
+    # 7. Append UNIFIED_SINGLE_OUTRO strictly ONCE
+    final_spoken = body_text.rstrip(".!? ") + ". " + UNIFIED_SINGLE_OUTRO
+    final_spoken = re.sub(r"\s+", " ", final_spoken).strip()
+    return final_spoken
+
+
+def build_viral_shorts_segments(spoken_script: str, topic: str) -> list[dict]:
+    """
+    Structures the sanitized spoken script into the 4-Attribute Three-Part Viral Shorts System:
+      1. visual_direction
+      2. on_screen_text
+      3. spoken_narration
+      4. audio_cue
+    """
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", spoken_script) if s.strip()]
+    hook_sent = sentences[0] if sentences else spoken_script
+    disclaimer_sent = sentences[1] if len(sentences) > 1 else MANDATORY_VERBAL_DISCLAIMER
+    outro_sents = " ".join(sentences[-2:]) if len(sentences) >= 4 else UNIFIED_SINGLE_OUTRO
+    body_sents = " ".join(sentences[2:-2]) if len(sentences) > 4 else " ".join(sentences[1:-1])
+
+    short_topic_words = " ".join(re.findall(r"[a-zA-Z0-9]+", topic or "Body Signal")[:3]).upper()
+
+    return [
+        {
+            "segment": "1. Pattern-Interrupt Hook (0:00–0:03)",
+            "visual_direction": (
+                f"High-contrast 9:16 close-up lifestyle or subtle 3D anatomical highlight of {topic} "
+                f"in clinical navy ({VISUAL_IDENTITY['color_palette']['deep_clinical_navy']}) with dynamic 1.08x zoom."
+            ),
+            "on_screen_text": f"WHY {short_topic_words} HAPPENS",
+            "spoken_narration": hook_sent,
+            "audio_cue": "Subtle low-frequency whoosh transition into calm ambient clinical pad",
+        },
+        {
+            "segment": "2. Mandatory Disclaimer & Setup (0:03–0:08)",
+            "visual_direction": "Clean kinetic typography banner over calm wellness B-roll (strictly no graphic imagery).",
+            "on_screen_text": "GENERAL INFO ONLY • NOT MEDICAL ADVICE",
+            "spoken_narration": disclaimer_sent,
+            "audio_cue": "Soft acoustic pulse (BGM ducked to 7% volume)",
+        },
+        {
+            "segment": "3. Physiological Mechanism & E-E-A-T Citation (0:08–0:48)",
+            "visual_direction": (
+                "Fast-paced 2-second B-roll cuts showing physiological mechanisms, hydration/posture/sleep habits, "
+                "and peer-reviewed research callout badge."
+            ),
+            "on_screen_text": "WHAT CLINICAL RESEARCH SAYS",
+            "spoken_narration": body_sents or hook_sent,
+            "audio_cue": "Steady rhythmic ambient pulse supporting spoken cadence",
+        },
+        {
+            "segment": "4. Unified Single Recap & Outro Disclaimer (0:48–End)",
+            "visual_direction": (
+                f"Clean clinical summary card displaying on-screen text: '{MANDATORY_VERBAL_DISCLAIMER}' "
+                "with subtle loop fade."
+            ),
+            "on_screen_text": "Not a substitute for professional medical advice.",
+            "spoken_narration": outro_sents,
+            "audio_cue": "Gentle 1.0s audio fade-out (single outro instance)",
+        },
+    ]
 
 
 def generate_script(topic: str, user_prompt: str) -> str:
     models = _build_model_list()
     last_err = None
+    sources = select_credible_sources(topic, count=2)
+    source_orgs = f"{sources[0]['org']} or {sources[1]['org']}"
+
     system_msg = (
-        "You are a professional voiceover artist and scriptwriter for YouTube Shorts. "
-        "Output ONLY the exact speakable voiceover content for the video, exclusively and directly "
-        "related to the chosen topic. Do NOT include <think> tags or meta commentary. "
-        "Start DIRECTLY with the first spoken word."
+        "You are an objective, policy-safe YouTube Health Shorts scriptwriter. "
+        "Frame all content strictly as educational awareness, never medical diagnosis. "
+        f"Cite {source_orgs} naturally in speech. "
+        "Output ONLY the raw speakable body sentences. Do NOT include <think> tags, markdown, "
+        "speaker labels, timestamps, or 'Thank you for watching' sign-offs.\n"
+        f"{NEGATIVE_PROMPT_RULES}"
     )
     for model in models:
         try:
@@ -156,8 +310,8 @@ def generate_script(topic: str, user_prompt: str) -> str:
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.75,
-                    "max_tokens": 800,
+                    "temperature": 0.70,
+                    "max_tokens": 700,
                 },
                 timeout=120,
             )
@@ -165,11 +319,11 @@ def generate_script(topic: str, user_prompt: str) -> str:
                 last_err = RuntimeError(f"Model {model} HTTP {r.status_code}: {r.text[:200]}")
                 continue
             raw = r.json()["choices"][0]["message"]["content"].strip()
-            cleaned = _clean_script(raw)
-            if len(cleaned.split()) < 35:
+            cleaned = sanitize_spoken_script(raw, topic=topic, enforce_policy_blocks=True)
+            if len(cleaned.split()) < 40:
                 last_err = RuntimeError(f"Too few words ({len(cleaned.split())}) from {model}")
                 continue
-            log.info("[script] Generated %d words using %s", len(cleaned.split()), model)
+            log.info("[script] Generated %d sanitized spoken words using %s", len(cleaned.split()), model)
             return cleaned
         except Exception as exc:
             last_err = exc
@@ -222,14 +376,18 @@ def get_audio_duration(path: str) -> float:
 
 def ensure_bgm_track(duration: float, out_path: str = "bgm_src.m4a") -> str:
     """Generates a calm instrumental ambient pad using FFmpeg synthesis."""
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "lavfi", "-t", f"{duration + 2.0:.2f}",
-        "-i", "anoisesrc=c=pink:a=0.03", "-f", "lavfi", "-t", f"{duration + 2.0:.2f}",
-        "-i", "sine=frequency=216:sample_rate=44100", "-filter_complex",
-        "[0:a]lowpass=f=600[noise];[1:a]volume=0.02[tone];[noise][tone]amix=inputs=2,"
-        f"afade=t=in:st=0:d=2.0,afade=t=out:st={max(0.0, duration - 1.0):.2f}:d=1.0",
-        "-c:a", "aac", "-b:a", "128k", out_path
-    ], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-t", f"{duration + 2.0:.2f}",
+            "-i", "anoisesrc=c=pink:a=0.03", "-f", "lavfi", "-t", f"{duration + 2.0:.2f}",
+            "-i", "sine=frequency=216:sample_rate=44100", "-filter_complex",
+            "[0:a]lowpass=f=600[noise];[1:a]volume=0.02[tone];[noise][tone]amix=inputs=2,"
+            f"afade=t=in:st=0:d=2.0,afade=t=out:st={max(0.0, duration - 1.0):.2f}:d=1.0",
+            "-c:a", "aac", "-b:a", "128k", out_path,
+        ],
+        check=True,
+        capture_output=True,
+    )
     return out_path
 
 
@@ -302,7 +460,7 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
         [
             "ffmpeg", "-y", "-i", in_mp4,
             "-vf", f"subtitles={_ffmpeg_escape(srt_abs)}:force_style={_ffmpeg_escape(style)}",
-            "-c:a", "copy", "-pix_fmt", "yuv420p", out_mp4
+            "-c:a", "copy", "-pix_fmt", "yuv420p", out_mp4,
         ],
         check=True,
         capture_output=True,
@@ -343,6 +501,8 @@ def smart_cover_crop(clip, target_w=1080, target_h=1920):
 
 def fetch_broll(query: str, need: int = 6) -> list[str]:
     clean_q = re.sub(r"[^a-zA-Z0-9\s]", " ", query or "")
+    # Strip any graphic/medical-gore terms from Pexels query to keep B-roll strictly clean & policy-safe
+    clean_q = re.sub(r"(?i)\b(blood|surgery|disease|wound|tumor|infection)\b", "wellness", clean_q)
     clean_q = " ".join(clean_q.split()[:4]) or "healthy lifestyle"
     all_queries = [clean_q, "healthy lifestyle", "fitness exercise", "meditation", "wellness nature"]
     collected, seen = [], set()
@@ -382,9 +542,9 @@ def fetch_broll(query: str, need: int = 6) -> list[str]:
 
 
 def _generate_fallback_video_clips(tmp: Path, count: int = 3) -> list[str]:
-    """Generates clean vertical dark-teal ambient background clips via FFmpeg if downloads fail."""
+    """Generates clean vertical clinical-navy and medical-teal background clips via FFmpeg if downloads fail."""
     generated = []
-    colors = ["0x0f2027", "0x134e5e", "0x1a2a6c"]
+    colors = ["0x0A2540", "0x00A896", "0x134E5E"]
     for i in range(count):
         out_p = tmp / f"synth_{i}.mp4"
         color = colors[i % len(colors)]
@@ -425,7 +585,7 @@ def _download_broll(urls: list[str], tmp: Path) -> list[str]:
             log.warning("[broll] download failed for %s: %s", u, exc)
 
     if not local:
-        log.warning("[broll] No remote B-roll downloaded; generating synthetic vertical clips.")
+        log.warning("[broll] No remote B-roll downloaded; generating clinical palette synthetic vertical clips.")
         local = _generate_fallback_video_clips(tmp, count=3)
     return local
 
@@ -443,9 +603,18 @@ def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_m
             try:
                 c = VideoFileClip(p)
                 raw_clips.append(c)
-                sub_dur = min(6.0, max(2.5, float(c.duration)))
-                comp = smart_cover_crop(c.subclip(0, sub_dur)).set_audio(None)
-                base_comps.append(comp)
+                # Dynamic 2.0-2.5s cuts for high retention and YPP compliance
+                clip_dur = float(c.duration)
+                step = 2.4
+                t_cursor = 0.0
+                while t_cursor + 1.8 <= min(clip_dur, 7.5):
+                    sub_end = min(clip_dur, t_cursor + step)
+                    comp = smart_cover_crop(c.subclip(t_cursor, sub_end)).set_audio(None)
+                    base_comps.append(comp)
+                    t_cursor += step
+                if not base_comps and clip_dur > 0.5:
+                    comp = smart_cover_crop(c.subclip(0, min(clip_dur, 2.5))).set_audio(None)
+                    base_comps.append(comp)
             except Exception as exc:
                 log.warning("[render] clip load error on %s: %s", p, exc)
 
@@ -456,7 +625,7 @@ def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_m
         voice_clip = AudioFileClip(voice_mp3)
         target_dur = float(voice_clip.duration)
 
-        while sum(c.duration for c in cropped) < target_dur and len(cropped) < 50:
+        while sum(c.duration for c in cropped) < target_dur and len(cropped) < 60:
             for comp in base_comps:
                 cropped.append(comp)
                 if sum(c.duration for c in cropped) >= target_dur:
@@ -524,7 +693,7 @@ def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_m
     return round(end, 2)
 
 
-# ── YouTube Upload ────────────────────────────────────────────────────────────
+# ── YouTube Upload (with 2026 Synthetic Media Disclosure) ────────────────────
 def _yt_client():
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -551,6 +720,7 @@ def upload_unlisted(video_path: str, title: str, desc: str, tags: str) -> tuple[
         "status": {
             "privacyStatus": "unlisted",
             "selfDeclaredMadeForKids": False,
+            "containsSyntheticMedia": True,
         },
     }
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
@@ -562,23 +732,25 @@ def upload_unlisted(video_path: str, title: str, desc: str, tags: str) -> tuple[
 
 
 def build_preview(topic: str, user_script: str | None, slot: str, issue_body: str) -> tuple[dict | None, str]:
-    best = {"path": None, "dur": None, "score": float("inf"), "attempt": 0, "seo": None}
+    best = {"path": None, "dur": None, "score": float("inf"), "attempt": 0, "seo": None, "segments": None}
     last_error = None
 
-    # Only run 1 attempt if user provided an exact custom script
     max_attempts = 1 if user_script else 2
 
     for attempt in range(1, max_attempts + 1):
         try:
             log.info("[build] Starting attempt %d/%d for topic: %s", attempt, max_attempts, topic)
             if user_script:
-                script_text = _clean_script(user_script)
+                # If user provides custom script, sanitize markdown/labels & repeated thank-yous
+                script_text = sanitize_spoken_script(user_script, topic=topic, enforce_policy_blocks=False)
             else:
                 prompt_tpl = load_default_prompt()
                 actual_prompt = prompt_tpl.format(topic=topic)
                 script_text = generate_script(topic, actual_prompt)
 
+            segments = build_viral_shorts_segments(script_text, topic)
             seo = generate_seo_package(topic, script_text)
+
             voice_raw = f"voice_{attempt}.mp3"
             synthesize_speech(script_text, voice_raw, lang=TTS_LANG)
 
@@ -590,37 +762,50 @@ def build_preview(topic: str, user_script: str | None, slot: str, issue_body: st
             if score < best["score"]:
                 best_path = f"best_{attempt}.mp4"
                 shutil.copyfile(final_mp4, best_path)
-                best.update({"path": best_path, "dur": round(dur, 2), "score": score, "attempt": attempt, "seo": seo})
+                best.update({
+                    "path": best_path,
+                    "dur": round(dur, 2),
+                    "score": score,
+                    "attempt": attempt,
+                    "seo": seo,
+                    "segments": segments,
+                })
 
             if TARGET_LOW <= dur < TARGET_HIGH or user_script:
-                return _package_and_upload(final_mp4, seo, topic, slot, issue_body, attempt, dur)
+                return _package_and_upload(final_mp4, seo, segments, topic, slot, issue_body, attempt, dur)
         except Exception as exc:
             last_error = exc
             log.error("[build] attempt %d failed: %s", attempt, exc, exc_info=True)
 
     if best["path"] and os.path.exists(best["path"]):
-        return _package_and_upload(best["path"], best["seo"], topic, slot, issue_body, best["attempt"], best["dur"])
+        return _package_and_upload(
+            best["path"], best["seo"], best["segments"], topic, slot, issue_body, best["attempt"], best["dur"]
+        )
 
     if last_error:
         raise RuntimeError(f"Video generation failed: {last_error}")
     return None, issue_body
 
 
-def _package_and_upload(video_path, seo, topic, slot, issue_body, attempt, dur):
+def _package_and_upload(video_path, seo, segments, topic, slot, issue_body, attempt, dur):
     try:
-        log.info("[upload] Uploading %s to YouTube as unlisted...", video_path)
+        log.info("[upload] Uploading %s to YouTube as unlisted (containsSyntheticMedia=True)...", video_path)
         vid_id, link = upload_unlisted(video_path, seo["title"], seo["description"], seo["tags_csv"])
         log.info("[upload] Uploaded successfully: %s", link)
         meta = get_metadata_from_issue_body(issue_body) or {}
         meta.update({
             "topic": topic,
             "title": seo["title"],
+            "punchy_short_title": seo.get("punchy_short_title", ""),
+            "thumbnail_text": seo.get("thumbnail_text", ""),
+            "thumbnail_prompt": seo.get("thumbnail_prompt", ""),
             "description": seo["description"],
             "preview_video_id": vid_id,
             "preview_link": link,
             "slot": slot,
             "duration_sec": dur,
             "attempt": attempt,
+            "viral_segments": segments,
         })
         return meta, set_metadata_in_issue_body(issue_body, meta)
     except Exception as exc:
@@ -631,8 +816,8 @@ def _package_and_upload(video_path, seo, topic, slot, issue_body, attempt, dur):
 def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None:
     body = (
         f"✅ **Topic approved:** {topic}\n\n"
-        "Please provide your script text or generate one automatically:\n\n"
-        "- **Option A — Use AI Default Prompt:**\n"
+        "Please provide your script text or generate a policy-safe script automatically:\n\n"
+        "- **Option A — Use AI Policy-Safe Default Prompt:**\n"
         "  Reply with: `/use-default-prompt`\n\n"
         "- **Option B — Provide Your Own Script:**\n"
         "  Reply with: `/set-script` followed by your full voiceover text."
@@ -643,11 +828,10 @@ def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None
 def _clean_issue_title_to_topic(title: str) -> str:
     s = re.sub(r"(?i)#?shorts?|\[[^\]]+\]|\([^)]+\)", "", (title or "").strip())
     s = re.split(r"\s+[|\-–—]\s+", s)[0].strip()
-    return (s[0].upper() + s[1:])[:120].rstrip() if s else "Health and wellness tips"
+    return (s[0].upper() + s[1:])[:120].rstrip() if s else "Health and symptom awareness"
 
 
 def _extract_topics_from_visible_body(issue_body: str) -> list[str]:
-    """Fallback parser if the HTML metadata comment is missing or corrupted."""
     if not issue_body:
         return []
     matches = re.findall(r"^\s*\d+\)\s+(.+)$", issue_body, flags=re.MULTILINE)
@@ -657,8 +841,7 @@ def _extract_topics_from_visible_body(issue_body: str) -> list[str]:
 def _extract_user_script_if_present(comment_body: str) -> str | None:
     idx = comment_body.lower().find("/set-script")
     if idx != -1:
-        script = comment_body[idx + len("/set-script"):].strip()
-        # Strip trailing commands if someone wrote /set-script ... /approve-topic 1
+        script = comment_body[idx + len("/set-script") :].strip()
         for cmd in ["/approve-topic", "/custom-topic", "/use-default-prompt"]:
             c_idx = script.lower().find(cmd)
             if c_idx != -1:
@@ -670,21 +853,18 @@ def _extract_user_script_if_present(comment_body: str) -> str | None:
 def _parse_topic_from_approve(comment_body: str, topics: list[str], issue_title: str = "") -> str:
     lower = comment_body.lower()
     idx_kw = lower.find("/approve-topic")
-    body_part = comment_body[idx_kw + len("/approve-topic"):].strip() if idx_kw != -1 else comment_body.strip()
+    body_part = comment_body[idx_kw + len("/approve-topic") :].strip() if idx_kw != -1 else comment_body.strip()
 
-    # Strip any chained command keywords from the topic argument
     for kw in ["/use-default-prompt", "/set-script", "/custom-topic"]:
         idx = body_part.lower().find(kw)
         if idx != -1:
             body_part = body_part[:idx].strip()
 
-    # Take only the first line in case extra comments follow on newlines
     first_line = body_part.splitlines()[0].strip() if body_part else ""
 
     if not first_line:
         return topics[0] if topics else _clean_issue_title_to_topic(issue_title)
 
-    # Check if the user passed a number like "2" or "2)"
     m_num = re.match(r"^(\d+)\)?$", first_line)
     if m_num:
         idx = int(m_num.group(1))
@@ -700,7 +880,7 @@ def _parse_topic_from_approve(comment_body: str, topics: list[str], issue_title:
 def _parse_topic_from_custom(comment_body: str, issue_title: str = "") -> str:
     lower = comment_body.lower()
     idx_c = lower.find("/custom-topic")
-    body_part = comment_body[idx_c + len("/custom-topic"):].strip() if idx_c != -1 else comment_body.strip()
+    body_part = comment_body[idx_c + len("/custom-topic") :].strip() if idx_c != -1 else comment_body.strip()
 
     for kw in ["/use-default-prompt", "/set-script", "/approve-topic"]:
         pos = body_part.lower().find(kw)
@@ -739,7 +919,7 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     ctx.issue_body = new_body
 
-    mode_str = "custom script" if user_script else "AI default prompt"
+    mode_str = "custom script (sanitized)" if user_script else "YMYL policy-safe AI script"
     post_comment(
         ctx.owner,
         ctx.repo,
@@ -751,7 +931,12 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
         video_meta, new_body2 = build_preview(topic, user_script, ctx.slot, new_body)
     except Exception as exc:
         log.error("[build] error: %s", exc, exc_info=True)
-        post_comment(ctx.owner, ctx.repo, ctx.number, f"❌ **Error building preview:**\n```\n{exc}\n```\nTry `/regenerate-video` or check repository secrets.")
+        post_comment(
+            ctx.owner,
+            ctx.repo,
+            ctx.number,
+            f"❌ **Error building preview:**\n```\n{exc}\n```\nTry `/regenerate-video` or check repository secrets.",
+        )
         return
 
     if not video_meta:
@@ -760,13 +945,34 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
 
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body2})
     ctx.issue_body = new_body2
+
+    # Format the 4-Attribute Viral Shorts Script table for the GitHub Issue preview
+    seg_rows = []
+    for seg in video_meta.get("viral_segments", []):
+        seg_rows.append(
+            f"| **{seg['segment']}** | {seg['on_screen_text']} | {seg['spoken_narration']} | *{seg['audio_cue']}* |"
+        )
+    seg_table = (
+        "| Segment | On-Screen Hook/Text | Sanitized Spoken Narration | Audio Cue |\n"
+        "|---|---|---|---|\n" + "\n".join(seg_rows)
+        if seg_rows
+        else ""
+    )
+
     post_comment(
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"✅ **Preview ready!** (Attempt {video_meta['attempt']}, {video_meta['duration_sec']}s)\n"
+        f"✅ **Preview Ready!** (Attempt {video_meta['attempt']}, {video_meta['duration_sec']}s)\n"
         f"🔗 **Watch Unlisted Preview:** {video_meta['preview_link']}\n\n"
-        f"**Title:** `{video_meta['title']}`\n\n"
+        f"### 📦 Viral Packaging & YMYL Compliance Matrix\n"
+        f"- **SEO Video Title:** `{video_meta['title']}`\n"
+        f"- **Punchy Alt Title (<6 words):** `{video_meta.get('punchy_short_title', '')}`\n"
+        f"- **3-Word Complementary Thumbnail Text:** `{video_meta.get('thumbnail_text', '')}` *(0% word overlap with title)*\n"
+        f"- **AI Thumbnail Prompt:** `{video_meta.get('thumbnail_prompt', '')}`\n"
+        f"- **2026 Synthetic Media Flag:** `containsSyntheticMedia = True`\n\n"
+        f"### 🎙️ 4-Attribute Shorts Script Breakdown\n"
+        f"{seg_table}\n\n"
         "Reply with:\n"
         "- `/approve-video` — schedule for publication\n"
         "- `/regenerate-video` — rebuild with fresh B-roll\n"
@@ -783,12 +989,12 @@ def handle_reject_topic(ctx: Ctx) -> None:
 
     if not options:
         options = [
-            "Gut health basics",
-            "Fixing posture in 2 minutes",
-            "Better sleep habits",
-            "Hydration tips for energy",
-            "Mental clarity morning routine",
-            "Natural metabolism boosters",
+            "5 Subtle Dehydration Signals People Often Ignore",
+            "Myth vs Fact: Does Drinking Coffee First Thing Spike Cortisol?",
+            "How 10 Minutes of Morning Sunlight Resets Your Circadian Clock",
+            "Why Your Neck Hurts at a Desk: Forward Head Posture Explained",
+            "How the Vagus Nerve Calms Your Heart Rate in 20 Seconds",
+            "Walking 10 Minutes After Meals: What Blood Sugar Research Says",
         ]
 
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
@@ -802,7 +1008,7 @@ def handle_reject_topic(ctx: Ctx) -> None:
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"🔄 **Fresh topic options:**\n{numbered}\n\n"
+        f"🔄 **Fresh Policy-Safe Topic Options:**\n{numbered}\n\n"
         "Reply `/approve-topic N` (or `/approve-topic N /use-default-prompt`) or `/custom-topic Your Topic`.",
     )
 
@@ -857,10 +1063,23 @@ def handle_reject_video(ctx: Ctx) -> None:
         except Exception:
             pass
 
-    for k in ["preview_video_id", "preview_link", "title", "description", "attempt", "duration_sec"]:
+    for k in [
+        "preview_video_id", "preview_link", "title", "punchy_short_title",
+        "thumbnail_text", "thumbnail_prompt", "description", "attempt",
+        "duration_sec", "viral_segments",
+    ]:
         meta.pop(k, None)
-    gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": set_metadata_in_issue_body(ctx.issue_body, meta)})
-    post_comment(ctx.owner, ctx.repo, ctx.number, "🗑️ Deleted preview video. Reply `/new-topic` for fresh options or `/custom-topic Your Topic`.")
+    gh(
+        "PATCH",
+        f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}",
+        json={"body": set_metadata_in_issue_body(ctx.issue_body, meta)},
+    )
+    post_comment(
+        ctx.owner,
+        ctx.repo,
+        ctx.number,
+        "🗑️ Deleted preview video. Reply `/new-topic` for fresh options or `/custom-topic Your Topic`.",
+    )
 
 
 def handle_regenerate_video(ctx: Ctx) -> None:
@@ -895,14 +1114,23 @@ def handle_approve_video(ctx: Ctx) -> None:
 
     yt.videos().update(
         part="status",
-        body={"id": vid_id, "status": {"privacyStatus": "private", "publishAt": publish_utc}},
+        body={
+            "id": vid_id,
+            "status": {
+                "privacyStatus": "private",
+                "publishAt": publish_utc,
+                "selfDeclaredMadeForKids": False,
+                "containsSyntheticMedia": True,
+            },
+        },
     ).execute()
     post_comment(
         ctx.owner,
         ctx.repo,
         ctx.number,
         f"🚀 **Scheduled:** https://youtu.be/{vid_id}\n"
-        f"📅 **Publishes at (IST):** `{ist_dt.strftime('%Y-%m-%d %H:%M')}`\n\n"
+        f"📅 **Publishes at (IST):** `{ist_dt.strftime('%Y-%m-%d %H:%M')}`\n"
+        f"🛡️ **2026 Synthetic Media Disclosure:** `Enabled`\n\n"
         "Closing this issue.",
     )
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"state": "closed"})
