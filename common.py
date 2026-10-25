@@ -154,7 +154,4 @@ def extract_json_block(text: str) -> str | None:
     obj = re.search(r"(\{.*\})", cleaned, re.DOTALL)
     if obj:
         return obj.group(1).strip()
-    arr = re.search(r"(\[.*\])", cleaned, re.DOTALL)
-    if arr:
-        return arr.group(1).strip()
     return None
