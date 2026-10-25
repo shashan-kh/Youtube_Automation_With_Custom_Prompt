@@ -1,7 +1,7 @@
 """
-propose.py — Discovers policy-safe health topics aligned with the 4 Weekly Content Pillars
-(Symptom Awareness, Myth vs Fact, Lifestyle & Prevention, Explainer / How the Body Works)
-and manages the dynamic topics_pool.json.
+propose.py — Discovers health and wellness topics aligned with the 4 Weekly Content Pillars
+(Daily Habits, Nutrition & Metabolism, Rest & Recovery, Movement & Longevity Science)
+and manages topics_pool.json.
 """
 from __future__ import annotations
 
@@ -34,7 +34,6 @@ from common import (
 
 log = get_logger("propose")
 
-# ── Config ─────────────────────────────────────────────────────────────────────
 REGION = os.getenv("REGION", "IN")
 SLOT = os.getenv("SLOT", "morning")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -48,24 +47,21 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Built-in emergency fallback topics in case topics_pool.json or APIs ever fail
 BUILTIN_SAFE_TOPICS = [
-    "5 Subtle Dehydration Signals People Often Ignore",
-    "Why Your Neck Hurts at a Desk: Forward Head Posture Explained",
-    "How 3 Minutes of Alternate Nostril Breathing Calms the Nervous System",
-    "Myth vs Fact: Does Skipping Breakfast Slow Down Your Metabolism?",
-    "Why Looking Down at Your Phone Adds 40 Pounds of Cervical Spine Load",
-    "How Digital Eye Strain Makes Your Brain Feel Exhausted",
-    "Why 10 Minutes of Morning Sunlight Resets Your Melatonin Timer",
-    "How 4-7-8 Breathing Activates the Parasympathetic Nervous System",
-    "What Happens to Your Brain Glymphatic System During Deep Sleep",
-    "Why Walking 10 Minutes After Meals Helps Regulate Blood Glucose",
+    "How 10 Minutes of Morning Sunlight Optimizes Your Circadian Clock",
+    "Why Delaying Morning Caffeine by 60 Minutes Prevents Afternoon Crashes",
+    "Zone 2 Cardio: The Science Behind Longevity and Mitochondrial Health",
+    "Magnesium Glycinate and Its Role in Deep Restorative Sleep Architecture",
+    "How Walking 10 Minutes After Meals Regulates Postprandial Glucose",
+    "Prebiotic Fiber and the Gut Microbiome: What Harvard Research Shows",
+    "How Cold Water Immersion Triggers Norepinephrine and Alertness",
+    "The Science of Deep Sleep: What Happens in Your Brain at Night",
+    "How Box Breathing Regulates Autonomic Heart Rate Variability",
+    "Protein Pacing: Why Distributing Protein Intake Maximizes Recovery",
 ]
 
 
-# ── Topic Validation & Cleaning ────────────────────────────────────────────────
 def is_valid_topic(text: str) -> bool:
-    """Ensures a topic has at least 3 actual words and 15+ characters (prevents punctuation-only bugs)."""
     if not text or len(text.strip()) < 15:
         return False
     alpha_words = re.findall(r"[a-zA-Z]{2,}", text)
@@ -73,26 +69,14 @@ def is_valid_topic(text: str) -> bool:
 
 
 def clean_to_topic(title: str) -> str:
-    """
-    Cleans raw YouTube/LLM titles into crisp topic strings while preserving all words and numbers.
-    Fixes the previous `#?\\w+` regex bug that stripped alphanumeric words.
-    """
     s = html.unescape((title or "").strip())
-    # Remove leading numbering or bullets like "1) ", "1. ", "- "
     s = re.sub(r"^\s*(?:\d+[\)\.\:]|\-|\*)\s*", "", s)
-    # Remove ONLY actual hashtags (requiring the '#' prefix)
     s = re.sub(r"(?:^|\s)#\w+", " ", s)
-    # Remove standalone "shorts" word if left over
     s = re.sub(r"(?i)\bshorts?\b", " ", s)
-    # Remove bracketed or parenthesized tags like [Shorts] or (Official Video)
     s = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", s)
-    # Strip emojis and non-ASCII characters
     s = re.sub(r"[^\x00-\x7F]+", " ", s)
-    # Split off channel names after pipes or spaced dashes (e.g. "Topic | Dr. Name" or "Topic - Channel")
     s = re.split(r"\s+\|\s+|\s+[-–—]{1,2}\s+", s)[0].strip()
-    # Apply YMYL policy guardrails
     s = enforce_policy_guardrails(s)
-    # Clean stray leading/trailing punctuation while keeping trailing '?'
     s = re.sub(r"\s+", " ", s).strip(" :;,-–—.!\"'")
     if not is_valid_topic(s):
         return ""
@@ -104,14 +88,13 @@ def is_english(text: str) -> bool:
     return bool(s and sum(1 for c in s if ord(c) < 128) / len(s) >= 0.9)
 
 
-def has_health_signal(title: str, desc: str = "") -> bool:
+def has_wellness_signal(title: str, desc: str = "") -> bool:
     keywords = [
-        "health", "symptom", "sleep", "nutrition", "diet", "water", "stress",
-        "cardio", "back", "neck", "pain", "mindfulness", "brain", "focus", "gut",
-        "fast", "fasting", "posture", "hormone", "metabolism", "vagus", "circadian",
-        "hydration", "dehydration", "digestion", "eye", "cortisol", "breathing",
-        "sunlight", "melatonin", "magnesium", "fiber", "glucose", "blood", "spine",
-        "shoulder", "nervous", "nerve", "stretch", "walk", "walking", "caffeine",
+        "health", "wellness", "sleep", "nutrition", "diet", "water", "stress",
+        "cardio", "mindfulness", "brain", "focus", "gut", "fasting", "posture",
+        "hormone", "metabolism", "circadian", "hydration", "digestion", "cortisol",
+        "breathing", "sunlight", "melatonin", "magnesium", "fiber", "glucose",
+        "longevity", "recovery", "fitness", "energy", "habits", "biohack",
     ]
     blob = f"{title} {desc}".lower()
     red_flags = ["whitening", "fairness", "miracle cure", "reverses disease", "never visit doctors", "ozempic"]
@@ -120,7 +103,6 @@ def has_health_signal(title: str, desc: str = "") -> bool:
     return any(k in blob for k in keywords)
 
 
-# ── Dynamic Fallback Pool ──────────────────────────────────────────────────────
 def get_topics_pool(owner: str, repo: str) -> list[str]:
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/topics_pool.json"
     try:
@@ -133,19 +115,8 @@ def get_topics_pool(owner: str, repo: str) -> list[str]:
                 valid = [x for x in valid if is_valid_topic(x)]
                 if valid:
                     return valid
-    except Exception as exc:
-        log.warning("Could not load remote topics_pool.json: %s", exc)
-
-    # Local file fallback
-    try:
-        with open("topics_pool.json", "r", encoding="utf-8") as f:
-            local_list = json.load(f)
-            valid = [clean_to_topic(str(x)) for x in local_list if is_valid_topic(clean_to_topic(str(x)))]
-            if valid:
-                return valid
     except Exception:
         pass
-
     return list(BUILTIN_SAFE_TOPICS)
 
 
@@ -153,7 +124,6 @@ def save_topics_pool(owner: str, repo: str, pool: list[str]) -> None:
     clean_pool = [clean_to_topic(t) for t in pool]
     clean_pool = [t for t in clean_pool if is_valid_topic(t)]
     if len(clean_pool) < 6:
-        log.warning("Refusing to overwrite topics_pool.json with fewer than 6 valid topics.")
         return
 
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/topics_pool.json"
@@ -177,7 +147,6 @@ def save_topics_pool(owner: str, repo: str, pool: list[str]) -> None:
         log.warning("Failed to save topics pool: %s", exc)
 
 
-# ── Utilities ──────────────────────────────────────────────────────────────────
 def next_slot_ist() -> datetime:
     tomorrow = datetime.now(IST).date() + timedelta(days=1)
     h, mn = (16, 0) if SLOT == "afternoon" else (9, 0)
@@ -211,7 +180,6 @@ def open_issues_with_labels(owner: str, repo: str, labels: list[str]) -> list[di
     return [it for it in items if set(labels).issubset({lbl.get("name", "") for lbl in it.get("labels", []) if isinstance(lbl, dict)})]
 
 
-# ── Data Fetching ──────────────────────────────────────────────────────────────
 def fetch_yt_search(region_pref: str, exclude: set, pillar: dict) -> list[str]:
     yt, found = None, []
     try:
@@ -247,7 +215,7 @@ def fetch_yt_search(region_pref: str, exclude: set, pillar: dict) -> list[str]:
             ).execute()
             for it in resp.get("items", []):
                 t = clean_to_topic(it.get("snippet", {}).get("title", ""))
-                if is_valid_topic(t) and is_english(t) and has_health_signal(t) and not any(jaccard(t, ex) > 0.75 for ex in exclude):
+                if is_valid_topic(t) and is_english(t) and has_wellness_signal(t) and not any(jaccard(t, ex) > 0.75 for ex in exclude):
                     found.append(t)
         except Exception:
             pass
@@ -260,15 +228,10 @@ def refine_topics_with_llm(raw: list[str], pillar: dict) -> list[str]:
         return cleaned_raw[:6]
 
     prompt = (
-        f"You are a YouTube Health & Symptoms Niche Strategist.\n"
-        f"Scheduled Content Pillar for this slot: **{pillar['name']}** — {pillar['framing']}\n\n"
+        f"You are a YouTube Health & Wellness Content Strategist.\n"
+        f"Scheduled Content Pillar: **{pillar['name']}** — {pillar['framing']}\n\n"
         f"{NEGATIVE_PROMPT_RULES}\n\n"
-        "Convert these raw health signals into 6 SPECIFIC, HIGH-CTR, POLICY-SAFE YouTube Shorts topics.\n"
-        "Use proven curiosity-driven educational formulas such as:\n"
-        "- '5 Subtle [Condition/Habit] Signals People Often Ignore'\n"
-        "- 'Myth vs Fact: Does [Habit] Actually Affect Your [Organ/Hormone]?'\n"
-        "- 'Why Does This Happen? [Symptom/Mechanism] Explained Simply'\n"
-        "- 'What Happens Inside Your Body When You [Daily Habit]'\n\n"
+        "Convert these raw signals into 6 specific, high-retention, engaging YouTube Shorts wellness topics.\n"
         f"Raw Signals: {cleaned_raw[:20]}\n\n"
         "Output ONLY a valid JSON array of 6 strings."
     )
@@ -301,13 +264,12 @@ def gather_topics(region_pref: str, need: int, exclude: set, target_dt: datetime
     return [t for t in refined if is_valid_topic(t)][:need]
 
 
-# ── Issue Creation ─────────────────────────────────────────────────────────────
 def create_topic_issue(owner: str, repo: str, topics: list[str], scheduled_ist: datetime, note: str) -> None:
     pillar = get_pillar_for_date(scheduled_ist)
     numbered = "\n".join(f"{i}) {t}" for i, t in enumerate(topics, 1)) if topics else "(No eligible topics found)"
     title = f"Topic approval — {SLOT} slot ({scheduled_ist.strftime('%Y-%m-%d %H:%M')} IST) [{pillar['name']}]"
 
-    body = f"""## Proposed Health Short Topics
+    body = f"""## Proposed Health & Wellness Short Topics
 - **Scheduled Publish (IST):** `{scheduled_ist.strftime('%Y-%m-%d %H:%M')}`
 - **Scheduled Content Pillar:** **{pillar['name']}** — *{pillar['framing']}*
 - **Channel Positioning:** *{CHANNEL_POSITIONING_STATEMENT}*
@@ -322,7 +284,7 @@ def create_topic_issue(owner: str, repo: str, topics: list[str], scheduled_ist: 
    - `/custom-topic Your Topic /use-default-prompt` (or `/custom-topic Your Topic /set-script Your script text...`)
 
 2. **Step-by-step:**
-   - `/approve-topic 1` (or 2-6) — approve a numbered topic (bot will then prompt for script)
+   - `/approve-topic 1` (or 2-6) — approve a numbered topic
    - `/custom-topic Your Specific Topic` — use your own topic
    - `/reject-topic` — get fresh suggestions
 {note}
@@ -355,7 +317,7 @@ def main() -> None:
     sched_dt = next_slot_ist()
     approved = load_recent_approved_topics(owner, repo)
     pool = [clean_to_topic(t) for t in get_topics_pool(owner, repo)]
-    pool = [t for t in pool if is_valid_topic(t) and has_health_signal(t) and not any(jaccard(t, a) >= 0.75 for a in approved)]
+    pool = [t for t in pool if is_valid_topic(t) and has_wellness_signal(t) and not any(jaccard(t, a) >= 0.75 for a in approved)]
 
     if len(pool) < 6:
         for bt in BUILTIN_SAFE_TOPICS:
@@ -384,7 +346,7 @@ def main() -> None:
             if len(issue_topics) >= 6:
                 break
 
-    note = "" if live_candidates else "\n*Note: Pulled from policy-safe dynamic fallback pool.*"
+    note = "" if live_candidates else "\n*Note: Pulled from wellness dynamic fallback pool.*"
     create_topic_issue(owner, repo, issue_topics[:6], sched_dt, note)
 
 
