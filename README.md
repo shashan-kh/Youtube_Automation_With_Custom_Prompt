@@ -66,7 +66,3 @@ Go to **Settings → Secrets and variables → Actions → New repository secret
 ## Repository Settings
 **Settings → Actions → General → Workflow permissions →**
 ✅ Read and write permissions
-
-
-
-================================================
