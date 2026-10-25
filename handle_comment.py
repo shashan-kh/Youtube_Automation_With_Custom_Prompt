@@ -1,8 +1,8 @@
 """
-handle_comment.py — Processes all /commands posted on GitHub Issues, enforces YMYL Health Policy
-sanitization, eliminates repeated 'Thank You' loops, builds the 4-Attribute Viral Shorts Script
-Package, renders the vertical video with a 0.3s embedded 9:16 Pillow Thumbnail intro frame for
-native YouTube Shorts shelf selection, and uploads to YouTube with 2026 Synthetic Media disclosure.
+handle_comment.py — Processes all /commands posted on GitHub Issues, sanitizes spoken scripts
+to be clean, curious, and informative (without spoken disclaimers), builds the 4-Attribute Viral
+Shorts Script Package, renders the vertical video under 59s, and uploads to YouTube with 2026
+Synthetic Media disclosure and custom Pillow JPEG thumbnail.
 """
 from __future__ import annotations
 
@@ -20,17 +20,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from moviepy.editor import (
-    AudioFileClip,
-    CompositeVideoClip,
-    ImageClip,
-    VideoFileClip,
-    concatenate_videoclips,
-)
+from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_videoclips
 
 from brand_config import (
-    MANDATORY_VERBAL_DISCLAIMER,
-    MID_CONTENT_DOCTOR_REMINDER,
     NEGATIVE_PROMPT_RULES,
     UNIFIED_SINGLE_OUTRO,
     VISUAL_IDENTITY,
@@ -84,8 +76,7 @@ BGM_VOL = 0.07
 IST = timezone(timedelta(hours=5, minutes=30))
 TARGET_LOW = 35.0
 TARGET_HIGH = 58.0
-PREVIEW_MAX = 57.3
-THUMB_INTRO_DUR = 0.3
+PREVIEW_MAX = 57.3  # Strictly under 59 seconds
 
 _PROMPT_FILE = Path(__file__).parent / "prompt.txt"
 
@@ -154,14 +145,13 @@ def _build_model_list() -> list[str]:
     return ordered[:12]
 
 
-def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks: bool = True) -> str:
+def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks: bool = False) -> str:
     """
-    100% clean spoken narration sanitizer:
-    1. Strips <think> tags, markdown (** / ##), stage directions ([Visual]), timestamps ([0:00-0:15]),
-       and speaker labels (Narrator:, Host:).
-    2. Strips ALL LLM-generated 'Thank you for watching' / 'Follow for more' conclusions.
-    3. Enforces YMYL medical disclaimers, E-E-A-T source citation, and appends UNIFIED_SINGLE_OUTRO
-       strictly ONCE at the very end.
+    100% clean, curious, and informative spoken narration sanitizer:
+    1. Strips <think> tags, markdown, stage directions, timestamps, and speaker labels.
+    2. Strips ALL LLM-generated sign-offs.
+    3. Keeps voiceover purely engaging and informative without spoken disclaimers,
+       appending a single clean closing thought.
     """
     text = raw_text or ""
 
@@ -206,28 +196,7 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
     body_text = " ".join(deduped_sentences).strip()
     body_text = enforce_policy_guardrails(body_text)
 
-    if enforce_policy_blocks:
-        if "not medical advice" not in body_text.lower():
-            if len(deduped_sentences) >= 1:
-                deduped_sentences.insert(1, MANDATORY_VERBAL_DISCLAIMER)
-            else:
-                deduped_sentences.append(MANDATORY_VERBAL_DISCLAIMER)
-            body_text = " ".join(deduped_sentences)
-
-        credible_orgs = ("mayo clinic", "cdc", "nih", "world health organization", "who", "cleveland clinic", "pubmed")
-        if not any(org in body_text.lower() for org in credible_orgs):
-            top_src = select_credible_sources(topic, body_text, count=1)[0]["org"]
-            cite_sentence = (
-                f"According to research from the {top_src}, understanding how your body signals "
-                "these changes helps you respond early."
-            )
-            deduped_sentences.append(cite_sentence)
-            body_text = " ".join(deduped_sentences)
-
-        if "consult a doctor" not in body_text.lower() and "healthcare provider" not in body_text.lower():
-            deduped_sentences.append(MID_CONTENT_DOCTOR_REMINDER)
-            body_text = " ".join(deduped_sentences)
-
+    # Append single clean informative closing thought strictly once
     final_spoken = body_text.rstrip(".!? ") + ". " + UNIFIED_SINGLE_OUTRO
     final_spoken = re.sub(r"\s+", " ", final_spoken).strip()
     return final_spoken
@@ -236,32 +205,24 @@ def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks
 def build_viral_shorts_segments(spoken_script: str, topic: str) -> list[dict]:
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", spoken_script) if s.strip()]
     hook_sent = sentences[0] if sentences else spoken_script
-    disclaimer_sent = sentences[1] if len(sentences) > 1 else MANDATORY_VERBAL_DISCLAIMER
-    outro_sents = " ".join(sentences[-2:]) if len(sentences) >= 4 else UNIFIED_SINGLE_OUTRO
-    body_sents = " ".join(sentences[2:-2]) if len(sentences) > 4 else " ".join(sentences[1:-1])
+    outro_sents = " ".join(sentences[-2:]) if len(sentences) >= 3 else UNIFIED_SINGLE_OUTRO
+    body_sents = " ".join(sentences[1:-2]) if len(sentences) > 3 else " ".join(sentences[1:-1])
 
     short_topic_words = " ".join(re.findall(r"[a-zA-Z0-9]+", topic or "Body Signal")[:3]).upper()
 
     return [
         {
-            "segment": "1. Pattern-Interrupt Hook (0:00–0:03)",
+            "segment": "1. Curiosity Hook (0:00–0:03)",
             "visual_direction": (
-                f"0.3s 3-word Pillow thumbnail flash into high-contrast 9:16 lifestyle/3D highlight of {topic} "
-                f"in clinical navy ({VISUAL_IDENTITY['color_palette']['deep_clinical_navy']})."
+                f"High-contrast 9:16 close-up lifestyle or subtle 3D anatomical highlight of {topic} "
+                f"in clinical navy ({VISUAL_IDENTITY['color_palette']['deep_clinical_navy']}) with dynamic zoom."
             ),
             "on_screen_text": f"WHY {short_topic_words} HAPPENS",
             "spoken_narration": hook_sent,
             "audio_cue": "Subtle low-frequency whoosh transition into calm ambient clinical pad",
         },
         {
-            "segment": "2. Mandatory Disclaimer & Setup (0:03–0:08)",
-            "visual_direction": "Clean kinetic typography banner over calm wellness B-roll (strictly no graphic imagery).",
-            "on_screen_text": "GENERAL INFO ONLY • NOT MEDICAL ADVICE",
-            "spoken_narration": disclaimer_sent,
-            "audio_cue": "Soft acoustic pulse (BGM ducked to 7% volume)",
-        },
-        {
-            "segment": "3. Physiological Mechanism & E-E-A-T Citation (0:08–0:48)",
+            "segment": "2. Informative Physiological Insights (0:03–0:48)",
             "visual_direction": (
                 "Fast-paced 2-second B-roll cuts showing physiological mechanisms, hydration/posture/sleep habits, "
                 "and peer-reviewed research callout badge."
@@ -271,14 +232,11 @@ def build_viral_shorts_segments(spoken_script: str, topic: str) -> list[dict]:
             "audio_cue": "Steady rhythmic ambient pulse supporting spoken cadence",
         },
         {
-            "segment": "4. Unified Single Recap & Outro Disclaimer (0:48–End)",
-            "visual_direction": (
-                f"Clean clinical summary card displaying on-screen text: '{MANDATORY_VERBAL_DISCLAIMER}' "
-                "with subtle loop fade."
-            ),
-            "on_screen_text": "Not a substitute for professional medical advice.",
+            "segment": "3. Clean Concluding Thought (0:48–End)",
+            "visual_direction": "Clean clinical summary card with subtle loop fade.",
+            "on_screen_text": "Stay informed • Subscribe for daily science facts.",
             "spoken_narration": outro_sents,
-            "audio_cue": "Gentle 1.0s audio fade-out (single outro instance)",
+            "audio_cue": "Gentle 1.0s audio fade-out",
         },
     ]
 
@@ -290,11 +248,11 @@ def generate_script(topic: str, user_prompt: str) -> str:
     source_orgs = f"{sources[0]['org']} or {sources[1]['org']}"
 
     system_msg = (
-        "You are an objective, policy-safe YouTube Health Shorts scriptwriter. "
-        "Frame all content strictly as educational awareness, never medical diagnosis. "
+        "You are an objective, engaging YouTube Health Shorts scriptwriter. "
+        "Keep narration clean, curious, and informative. "
         f"Cite {source_orgs} naturally in speech. "
         "Output ONLY the raw speakable body sentences. Do NOT include <think> tags, markdown, "
-        "speaker labels, timestamps, or 'Thank you for watching' sign-offs.\n"
+        "speaker labels, timestamps, spoken disclaimers, or 'Thank you for watching' sign-offs.\n"
         f"{NEGATIVE_PROMPT_RULES}"
     )
     for model in models:
@@ -318,7 +276,7 @@ def generate_script(topic: str, user_prompt: str) -> str:
                 last_err = RuntimeError(f"Model {model} HTTP {r.status_code}: {r.text[:200]}")
                 continue
             raw = r.json()["choices"][0]["message"]["content"].strip()
-            cleaned = sanitize_spoken_script(raw, topic=topic, enforce_policy_blocks=True)
+            cleaned = sanitize_spoken_script(raw, topic=topic, enforce_policy_blocks=False)
             if len(cleaned.split()) < 40:
                 last_err = RuntimeError(f"Too few words ({len(cleaned.split())}) from {model}")
                 continue
@@ -422,8 +380,7 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
             chunks.append((" ".join(w[0] for w in grp), grp[0][1], grp[-1][2]))
             i += take
 
-        # Start captions after the 0.3s embedded thumbnail intro so the thumbnail frame stays clean
-        out, idx, cur_t = [], 1, max(THUMB_INTRO_DUR, chunks[0][1]) if chunks else THUMB_INTRO_DUR
+        out, idx, cur_t = [], 1, max(0.0, chunks[0][1]) if chunks else 0.0
         for text, w_start, w_end in chunks:
             start = max(cur_t, w_start)
             end = max(start + 0.35, w_end)
@@ -466,7 +423,7 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
     )
 
 
-# ── Video Processing ──────────────────────────────────────────────────────────
+# ── Video Processing (Clean Video Start without Thumbnail Flash) ───────────────
 _cascade = None
 
 
@@ -597,17 +554,16 @@ def render_and_cap(
     thumb_out_path: str = "thumbnail.jpg",
 ) -> float:
     """
-    Downloads B-roll, renders the 9:16 Pillow thumbnail using a clean B-roll source clip,
-    overlays the generated thumbnail onto the first 0.3 seconds (THUMB_INTRO_DUR) of the
-    MP4 video so YouTube Shorts frame-picker can select it natively, and burns captions + BGM.
+    Downloads B-roll, generates the standalone 9:16 Pillow thumbnail for YouTube API upload,
+    renders the vertical video starting immediately with B-roll (no thumbnail flash in video),
+    and burns captions + BGM. Duration is strictly capped under 59 seconds.
     """
     tmp = Path(tempfile.mkdtemp())
     local = _download_broll(broll_urls, tmp)
     if not local:
         raise RuntimeError("No B-roll clips could be downloaded or synthesized.")
 
-    # 1. Generate the 9:16 Pillow Thumbnail before video encoding so it can be embedded in the first 0.3s
-    thumb_ready = False
+    # 1. Generate standalone 9:16 Pillow thumbnail for YouTube API upload
     try:
         generate_shorts_thumbnail(
             thumbnail_text=thumbnail_text,
@@ -615,11 +571,10 @@ def render_and_cap(
             video_path=local[0],
             out_path=thumb_out_path,
         )
-        thumb_ready = os.path.exists(thumb_out_path) and os.path.getsize(thumb_out_path) > 1024
     except Exception as tex:
-        log.warning("[thumbnail] Pre-render thumbnail generation failed (%s)", tex)
+        log.warning("[thumbnail] Thumbnail generation failed (%s)", tex)
 
-    raw_clips, cropped, merged, voice_clip, thumb_clip, composite_clip = [], [], None, None, None, None
+    raw_clips, cropped, merged, voice_clip = [], [], None, None
     try:
         base_comps = []
         for p in local:
@@ -655,26 +610,9 @@ def render_and_cap(
 
         merged = concatenate_videoclips(cropped, method="compose")
         end = max(0.5, min(PREVIEW_MAX, target_dur))
-        base_video = merged.subclip(0, end)
 
-        # 2. Overlay the 9:16 Pillow thumbnail onto the first 0.3s (THUMB_INTRO_DUR) of the video stream
-        if thumb_ready and end > THUMB_INTRO_DUR:
-            try:
-                thumb_clip = (
-                    ImageClip(thumb_out_path)
-                    .set_start(0)
-                    .set_duration(THUMB_INTRO_DUR)
-                    .resize((1080, 1920))
-                )
-                composite_clip = CompositeVideoClip([base_video, thumb_clip], size=(1080, 1920)).set_duration(end)
-                out_clip = composite_clip.set_audio(voice_clip.subclip(0, end))
-                log.info("[render] Embedded 9:16 Pillow thumbnail into first %.1fs of MP4", THUMB_INTRO_DUR)
-            except Exception as oex:
-                log.warning("[render] 0.3s thumbnail overlay fallback to base_video: %s", oex)
-                out_clip = base_video.set_audio(voice_clip.subclip(0, end))
-        else:
-            out_clip = base_video.set_audio(voice_clip.subclip(0, end))
-
+        # 2. Render video starting immediately with clean B-roll (no thumbnail overlay)
+        out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
         out_clip.write_videofile(
             temp_mp4,
             fps=30,
@@ -691,12 +629,16 @@ def render_and_cap(
                 c.close()
             except Exception:
                 pass
-        for clip_obj in (thumb_clip, composite_clip, voice_clip, merged):
-            if clip_obj is not None:
-                try:
-                    clip_obj.close()
-                except Exception:
-                    pass
+        if voice_clip:
+            try:
+                voice_clip.close()
+            except Exception:
+                pass
+        if merged:
+            try:
+                merged.close()
+            except Exception:
+                pass
         shutil.rmtree(tmp, ignore_errors=True)
 
     srt_path = "cap.srt"
@@ -780,7 +722,7 @@ def upload_unlisted(
             thumb_uploaded = True
             log.info("[upload] Custom 3-word Pillow thumbnail uploaded for video %s", vid_id)
         except Exception as exc:
-            log.warning("[upload] Custom thumbnail API call skipped/failed (%s); 0.3s MP4 frame remains active", exc)
+            log.warning("[upload] Custom thumbnail upload skipped/failed (%s)", exc)
 
     return vid_id, f"https://youtu.be/{vid_id}", thumb_uploaded
 
@@ -894,8 +836,8 @@ def _package_and_upload(video_path, seo, segments, topic, slot, issue_body, atte
 def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None:
     body = (
         f"✅ **Topic approved:** {topic}\n\n"
-        "Please provide your script text or generate a policy-safe script automatically:\n\n"
-        "- **Option A — Use AI Policy-Safe Default Prompt:**\n"
+        "Please provide your script text or generate a clean, informative script automatically:\n\n"
+        "- **Option A — Use AI Default Prompt:**\n"
         "  Reply with: `/use-default-prompt`\n\n"
         "- **Option B — Provide Your Own Script:**\n"
         "  Reply with: `/set-script` followed by your full voiceover text."
@@ -1003,12 +945,12 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     ctx.issue_body = new_body
 
-    mode_str = "custom script (sanitized)" if user_script else "YMYL policy-safe AI script"
+    mode_str = "custom script (sanitized)" if user_script else "AI informative script"
     post_comment(
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"🎬 Building video preview & embedding 0.3s 9:16 Pillow thumbnail for **{topic}** (using {mode_str}).\nThis takes ~2–5 minutes...",
+        f"🎬 Building video preview for **{topic}** (using {mode_str}).\nThis takes ~2–5 minutes...",
     )
 
     try:
@@ -1036,32 +978,28 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
             f"| **{seg['segment']}** | {seg['on_screen_text']} | {seg['spoken_narration']} | *{seg['audio_cue']}* |"
         )
     seg_table = (
-        "| Segment | On-Screen Hook/Text | Sanitized Spoken Narration | Audio Cue |\n"
+        "| Segment | On-Screen Hook/Text | Spoken Narration (Clean & Informative) | Audio Cue |\n"
         "|---|---|---|---|\n" + "\n".join(seg_rows)
         if seg_rows
         else ""
     )
 
-    thumb_status = (
-        "Embedded in 0.0–0.3s of MP4 + Uploaded via YouTube API ✓"
-        if video_meta.get("thumbnail_uploaded")
-        else "Embedded in 0.0–0.3s of MP4 for Shorts Frame-Picker ✓"
-    )
+    thumb_status = "Uploaded via YouTube API (Description has Disclaimer) ✓" if video_meta.get("thumbnail_uploaded") else "Generated locally ✓"
 
     post_comment(
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"✅ **Preview Ready!** (Attempt {video_meta['attempt']}, {video_meta['duration_sec']}s)\n"
+        f"✅ **Preview Ready!** (Attempt {video_meta['attempt']}, {video_meta['duration_sec']}s < 59s)\n"
         f"🔗 **Watch Unlisted Preview:** {video_meta['preview_link']}\n\n"
-        f"### 📦 Viral Packaging & YMYL Compliance Matrix\n"
+        f"### 📦 Viral Packaging & Compliance Matrix\n"
         f"- **SEO Video Title:** `{video_meta['title']}`\n"
         f"- **Punchy Alt Title (<6 words):** `{video_meta.get('punchy_short_title', '')}`\n"
         f"- **3-Word Complementary Thumbnail Text:** `{video_meta.get('thumbnail_text', '')}` *(0% word overlap with title)*\n"
-        f"- **Pillow 9:16 Thumbnail Status:** `{thumb_status}`\n"
+        f"- **Thumbnail Status:** `{thumb_status}`\n"
         f"- **AI Thumbnail Prompt:** `{video_meta.get('thumbnail_prompt', '')}`\n"
         f"- **2026 Synthetic Media Flag:** `containsSyntheticMedia = True`\n\n"
-        f"### 🎙️ 4-Attribute Shorts Script Breakdown\n"
+        f"### 🎙️ Shorts Script Breakdown\n"
         f"{seg_table}\n\n"
         "Reply with:\n"
         "- `/approve-video` — schedule for publication\n"
@@ -1080,7 +1018,7 @@ def handle_reject_topic(ctx: Ctx) -> None:
     if len(options) < 6:
         options = [
             "5 Subtle Dehydration Signals People Often Ignore",
-            "Myth vs Fact: Does Drinking Coffee First Thing Spike Cortisol?",
+            "Why Your Neck Hurts at a Desk: Forward Head Posture Explained",
             "How 10 Minutes of Morning Sunlight Resets Your Circadian Clock",
             "Why Your Neck Hurts at a Desk: Forward Head Posture Explained",
             "How the Vagus Nerve Calms Your Heart Rate in 20 Seconds",
@@ -1098,7 +1036,7 @@ def handle_reject_topic(ctx: Ctx) -> None:
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"🔄 **Fresh Policy-Safe Topic Options:**\n{numbered}\n\n"
+        f"🔄 **Fresh Topic Options:**\n{numbered}\n\n"
         "Reply `/approve-topic N` (or `/approve-topic N /use-default-prompt`) or `/custom-topic Your Topic`.",
     )
 
