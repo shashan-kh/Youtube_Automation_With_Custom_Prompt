@@ -1,8 +1,5 @@
 """
-handle_comment.py — Processes all /commands posted on GitHub Issues, sanitizes spoken scripts,
-programmatically expands acronyms (CDC -> Centers for Disease Control and Prevention), ensures
-duration matches the natural script length up to 58.8s (just less than 59 seconds), and appends
-a guaranteed 'Thank you' conclusion strictly once.
+handle_comment.py — processes all /commands posted on GitHub Issues.
 """
 from __future__ import annotations
 
@@ -15,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,30 +20,13 @@ from pathlib import Path
 import requests
 from moviepy.editor import AudioFileClip, VideoFileClip, concatenate_videoclips
 
-from brand_config import (
-    NEGATIVE_PROMPT_RULES,
-    UNIFIED_SINGLE_OUTRO,
-    VISUAL_IDENTITY,
-    enforce_policy_guardrails,
-    select_credible_sources,
-)
 from common import (
-    REPO,
-    add_label,
-    extract_json_block,
-    get_logger,
-    get_metadata_from_issue_body,
-    get_slot_from_labels,
-    gh,
-    is_authorized_commenter,
-    jaccard,
-    normalize_key,
-    post_comment,
-    remove_label,
-    set_metadata_in_issue_body,
+    REPO, add_label, extract_json_block, get_logger,
+    get_metadata_from_issue_body, get_slot_from_labels, gh,
+    is_authorized_commenter, jaccard, normalize_key, post_comment,
+    remove_label, set_metadata_in_issue_body
 )
 from seo import generate_seo_package
-from thumbnail_generator import generate_shorts_thumbnail
 
 log = get_logger("handle_comment")
 
@@ -55,39 +36,29 @@ except Exception:
     cv2 = None
 
 # ── Env ────────────────────────────────────────────────────────────────────────
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_FALLBACKS = [
-    m.strip()
-    for m in os.getenv(
+    m.strip() for m in os.getenv(
         "GROQ_FALLBACK_MODELS",
         "llama-3.3-70b-versatile,llama-3.1-8b-instant,"
         "qwen/qwen3-32b,openai/gpt-oss-20b,openai/gpt-oss-120b,"
         "groq/compound-mini,moonshotai/kimi-k2-instruct",
-    ).split(",")
-    if m.strip()
+    ).split(",") if m.strip()
 ]
 
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
-REGION = os.getenv("REGION", "IN")
-TTS_LANG = os.getenv("TTS_LANG", "en")
-BGM_VOL = 0.07
+REGION         = os.getenv("REGION", "IN")
+TTS_LANG       = os.getenv("TTS_LANG", "en")
+BGM_VOL        = 0.07
 
-IST = timezone(timedelta(hours=5, minutes=30))
-TARGET_LOW = 45.0
-TARGET_HIGH = 58.8
-PREVIEW_MAX = 58.8  # Maximized to just less than 59 seconds
+IST         = timezone(timedelta(hours=5, minutes=30))
+TARGET_LOW  = 35.0
+TARGET_HIGH = 58.0
+PREVIEW_MAX = 57.3
+PROMPT_REMINDER_HOURS = 1
 
 _PROMPT_FILE = Path(__file__).parent / "prompt.txt"
-
-_OUTRO_STRIP_PATTERNS = [
-    r"(?i)\bthank\s+you\s+(so\s+much\s+)?for\s+(watching|listening|tuning\s+in)[^.!?]*[.!?]?",
-    r"(?i)\bthanks\s+for\s+(watching|listening)[^.!?]*[.!?]?",
-    r"(?i)\bfollow\s+for\s+more\s+(daily\s+)?(health|wellness)\s+tips[^.!?]*[.!?]?",
-    r"(?i)\bdon'?t\s+forget\s+to\s+(like\s+and\s+)?subscribe[^.!?]*[.!?]?",
-    r"(?i)\blike\s+and\s+subscribe\s+for\s+more[^.!?]*[.!?]?",
-    r"(?i)\bsubscribe\s+for\s+more\s+(daily\s+)?(wellness|health|science)[^.!?]*[.!?]?",
-]
 
 
 def load_default_prompt() -> str:
@@ -97,22 +68,23 @@ def load_default_prompt() -> str:
             return content
     except Exception:
         pass
-    return "Write a spoken voiceover script for a 55-second health and wellness YouTube Short about: {topic}"
+    return "Write a spoken voiceover script for a 50-second YouTube Short about: {topic}"
 
 
 class Ctx:
     def __init__(self, event: dict, owner: str, repo: str) -> None:
-        self.event = event
-        self.owner = owner
-        self.repo = repo
-        self.issue = event["issue"]
-        self.number: int = self.issue["number"]
+        self.event        = event
+        self.owner        = owner
+        self.repo         = repo
+        self.issue        = event["issue"]
+        self.number: int  = self.issue["number"]
         self.comment_body = (event["comment"]["body"] or "").strip()
-        self.issue_body = self.issue.get("body") or ""
-        self.labels = self.issue.get("labels", [])
-        self.slot = get_slot_from_labels(self.labels)
+        self.issue_body   = (self.issue.get("body") or "")
+        self.labels       = self.issue.get("labels", [])
+        self.slot         = get_slot_from_labels(self.labels)
 
 
+# ── LLM & Script Cleaning ──────────────────────────────────────────────────────
 def _list_groq_models() -> list[str]:
     if not GROQ_API_KEY:
         return []
@@ -143,119 +115,34 @@ def _build_model_list() -> list[str]:
     return ordered[:12]
 
 
-def expand_full_forms(text: str) -> str:
-    if not text:
-        return ""
-    expanded = text
-    expanded = re.sub(r"\bCDC\b", "Centers for Disease Control and Prevention", expanded)
-    expanded = re.sub(r"\bNIH\b", "National Institutes of Health", expanded)
-    expanded = re.sub(r"\bWHO\b", "World Health Organization", expanded)
-    expanded = re.sub(r"\bFDA\b", "Food and Drug Administration", expanded)
-    return expanded
-
-
-def sanitize_spoken_script(raw_text: str, topic: str = "", enforce_policy_blocks: bool = False) -> str:
-    text = raw_text or ""
-
-    text = re.sub(r"<think>.*?</think>", " ", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"```[a-zA-Z]*", " ", text)
-    text = text.replace("```", " ")
-
-    text = re.sub(r"\[[^\]]*\]", " ", text)
+def _clean_script(text: str) -> str:
+    # Remove <think>...</think> blocks from reasoning models like Qwen
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+    # Remove markdown code fences if the LLM wrapped the output
+    text = re.sub(r"^```[a-zA-Z]*\s*", "", text).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
     text = re.sub(
-        r"\((?:visual|scene|cut|music|sfx|audio|pause|b-roll|on-screen|outro|intro)[^)]*\)",
-        " ",
+        r"(?i)^(Title|Topic|Script|Intro|Hook|Body|CTA|Voiceover|The hook is|The script starts here):?\s*",
+        "",
         text,
-        flags=re.IGNORECASE,
+        flags=re.MULTILINE,
     )
-    text = re.sub(r"\b\d{1,2}:\d{2}(?:\s*[-–—to]+\s*\d{1,2}:\d{2})?\b", " ", text)
-
-    text = re.sub(
-        r"(?i)(?:^|\n)\s*(?:Title|Topic|Script|Intro|Hook|Body|Point\s*\d+|Recap|CTA|Outro|Disclaimer|Voiceover|Narrator|Host|Speaker|Visual|Audio|On-screen\s+text)\s*:\s*",
-        " ",
-        text,
-    )
-    text = re.sub(r"(?i)^(Here is the script|Sure!|Certainly!|Here's your script)[^\n]*\n?", " ", text).strip()
-
-    text = re.sub(r"https?://\S+", " ", text)
-    text = re.sub(r"(?:^|\s)#\w+", " ", text)
-    text = re.sub(r"[*_~`#>|]+", " ", text)
-    text = re.sub(r"[^\x00-\x7F]+", " ", text)
-
-    for pat in _OUTRO_STRIP_PATTERNS:
-        text = re.sub(pat, " ", text)
-
-    text = expand_full_forms(text)
-
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    deduped_sentences: list[str] = []
-    seen_norm: set[str] = set()
-    for s in sentences:
-        norm = normalize_key(s)
-        if not norm or norm in seen_norm:
-            continue
-        seen_norm.add(norm)
-        deduped_sentences.append(s if s[-1] in ".!?" else s + ".")
-
-    body_text = " ".join(deduped_sentences).strip()
-    body_text = enforce_policy_guardrails(body_text)
-
-    # Append UNIFIED_SINGLE_OUTRO strictly ONCE
-    final_spoken = body_text.rstrip(".!? ") + ". " + UNIFIED_SINGLE_OUTRO
-    final_spoken = re.sub(r"\s+", " ", final_spoken).strip()
-    return final_spoken
-
-
-def build_viral_shorts_segments(spoken_script: str, topic: str) -> list[dict]:
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", spoken_script) if s.strip()]
-    hook_sent = sentences[0] if sentences else spoken_script
-    outro_sents = " ".join(sentences[-2:]) if len(sentences) >= 3 else UNIFIED_SINGLE_OUTRO
-    body_sents = " ".join(sentences[1:-2]) if len(sentences) > 3 else " ".join(sentences[1:-1])
-
-    short_topic_words = " ".join(re.findall(r"[a-zA-Z0-9]+", topic or "Wellness Habit")[:3]).upper()
-
-    return [
-        {
-            "segment": "1. Curiosity Hook (0:00–0:03)",
-            "visual_direction": (
-                f"High-contrast 9:16 wellness B-roll highlighting {topic} "
-                f"in clinical navy ({VISUAL_IDENTITY['color_palette']['deep_clinical_navy']}) with dynamic zoom."
-            ),
-            "on_screen_text": f"WHY {short_topic_words} MATTERS",
-            "spoken_narration": hook_sent,
-            "audio_cue": "Subtle low-frequency whoosh transition into calm ambient clinical pad",
-        },
-        {
-            "segment": "2. High-Retention Informative Body (0:03–0:50)",
-            "visual_direction": "Voice-synchronized B-roll cuts matching exact sentence timing.",
-            "on_screen_text": "SCIENCE-BACKED WELLNESS",
-            "spoken_narration": body_sents or hook_sent,
-            "audio_cue": "Steady rhythmic ambient pulse supporting spoken cadence",
-        },
-        {
-            "segment": "3. Guaranteed Thank You Conclusion (0:50–End)",
-            "visual_direction": "Clean wellness summary card with subscriber callout.",
-            "on_screen_text": "Subscribe for daily wellness tips.",
-            "spoken_narration": outro_sents,
-            "audio_cue": "Gentle 1.0s audio fade-out",
-        },
-    ]
+    text = re.sub(r"(?i)(Here is the script|Sure!|Certainly!|The topic is)[^\n]*\n?", "", text)
+    text = text.replace("**", "").replace("*", "").strip('"\' \n')
+    conclusion = "Thank you for watching. Follow for more daily health tips."
+    if conclusion.lower() not in text.lower():
+        text = text.rstrip(".!? ") + f". {conclusion}"
+    return text
 
 
 def generate_script(topic: str, user_prompt: str) -> str:
     models = _build_model_list()
     last_err = None
-    sources = select_credible_sources(topic, count=2)
-    source_orgs = f"{sources[0]['org']} and {sources[1]['org']}"
-
     system_msg = (
-        "You are an elite, engaging YouTube Shorts scriptwriter for health and wellness. "
-        "Write a rich, detailed, high-retention script (~140-150 words) that maximizes duration up to 58 seconds. "
-        "Use precise English punctuation (commas for breath pauses, periods for full stops). "
-        f"Spell out full organization names (e.g., {source_orgs}). NEVER use acronyms like CDC or NIH. "
-        "Output ONLY the raw speakable body sentences. Do NOT include <think> tags, markdown, "
-        "speaker labels, timestamps, or sign-offs.\n"
-        f"{NEGATIVE_PROMPT_RULES}"
+        "You are a professional voiceover artist and scriptwriter for YouTube Shorts. "
+        "Output ONLY the exact speakable voiceover content for the video, exclusively and directly "
+        "related to the chosen topic. Do NOT include <think> tags or meta commentary. "
+        "Start DIRECTLY with the first spoken word."
     )
     for model in models:
         try:
@@ -269,7 +156,7 @@ def generate_script(topic: str, user_prompt: str) -> str:
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.72,
+                    "temperature": 0.75,
                     "max_tokens": 800,
                 },
                 timeout=120,
@@ -278,11 +165,11 @@ def generate_script(topic: str, user_prompt: str) -> str:
                 last_err = RuntimeError(f"Model {model} HTTP {r.status_code}: {r.text[:200]}")
                 continue
             raw = r.json()["choices"][0]["message"]["content"].strip()
-            cleaned = sanitize_spoken_script(raw, topic=topic, enforce_policy_blocks=False)
-            if len(cleaned.split()) < 50:
+            cleaned = _clean_script(raw)
+            if len(cleaned.split()) < 35:
                 last_err = RuntimeError(f"Too few words ({len(cleaned.split())}) from {model}")
                 continue
-            log.info("[script] Generated %d sanitized spoken words using %s", len(cleaned.split()), model)
+            log.info("[script] Generated %d words using %s", len(cleaned.split()), model)
             return cleaned
         except Exception as exc:
             last_err = exc
@@ -330,52 +217,27 @@ def get_audio_duration(path: str) -> float:
         a.close()
         return dur
     except Exception:
-        return 50.0
+        return 45.0
 
 
 def ensure_bgm_track(duration: float, out_path: str = "bgm_src.m4a") -> str:
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-f", "lavfi", "-t", f"{duration + 2.0:.2f}",
-            "-i", "anoisesrc=c=pink:a=0.03", "-f", "lavfi", "-t", f"{duration + 2.0:.2f}",
-            "-i", "sine=frequency=216:sample_rate=44100", "-filter_complex",
-            "[0:a]lowpass=f=600[noise];[1:a]volume=0.02[tone];[noise][tone]amix=inputs=2,"
-            f"afade=t=in:st=0:d=2.0,afade=t=out:st={max(0.0, duration - 1.0):.2f}:d=1.0",
-            "-c:a", "aac", "-b:a", "128k", out_path,
-        ],
-        check=True,
-        capture_output=True,
-    )
+    """Generates a calm instrumental ambient pad using FFmpeg synthesis."""
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi", "-t", f"{duration + 2.0:.2f}",
+        "-i", "anoisesrc=c=pink:a=0.03", "-f", "lavfi", "-t", f"{duration + 2.0:.2f}",
+        "-i", "sine=frequency=216:sample_rate=44100", "-filter_complex",
+        "[0:a]lowpass=f=600[noise];[1:a]volume=0.02[tone];[noise][tone]amix=inputs=2,"
+        f"afade=t=in:st=0:d=2.0,afade=t=out:st={max(0.0, duration - 1.0):.2f}:d=1.0",
+        "-c:a", "aac", "-b:a", "128k", out_path
+    ], check=True, capture_output=True)
     return out_path
 
 
-# ── Captions & Whisper Sentence Timestamps ────────────────────────────────────
+# ── Captions ──────────────────────────────────────────────────────────────────
 def _fmt_time(t: float) -> str:
     h, m, s = int(t // 3600), int((t % 3600) // 60), int(t % 60)
     ms = int((t - int(t)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def get_sentence_timestamps(audio_path: str, lang: str = "en") -> list[tuple[float, float]]:
-    try:
-        from faster_whisper import WhisperModel
-        model = WhisperModel(os.getenv("WHISPER_MODEL", "tiny.en"), device="cpu", compute_type="int8")
-        segments, _ = model.transcribe(audio_path, language=lang, beam_size=5, vad_filter=True, word_timestamps=True)
-
-        intervals = []
-        for seg in segments:
-            seg_start = float(seg.start)
-            seg_end = float(seg.end)
-            if seg_end > seg_start:
-                intervals.append((seg_start, seg_end))
-        if intervals:
-            return intervals
-    except Exception as exc:
-        log.warning("[whisper] sentence timestamp extraction failed (%s), using fallback intervals", exc)
-
-    dur = get_audio_duration(audio_path)
-    step = 4.0
-    return [(t, min(dur, t + step)) for t in [i * step for i in range(int(dur // step) + 1)] if t < dur]
 
 
 def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
@@ -420,7 +282,7 @@ def transcribe_to_srt(audio_path: str, srt_path: str, lang: str = "en") -> bool:
             f.writelines(out)
         return True
     except Exception as exc:
-        log.warning("[srt] failed: %s", exc)
+        log.warning("[srt] Whisper failed (%s), falling back to blank SRT", exc)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(f"1\n{_fmt_time(0.0)} --> {_fmt_time(max(0.8, get_audio_duration(audio_path)))}\n \n\n")
         return False
@@ -440,7 +302,7 @@ def burn_captions(in_mp4: str, srt_path: str, out_mp4: str) -> None:
         [
             "ffmpeg", "-y", "-i", in_mp4,
             "-vf", f"subtitles={_ffmpeg_escape(srt_abs)}:force_style={_ffmpeg_escape(style)}",
-            "-c:a", "copy", "-pix_fmt", "yuv420p", out_mp4,
+            "-c:a", "copy", "-pix_fmt", "yuv420p", out_mp4
         ],
         check=True,
         capture_output=True,
@@ -481,8 +343,8 @@ def smart_cover_crop(clip, target_w=1080, target_h=1920):
 
 def fetch_broll(query: str, need: int = 6) -> list[str]:
     clean_q = re.sub(r"[^a-zA-Z0-9\s]", " ", query or "")
-    clean_q = " ".join(clean_q.split()[:4]) or "healthy lifestyle wellness"
-    all_queries = [clean_q, "healthy lifestyle", "morning sunlight", "wellness nature", "nutrition fresh"]
+    clean_q = " ".join(clean_q.split()[:4]) or "healthy lifestyle"
+    all_queries = [clean_q, "healthy lifestyle", "fitness exercise", "meditation", "wellness nature"]
     collected, seen = [], set()
 
     if PEXELS_API_KEY:
@@ -520,8 +382,9 @@ def fetch_broll(query: str, need: int = 6) -> list[str]:
 
 
 def _generate_fallback_video_clips(tmp: Path, count: int = 3) -> list[str]:
+    """Generates clean vertical dark-teal ambient background clips via FFmpeg if downloads fail."""
     generated = []
-    colors = ["0x0A2540", "0x00A896", "0x134E5E"]
+    colors = ["0x0f2027", "0x134e5e", "0x1a2a6c"]
     for i in range(count):
         out_p = tmp / f"synth_{i}.mp4"
         color = colors[i % len(colors)]
@@ -529,7 +392,7 @@ def _generate_fallback_video_clips(tmp: Path, count: int = 3) -> list[str]:
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-f", "lavfi",
-                    "-i", f"color=c={color}:s=1080x1920:r=30:d=10",
+                    "-i", f"color=c={color}:s=1080x1920:r=30:d=8",
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast",
                     str(out_p),
                 ],
@@ -567,78 +430,40 @@ def _download_broll(urls: list[str], tmp: Path) -> list[str]:
     return local
 
 
-def render_and_cap(
-    broll_urls: list[str],
-    voice_mp3: str,
-    temp_mp4: str,
-    final_mp4: str,
-    thumbnail_text: str = "WHAT SCIENCE SAYS",
-    topic: str = "",
-    thumb_out_path: str = "thumbnail.jpg",
-) -> float:
-    """
-    Renders video matching full script duration naturally up to 58.8s (strictly less than 59s),
-    with 1:1 voice-synchronized visual cuts.
-    """
+def render_and_cap(broll_urls: list[str], voice_mp3: str, temp_mp4: str, final_mp4: str) -> float:
     tmp = Path(tempfile.mkdtemp())
     local = _download_broll(broll_urls, tmp)
     if not local:
         raise RuntimeError("No B-roll clips could be downloaded or synthesized.")
 
+    raw_clips, cropped, merged, voice_clip = [], [], None, None
     try:
-        generate_shorts_thumbnail(
-            thumbnail_text=thumbnail_text,
-            topic=topic,
-            video_path=local[0],
-            out_path=thumb_out_path,
-        )
-    except Exception as tex:
-        log.warning("[thumbnail] Thumbnail generation failed (%s)", tex)
+        base_comps = []
+        for p in local:
+            try:
+                c = VideoFileClip(p)
+                raw_clips.append(c)
+                sub_dur = min(6.0, max(2.5, float(c.duration)))
+                comp = smart_cover_crop(c.subclip(0, sub_dur)).set_audio(None)
+                base_comps.append(comp)
+            except Exception as exc:
+                log.warning("[render] clip load error on %s: %s", p, exc)
 
-    raw_clips, voice_clip = [], None
-    try:
-        sentence_intervals = get_sentence_timestamps(voice_mp3, lang=TTS_LANG)
+        if not base_comps:
+            raise RuntimeError("No valid video clips could be decoded by MoviePy.")
+
+        cropped = list(base_comps)
         voice_clip = AudioFileClip(voice_mp3)
         target_dur = float(voice_clip.duration)
 
-        source_video_objs = []
-        for p in local:
-            try:
-                vc = VideoFileClip(p)
-                raw_clips.append(vc)
-                source_video_objs.append(vc)
-            except Exception as exc:
-                log.warning("[render] failed to load video file %s: %s", p, exc)
+        while sum(c.duration for c in cropped) < target_dur and len(cropped) < 50:
+            for comp in base_comps:
+                cropped.append(comp)
+                if sum(c.duration for c in cropped) >= target_dur:
+                    break
 
-        if not source_video_objs:
-            raise RuntimeError("No valid source video objects could be loaded.")
-
-        matched_clips = []
-        source_idx = 0
-        for start_t, end_t in sentence_intervals:
-            seg_dur = max(0.5, end_t - start_t)
-            src_c = source_video_objs[source_idx % len(source_video_objs)]
-            source_idx += 1
-
-            src_dur = float(src_c.duration)
-            if src_dur >= seg_dur:
-                clip_start = random.uniform(0, max(0.0, src_dur - seg_dur))
-                sub = src_c.subclip(clip_start, clip_start + seg_dur)
-            else:
-                sub = src_c.subclip(0, src_dur)
-
-            cropped_sub = smart_cover_crop(sub, 1080, 1920).set_audio(None)
-            matched_clips.append(cropped_sub)
-
-        current_visual_dur = sum(c.duration for c in matched_clips)
-        if current_visual_dur < target_dur:
-            diff = target_dur - current_visual_dur
-            extra_comp = smart_cover_crop(source_video_objs[0].subclip(0, min(float(source_video_objs[0].duration), diff)), 1080, 1920).set_audio(None)
-            matched_clips.append(extra_comp)
-
-        merged = concatenate_videoclips(matched_clips, method="compose")
-        # Strictly less than 59 seconds (bounded by PREVIEW_MAX = 58.8)
-        end = max(45.0, min(PREVIEW_MAX, target_dur))
+        merged = concatenate_videoclips(cropped, method="compose")
+        end = max(0.5, min(PREVIEW_MAX, target_dur))
 
         out_clip = merged.subclip(0, end).set_audio(voice_clip.subclip(0, end))
         out_clip.write_videofile(
@@ -652,7 +477,7 @@ def render_and_cap(
             logger=None,
         )
     finally:
-        for c in raw_clips:
+        for c in raw_clips + cropped:
             try:
                 c.close()
             except Exception:
@@ -660,6 +485,11 @@ def render_and_cap(
         if voice_clip:
             try:
                 voice_clip.close()
+            except Exception:
+                pass
+        if merged:
+            try:
+                merged.close()
             except Exception:
                 pass
         shutil.rmtree(tmp, ignore_errors=True)
@@ -708,13 +538,7 @@ def _yt_client():
     return build("youtube", "v3", credentials=creds)
 
 
-def upload_unlisted(
-    video_path: str,
-    title: str,
-    desc: str,
-    tags: str,
-    thumbnail_path: str | None = None,
-) -> tuple[str, str, bool]:
+def upload_unlisted(video_path: str, title: str, desc: str, tags: str) -> tuple[str, str]:
     from googleapiclient.http import MediaFileUpload
     yt = _yt_client()
     body = {
@@ -727,7 +551,6 @@ def upload_unlisted(
         "status": {
             "privacyStatus": "unlisted",
             "selfDeclaredMadeForKids": False,
-            "containsSyntheticMedia": True,
         },
     }
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
@@ -735,120 +558,69 @@ def upload_unlisted(
     resp = None
     while resp is None:
         _, resp = req.next_chunk()
-
-    vid_id = resp["id"]
-    thumb_uploaded = False
-    if thumbnail_path and os.path.exists(thumbnail_path):
-        try:
-            thumb_media = MediaFileUpload(thumbnail_path, mimetype="image/jpeg", resumable=False)
-            yt.thumbnails().set(videoId=vid_id, media_body=thumb_media).execute()
-            thumb_uploaded = True
-            log.info("[upload] Custom Pillow thumbnail uploaded for video %s", vid_id)
-        except Exception as exc:
-            log.warning("[upload] Custom thumbnail upload failed (%s)", exc)
-
-    return vid_id, f"https://youtu.be/{vid_id}", thumb_uploaded
+    return resp["id"], f"https://youtu.be/{resp['id']}"
 
 
 def build_preview(topic: str, user_script: str | None, slot: str, issue_body: str) -> tuple[dict | None, str]:
-    best = {"path": None, "dur": None, "score": float("inf"), "attempt": 0, "seo": None, "segments": None, "thumb": None}
+    best = {"path": None, "dur": None, "score": float("inf"), "attempt": 0, "seo": None}
     last_error = None
 
+    # Only run 1 attempt if user provided an exact custom script
     max_attempts = 1 if user_script else 2
 
     for attempt in range(1, max_attempts + 1):
         try:
             log.info("[build] Starting attempt %d/%d for topic: %s", attempt, max_attempts, topic)
             if user_script:
-                script_text = sanitize_spoken_script(user_script, topic=topic, enforce_policy_blocks=False)
+                script_text = _clean_script(user_script)
             else:
                 prompt_tpl = load_default_prompt()
                 actual_prompt = prompt_tpl.format(topic=topic)
                 script_text = generate_script(topic, actual_prompt)
 
-            segments = build_viral_shorts_segments(script_text, topic)
             seo = generate_seo_package(topic, script_text)
-
             voice_raw = f"voice_{attempt}.mp3"
             synthesize_speech(script_text, voice_raw, lang=TTS_LANG)
 
             broll = fetch_broll(topic, need=6)
             temp_mp4, final_mp4 = f"temp_{attempt}.mp4", f"short_{attempt}.mp4"
-            thumb_path = f"thumb_{attempt}.jpg"
+            dur = render_and_cap(broll, voice_raw, temp_mp4, final_mp4)
 
-            dur = render_and_cap(
-                broll_urls=broll,
-                voice_mp3=voice_raw,
-                temp_mp4=temp_mp4,
-                final_mp4=final_mp4,
-                thumbnail_text=seo.get("thumbnail_text", "WHAT SCIENCE SAYS"),
-                topic=topic,
-                thumb_out_path=thumb_path,
-            )
-
-            if not os.path.exists(thumb_path):
-                thumb_path = None
-
-            score = abs(57.5 - dur)
+            score = 0.0 if TARGET_LOW <= dur < TARGET_HIGH else abs(dur - 45.0)
             if score < best["score"]:
                 best_path = f"best_{attempt}.mp4"
                 shutil.copyfile(final_mp4, best_path)
-                best.update({
-                    "path": best_path,
-                    "dur": round(dur, 2),
-                    "score": score,
-                    "attempt": attempt,
-                    "seo": seo,
-                    "segments": segments,
-                    "thumb": thumb_path,
-                })
+                best.update({"path": best_path, "dur": round(dur, 2), "score": score, "attempt": attempt, "seo": seo})
 
-            if TARGET_LOW <= dur <= TARGET_HIGH or user_script:
-                return _package_and_upload(final_mp4, seo, segments, topic, slot, issue_body, attempt, dur, thumb_path)
+            if TARGET_LOW <= dur < TARGET_HIGH or user_script:
+                return _package_and_upload(final_mp4, seo, topic, slot, issue_body, attempt, dur)
         except Exception as exc:
             last_error = exc
             log.error("[build] attempt %d failed: %s", attempt, exc, exc_info=True)
 
     if best["path"] and os.path.exists(best["path"]):
-        return _package_and_upload(
-            best["path"],
-            best["seo"],
-            best["segments"],
-            topic,
-            slot,
-            issue_body,
-            best["attempt"],
-            best["dur"],
-            best["thumb"],
-        )
+        return _package_and_upload(best["path"], best["seo"], topic, slot, issue_body, best["attempt"], best["dur"])
 
     if last_error:
         raise RuntimeError(f"Video generation failed: {last_error}")
     return None, issue_body
 
 
-def _package_and_upload(video_path, seo, segments, topic, slot, issue_body, attempt, dur, thumb_path=None):
+def _package_and_upload(video_path, seo, topic, slot, issue_body, attempt, dur):
     try:
-        log.info("[upload] Uploading %s to YouTube as unlisted (containsSyntheticMedia=True)...", video_path)
-        vid_id, link, thumb_ok = upload_unlisted(
-            video_path, seo["title"], seo["description"], seo["tags_csv"], thumbnail_path=thumb_path
-        )
+        log.info("[upload] Uploading %s to YouTube as unlisted...", video_path)
+        vid_id, link = upload_unlisted(video_path, seo["title"], seo["description"], seo["tags_csv"])
         log.info("[upload] Uploaded successfully: %s", link)
         meta = get_metadata_from_issue_body(issue_body) or {}
         meta.update({
             "topic": topic,
             "title": seo["title"],
-            "punchy_short_title": seo.get("punchy_short_title", ""),
-            "thumbnail_text": seo.get("thumbnail_text", ""),
-            "thumbnail_prompt": seo.get("thumbnail_prompt", ""),
-            "thumbnail_uploaded": thumb_ok,
             "description": seo["description"],
             "preview_video_id": vid_id,
             "preview_link": link,
             "slot": slot,
             "duration_sec": dur,
             "attempt": attempt,
-            "viral_segments": segments,
         })
         return meta, set_metadata_in_issue_body(issue_body, meta)
     except Exception as exc:
@@ -859,7 +631,7 @@ def _package_and_upload(video_path, seo, segments, topic, slot, issue_body, atte
 def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None:
     body = (
         f"✅ **Topic approved:** {topic}\n\n"
-        "Please provide your script text or generate a wellness script automatically:\n\n"
+        "Please provide your script text or generate one automatically:\n\n"
         "- **Option A — Use AI Default Prompt:**\n"
         "  Reply with: `/use-default-prompt`\n\n"
         "- **Option B — Provide Your Own Script:**\n"
@@ -869,26 +641,24 @@ def _post_script_request(owner: str, repo: str, number: int, topic: str) -> None
 
 
 def _clean_issue_title_to_topic(title: str) -> str:
-    s = re.sub(r"(?:^|\s)#\w+", " ", (title or "").strip())
-    s = re.sub(r"(?i)\bshorts?\b|\[[^\]]*\]|\([^)]*\)", " ", s)
-    s = re.split(r"\s+\|\s+", s)[0].strip()
-    s = re.sub(r"\s+", " ", s).strip(" \t\n\r\"'")
-    if len(re.findall(r"[a-zA-Z]{2,}", s)) < 3:
-        return "Daily Health and Wellness Habits"
-    return (s[0].upper() + s[1:])[:120].rstrip()
+    s = re.sub(r"(?i)#?shorts?|\[[^\]]+\]|\([^)]+\)", "", (title or "").strip())
+    s = re.split(r"\s+[|\-–—]\s+", s)[0].strip()
+    return (s[0].upper() + s[1:])[:120].rstrip() if s else "Health and wellness tips"
 
 
 def _extract_topics_from_visible_body(issue_body: str) -> list[str]:
+    """Fallback parser if the HTML metadata comment is missing or corrupted."""
     if not issue_body:
         return []
-    matches = re.findall(r"^\s*\d+[\)\.]\s+(.+)$", issue_body, flags=re.MULTILINE)
-    return [m.strip() for m in matches if len(re.findall(r"[a-zA-Z]{2,}", m)) >= 3]
+    matches = re.findall(r"^\s*\d+\)\s+(.+)$", issue_body, flags=re.MULTILINE)
+    return [m.strip() for m in matches if m.strip()]
 
 
 def _extract_user_script_if_present(comment_body: str) -> str | None:
     idx = comment_body.lower().find("/set-script")
     if idx != -1:
-        script = comment_body[idx + len("/set-script") :].strip()
+        script = comment_body[idx + len("/set-script"):].strip()
+        # Strip trailing commands if someone wrote /set-script ... /approve-topic 1
         for cmd in ["/approve-topic", "/custom-topic", "/use-default-prompt"]:
             c_idx = script.lower().find(cmd)
             if c_idx != -1:
@@ -900,26 +670,27 @@ def _extract_user_script_if_present(comment_body: str) -> str | None:
 def _parse_topic_from_approve(comment_body: str, topics: list[str], issue_title: str = "") -> str:
     lower = comment_body.lower()
     idx_kw = lower.find("/approve-topic")
-    body_part = comment_body[idx_kw + len("/approve-topic") :].strip() if idx_kw != -1 else comment_body.strip()
+    body_part = comment_body[idx_kw + len("/approve-topic"):].strip() if idx_kw != -1 else comment_body.strip()
 
+    # Strip any chained command keywords from the topic argument
     for kw in ["/use-default-prompt", "/set-script", "/custom-topic"]:
         idx = body_part.lower().find(kw)
         if idx != -1:
             body_part = body_part[:idx].strip()
 
+    # Take only the first line in case extra comments follow on newlines
     first_line = body_part.splitlines()[0].strip() if body_part else ""
 
     if not first_line:
         return topics[0] if topics else _clean_issue_title_to_topic(issue_title)
 
+    # Check if the user passed a number like "2" or "2)"
     m_num = re.match(r"^(\d+)\)?$", first_line)
     if m_num:
         idx = int(m_num.group(1))
         if topics and 1 <= idx <= len(topics):
-            candidate = topics[idx - 1]
-            if len(re.findall(r"[a-zA-Z]{2,}", candidate)) >= 3:
-                return candidate
-        if topics and len(re.findall(r"[a-zA-Z]{2,}", topics[0])) >= 3:
+            return topics[idx - 1]
+        elif topics:
             return topics[0]
         return _clean_issue_title_to_topic(issue_title)
 
@@ -929,7 +700,7 @@ def _parse_topic_from_approve(comment_body: str, topics: list[str], issue_title:
 def _parse_topic_from_custom(comment_body: str, issue_title: str = "") -> str:
     lower = comment_body.lower()
     idx_c = lower.find("/custom-topic")
-    body_part = comment_body[idx_c + len("/custom-topic") :].strip() if idx_c != -1 else comment_body.strip()
+    body_part = comment_body[idx_c + len("/custom-topic"):].strip() if idx_c != -1 else comment_body.strip()
 
     for kw in ["/use-default-prompt", "/set-script", "/approve-topic"]:
         pos = body_part.lower().find(kw)
@@ -955,7 +726,7 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
     topics = meta.get("topics") or _extract_topics_from_visible_body(ctx.issue_body)
     topic = meta.get("topic", "")
-    if not topic or len(re.findall(r"[a-zA-Z]{2,}", topic)) < 2:
+    if not topic:
         topic = topics[0] if topics else _clean_issue_title_to_topic(ctx.issue.get("title", ""))
         meta["topic"] = topic
 
@@ -968,24 +739,19 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body})
     ctx.issue_body = new_body
 
-    mode_str = "custom script (sanitized)" if user_script else "AI wellness script"
+    mode_str = "custom script" if user_script else "AI default prompt"
     post_comment(
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"🎬 Building voice-synchronized video preview for **{topic}** (using {mode_str}).\nThis takes ~3–5 minutes...",
+        f"🎬 Building video preview for **{topic}** (using {mode_str}).\nThis takes ~2–5 minutes...",
     )
 
     try:
         video_meta, new_body2 = build_preview(topic, user_script, ctx.slot, new_body)
     except Exception as exc:
         log.error("[build] error: %s", exc, exc_info=True)
-        post_comment(
-            ctx.owner,
-            ctx.repo,
-            ctx.number,
-            f"❌ **Error building preview:**\n```\n{exc}\n```\nTry `/regenerate-video` or check repository secrets.",
-        )
+        post_comment(ctx.owner, ctx.repo, ctx.number, f"❌ **Error building preview:**\n```\n{exc}\n```\nTry `/regenerate-video` or check repository secrets.")
         return
 
     if not video_meta:
@@ -994,36 +760,13 @@ def _run_build_with_script(ctx: Ctx, user_script: str | None) -> None:
 
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": new_body2})
     ctx.issue_body = new_body2
-
-    seg_rows = []
-    for seg in video_meta.get("viral_segments", []):
-        seg_rows.append(
-            f"| **{seg['segment']}** | {seg['on_screen_text']} | {seg['spoken_narration']} | *{seg['audio_cue']}* |"
-        )
-    seg_table = (
-        "| Segment | On-Screen Hook/Text | Spoken Narration | Audio Cue |\n"
-        "|---|---|---|---|\n" + "\n".join(seg_rows)
-        if seg_rows
-        else ""
-    )
-
-    thumb_status = "Uploaded via YouTube API ✓" if video_meta.get("thumbnail_uploaded") else "Generated locally ✓"
-
     post_comment(
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"✅ **Preview Ready!** (Attempt {video_meta['attempt']}, {video_meta['duration_sec']}s < 59s)\n"
+        f"✅ **Preview ready!** (Attempt {video_meta['attempt']}, {video_meta['duration_sec']}s)\n"
         f"🔗 **Watch Unlisted Preview:** {video_meta['preview_link']}\n\n"
-        f"### 📦 Viral Packaging & Compliance Matrix\n"
-        f"- **SEO Video Title:** `{video_meta['title']}`\n"
-        f"- **Punchy Alt Title (<6 words):** `{video_meta.get('punchy_short_title', '')}`\n"
-        f"- **3-Word Complementary Thumbnail Text:** `{video_meta.get('thumbnail_text', '')}` *(0% word overlap with title)*\n"
-        f"- **Thumbnail Status:** `{thumb_status}`\n"
-        f"- **AI Thumbnail Prompt:** `{video_meta.get('thumbnail_prompt', '')}`\n"
-        f"- **2026 Synthetic Media Flag:** `containsSyntheticMedia = True`\n\n"
-        f"### 🎙️ Shorts Script Breakdown (Voice-Synchronized Visuals & Full-Form Acronyms)\n"
-        f"{seg_table}\n\n"
+        f"**Title:** `{video_meta['title']}`\n\n"
         "Reply with:\n"
         "- `/approve-video` — schedule for publication\n"
         "- `/regenerate-video` — rebuild with fresh B-roll\n"
@@ -1038,14 +781,14 @@ def handle_reject_topic(ctx: Ctx) -> None:
     except Exception:
         options = []
 
-    if len(options) < 6:
+    if not options:
         options = [
-            "How 10 Minutes of Morning Sunlight Optimizes Your Circadian Clock",
-            "Why Delaying Morning Caffeine by 60 Minutes Prevents Afternoon Crashes",
-            "Zone 2 Cardio: The Science Behind Longevity and Mitochondrial Health",
-            "Magnesium Glycinate and Its Role in Deep Restorative Sleep Architecture",
-            "How Walking 10 Minutes After Meals Regulates Postprandial Glucose",
-            "Prebiotic Fiber and the Gut Microbiome: What Harvard Research Shows",
+            "Gut health basics",
+            "Fixing posture in 2 minutes",
+            "Better sleep habits",
+            "Hydration tips for energy",
+            "Mental clarity morning routine",
+            "Natural metabolism boosters",
         ]
 
     meta = get_metadata_from_issue_body(ctx.issue_body) or {}
@@ -1059,7 +802,7 @@ def handle_reject_topic(ctx: Ctx) -> None:
         ctx.owner,
         ctx.repo,
         ctx.number,
-        f"🔄 **Fresh Wellness Topic Options:**\n{numbered}\n\n"
+        f"🔄 **Fresh topic options:**\n{numbered}\n\n"
         "Reply `/approve-topic N` (or `/approve-topic N /use-default-prompt`) or `/custom-topic Your Topic`.",
     )
 
@@ -1114,23 +857,10 @@ def handle_reject_video(ctx: Ctx) -> None:
         except Exception:
             pass
 
-    for k in [
-        "preview_video_id", "preview_link", "title", "punchy_short_title",
-        "thumbnail_text", "thumbnail_prompt", "thumbnail_uploaded", "description",
-        "attempt", "duration_sec", "viral_segments",
-    ]:
+    for k in ["preview_video_id", "preview_link", "title", "description", "attempt", "duration_sec"]:
         meta.pop(k, None)
-    gh(
-        "PATCH",
-        f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}",
-        json={"body": set_metadata_in_issue_body(ctx.issue_body, meta)},
-    )
-    post_comment(
-        ctx.owner,
-        ctx.repo,
-        ctx.number,
-        "🗑️ Deleted preview video. Reply `/new-topic` for fresh options or `/custom-topic Your Topic`.",
-    )
+    gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"body": set_metadata_in_issue_body(ctx.issue_body, meta)})
+    post_comment(ctx.owner, ctx.repo, ctx.number, "🗑️ Deleted preview video. Reply `/new-topic` for fresh options or `/custom-topic Your Topic`.")
 
 
 def handle_regenerate_video(ctx: Ctx) -> None:
@@ -1165,23 +895,14 @@ def handle_approve_video(ctx: Ctx) -> None:
 
     yt.videos().update(
         part="status",
-        body={
-            "id": vid_id,
-            "status": {
-                "privacyStatus": "private",
-                "publishAt": publish_utc,
-                "selfDeclaredMadeForKids": False,
-                "containsSyntheticMedia": True,
-            },
-        },
+        body={"id": vid_id, "status": {"privacyStatus": "private", "publishAt": publish_utc}},
     ).execute()
     post_comment(
         ctx.owner,
         ctx.repo,
         ctx.number,
         f"🚀 **Scheduled:** https://youtu.be/{vid_id}\n"
-        f"📅 **Publishes at (IST):** `{ist_dt.strftime('%Y-%m-%d %H:%M')}`\n"
-        f"🛡️ **2026 Synthetic Media Disclosure:** `Enabled`\n\n"
+        f"📅 **Publishes at (IST):** `{ist_dt.strftime('%Y-%m-%d %H:%M')}`\n\n"
         "Closing this issue.",
     )
     gh("PATCH", f"https://api.github.com/repos/{ctx.owner}/{ctx.repo}/issues/{ctx.number}", json={"state": "closed"})
@@ -1206,6 +927,7 @@ def main() -> None:
 
     log.info("Processing comment on issue #%d: %s", ctx.number, comment_body[:120])
 
+    # 1. Direct video lifecycle commands
     if "/approve-video" in comment_lower:
         handle_approve_video(ctx)
         return
@@ -1219,6 +941,7 @@ def main() -> None:
         handle_reject_topic(ctx)
         return
 
+    # 2. Topic & Script commands (supports both single and combined in one comment)
     has_approve = "/approve-topic" in comment_lower
     has_custom = "/custom-topic" in comment_lower
     has_default = "/use-default-prompt" in comment_lower
