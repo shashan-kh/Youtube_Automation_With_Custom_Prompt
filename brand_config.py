@@ -1,6 +1,6 @@
 """
 brand_config.py — Health and Wellness Channel Positioning, Daily Habit Pillars,
-E-E-A-T Credible Sources with Full-Form Institution Names, and Visual Identity Constants.
+Full-Form Credible E-E-A-T Sources, and Visual Identity Constants.
 """
 from __future__ import annotations
 
@@ -19,15 +19,16 @@ CHANNEL_SEO_DESCRIPTIONS = [
         "Welcome to your daily destination for science-backed health and wellness mastery. "
         "Every 60-second Short breaks down actionable daily habits, metabolic nutrition science, "
         "sleep optimization, and longevity research cited from institutions like the Mayo Clinic, "
-        "the Centers for Disease Control and Prevention, the World Health Organization, and the National Institutes of Health. "
+        "Centers for Disease Control and Prevention, World Health Organization, and National Institutes of Health. "
         "Subscribe for daily wellness insights! "
         f"{CHANNEL_POSITIONING_STATEMENT}"
     ),
 ]
 
-# ── 2. Unified Single Conclusion ───────────────────────────────────────────────
+# ── 2. Guaranteed Single "Thank You" Conclusion ────────────────────────────────
 UNIFIED_SINGLE_OUTRO = (
-    "Thank you for watching. Subscribe for more daily wellness tips to elevate your health."
+    "Thank you for watching this video. "
+    "Subscribe for more daily wellness tips to elevate your health and longevity."
 )
 
 # ── 3. Content Pillars & Weekly Calendar Logic (Health & Wellness) ─────────────
@@ -94,7 +95,7 @@ def get_pillar_for_date(target_date: date | datetime | None = None) -> dict:
     return {"key": key, **CONTENT_PILLARS[key]}
 
 
-# ── 4. Credible E-E-A-T Medical Sources (Full-Form Names Only) ─────────────────
+# ── 4. Full-Form Credible E-E-A-T Medical Sources (No Abbreviations) ───────────
 CREDIBLE_SOURCES_POOL = [
     {
         "org": "Mayo Clinic",
@@ -120,12 +121,6 @@ CREDIBLE_SOURCES_POOL = [
         "url": "https://www.health.harvard.edu/",
         "keywords": ["diet", "heart", "gut", "exercise", "mindfulness", "longevity"],
     },
-    {
-        "org": "World Health Organization",
-        "name": "World Health Organization — Health Topics",
-        "url": "https://www.who.int/health-topics",
-        "keywords": ["global", "lifestyle", "cardio", "mental", "wellbeing", "diet"],
-    },
 ]
 
 
@@ -142,9 +137,8 @@ def select_credible_sources(topic: str, script_text: str = "", count: int = 2) -
 NEGATIVE_PROMPT_RULES = """
 STRICT HEALTH & WELLNESS GUIDELINES:
 1. Focus entirely on positive lifestyle optimization, vitality, nutrition, sleep, and longevity.
-2. Avoid disease diagnosis or medical scaremongering.
-3. NEVER use abbreviations like CDC, WHO, or NIH in the spoken script. Always use their full names
-   (e.g., Centers for Disease Control and Prevention, World Health Organization, National Institutes of Health).
+2. ALWAYS spell out full organization names (e.g., Centers for Disease Control and Prevention, National Institutes of Health, Harvard Health Publishing, World Health Organization). NEVER use abbreviations like CDC, NIH, WHO, or FDA.
+3. Maintain an inspiring, curious, high-retention educational tone with a proper Thank You conclusion.
 """
 
 
