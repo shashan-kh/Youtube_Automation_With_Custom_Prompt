@@ -27,8 +27,7 @@ CHANNEL_SEO_DESCRIPTIONS = [
 
 # ── 2. Guaranteed Single "Thank You" Conclusion ────────────────────────────────
 UNIFIED_SINGLE_OUTRO = (
-    "Thank you for watching this video. "
-    "Subscribe for more daily wellness tips to elevate your health and longevity."
+    "Thank you for watching. Subscribe for more daily health and wellness tips."
 )
 
 # ── 3. Content Pillars & Weekly Calendar Logic (Health & Wellness) ─────────────
@@ -138,7 +137,7 @@ NEGATIVE_PROMPT_RULES = """
 STRICT HEALTH & WELLNESS GUIDELINES:
 1. Focus entirely on positive lifestyle optimization, vitality, nutrition, sleep, and longevity.
 2. ALWAYS spell out full organization names (e.g., Centers for Disease Control and Prevention, National Institutes of Health, Harvard Health Publishing, World Health Organization). NEVER use abbreviations like CDC, NIH, WHO, or FDA.
-3. Maintain an inspiring, curious, high-retention educational tone with a proper Thank You conclusion.
+3. Maintain an inspiring, curious, high-retention educational tone with a strict 'Thank you for watching' conclusion.
 """
 
 
