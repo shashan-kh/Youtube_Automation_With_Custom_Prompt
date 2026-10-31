@@ -1,0 +1,116 @@
+name: comment-handler
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: none
+  checks: none
+  contents: read
+  deployments: none
+  id-token: none
+  issues: write
+  packages: none
+  pages: none
+  pull-requests: none
+  repository-projects: none
+  security-events: none
+  statuses: none
+
+env:
+  NODE_OPTIONS: "--no-deprecation"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  handle:
+    runs-on: ubuntu-latest
+    if: |
+      contains(github.event.comment.body, '/approve-topic')    ||
+      contains(github.event.comment.body, '/reject-topic')     ||
+      contains(github.event.comment.body, '/approve-video')    ||
+      contains(github.event.comment.body, '/reject-video')     ||
+      contains(github.event.comment.body, '/regenerate-video') ||
+      contains(github.event.comment.body, '/new-topic')        ||
+      contains(github.event.comment.body, '/custom-topic')     ||
+      contains(github.event.comment.body, '/set-script')       ||
+      contains(github.event.comment.body, '/use-default-prompt')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libass9 fonts-dejavu-core libfontconfig1 libgomp1 espeak-ng
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+          python -c "
+          import sys, moviepy, gtts, pytrends, praw, faster_whisper
+          print('All imports OK — Python', sys.version)
+          "
+
+      - name: Validate required secrets
+        if: |
+          contains(github.event.comment.body, '/approve-topic')      ||
+          contains(github.event.comment.body, '/custom-topic')       ||
+          contains(github.event.comment.body, '/set-script')         ||
+          contains(github.event.comment.body, '/use-default-prompt') ||
+          contains(github.event.comment.body, '/approve-video')      ||
+          contains(github.event.comment.body, '/reject-video')       ||
+          contains(github.event.comment.body, '/regenerate-video')
+        shell: bash
+        run: |
+          missing=0
+          for v in GROQ_API_KEY PEXELS_API_KEY YT_CLIENT_ID YT_CLIENT_SECRET YT_REFRESH_TOKEN; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Missing secret: $v"
+              missing=1
+            else
+              echo "$v is set ✓"
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+        env:
+          GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY:    ${{ secrets.PEXELS_API_KEY }}
+          YT_CLIENT_ID:      ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET:  ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN:  ${{ secrets.YT_REFRESH_TOKEN }}
+
+      - name: Dump event payload (debug)
+        run: cat "$GITHUB_EVENT_PATH"
+
+      - name: Handle comment
+        env:
+          REGION:               IN
+          GITHUB_TOKEN:         ${{ secrets.GITHUB_TOKEN }}
+          GROQ_API_KEY:         ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY:       ${{ secrets.PEXELS_API_KEY }}
+          YT_CLIENT_ID:         ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET:     ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN:     ${{ secrets.YT_REFRESH_TOKEN }}
+          TTS_LANG:             en
+          GROQ_MODEL:           llama-3.3-70b-versatile
+          GROQ_FALLBACK_MODELS: >-
+            llama-3.3-70b-versatile,llama-3.1-8b-instant,
+            openai/gpt-oss-20b,openai/gpt-oss-120b,
+            groq/compound-mini,moonshotai/kimi-k2-instruct
+          DEBUG:                "0"
+        run: python handle_comment.py

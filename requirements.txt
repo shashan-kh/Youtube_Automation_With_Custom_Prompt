@@ -1,0 +1,37 @@
+pip>=23.2
+setuptools>=68.0
+wheel>=0.41
+
+# Core
+requests
+gTTS
+edge-tts
+packaging>=23.1
+
+# Accurate, lightweight CPU transcription for exact captions
+faster-whisper>=1.0.0,<2
+
+# Face-aware subject cropping (headless build for CI)
+opencv-python-headless>=4.8,<5
+
+# YouTube + Google auth
+google-api-python-client
+google-auth
+google-auth-oauthlib
+
+# Trends
+pytrends
+langdetect>=1.0.9
+
+# Reddit scraping
+praw>=7.7.0
+
+# Video (pin to avoid Pillow ANTIALIAS removal)
+moviepy==1.0.3
+imageio>=2.31
+imageio-ffmpeg>=0.4.9
+numpy<2
+pillow<10
+
+# Retry / resilience
+tenacity>=8.2.0

@@ -1,0 +1,46 @@
+name: Gemini Assistant
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  gemini-cli:
+    runs-on: ubuntu-latest
+    if: contains(github.event.comment.body, '@gemini-cli')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Gemini CLI
+        run: npm install -g @google/gemini-cli
+
+      - name: Run Gemini CLI
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: gemini --yolo -p "$COMMENT_BODY"
+
+      - name: Commit and Push changes
+        run: |
+          git config --global user.name "gemini-cli[bot]"
+          git config --global user.email "gemini-cli[bot]@users.noreply.github.com"
+          if [[ -n $(git status -s) ]]; then
+            git add .
+            git commit -m "chore: apply changes from @gemini-cli"
+            git push
+          else
+            echo "No changes to commit"
+          fi
