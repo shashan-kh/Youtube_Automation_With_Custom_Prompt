@@ -5,6 +5,10 @@ wheel>=0.41
 # Core
 requests
 gTTS
+<<<<<<< HEAD
+=======
+edge-tts
+>>>>>>> origin/main
 packaging>=23.1
 
 # Accurate, lightweight CPU transcription for exact captions

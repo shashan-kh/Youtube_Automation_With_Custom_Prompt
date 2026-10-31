@@ -187,7 +187,11 @@ def _assemble_description(raw_desc: str, topic: str, topic_tags: list) -> str:
     if "like" not in desc.lower() and "subscribe" not in desc.lower():
         desc = desc.rstrip() + "\nLike and subscribe for daily health tips."
 
+<<<<<<< HEAD
     # Build 350 hashtags
+=======
+    # Build 5-8 highly relevant hashtags
+>>>>>>> origin/main
     topic_specific = _generate_topic_hashtags(topic)
     all_tags: list[str] = []
     seen_lower: set[str] = set()
@@ -201,6 +205,7 @@ def _assemble_description(raw_desc: str, topic: str, topic_tags: list) -> str:
             continue
         seen_lower.add(key)
         all_tags.append(ht_clean)
+<<<<<<< HEAD
         if len(all_tags) >= 350:
             break
 
@@ -215,6 +220,12 @@ def _assemble_description(raw_desc: str, topic: str, topic_tags: list) -> str:
                 break
 
     tag_block = "\n".join(all_tags[:350])
+=======
+        if len(all_tags) >= 8:
+            break
+
+    tag_block = " ".join(all_tags)
+>>>>>>> origin/main
     return desc.rstrip() + "\n\n" + tag_block
 
 
@@ -234,15 +245,21 @@ def _generate_topic_hashtags(topic: str) -> list[str]:
     if words:
         full = "".join(w.capitalize() for w in words)
         tags.append(f"#{full}")
+<<<<<<< HEAD
 
         for i in range(len(words) - 1):
             pair = words[i].capitalize() + words[i + 1].capitalize()
             tags.append(f"#{pair}")
 
+=======
+        if len(words) >= 2:
+            tags.append(f"#{words[0].capitalize()}{words[1].capitalize()}")
+>>>>>>> origin/main
         for w in words:
             if len(w) >= 4:
                 tags.append(f"#{w.capitalize()}")
 
+<<<<<<< HEAD
         root = words[0].capitalize()
         suffixes = [
             "Tips", "Hacks", "Facts", "Tricks", "Benefits", "Science",
@@ -291,6 +308,9 @@ def _generate_topic_hashtags(topic: str) -> list[str]:
         "HealthMindBlown", "WellnessWednesday", "HealthMonday",
         "TipOfTheDay", "FactOfTheDay", "HabitOfTheDay",
     ]
+=======
+    adjacent = ["HealthTips", "Wellness", "Shorts", "HealthyHabits", "Science"]
+>>>>>>> origin/main
     tags.extend([f"#{t}" for t in adjacent])
     return tags
 
@@ -299,7 +319,11 @@ def _clean_tags(raw: list, topic: str) -> str:
     out: list[str] = []
     seen: set[str] = set()
     topic_words = re.findall(r"[a-zA-Z0-9]+", topic or "")
+<<<<<<< HEAD
     candidates  = list(raw or []) + [topic] + [" ".join(topic_words[:3])]
+=======
+    candidates  = list(raw or []) + topic_words + ["health", "wellness"]
+>>>>>>> origin/main
     for t in candidates:
         t = (str(t) or "").strip().lstrip("#")
         t = re.sub(r"[^a-zA-Z0-9 ]", "", t).strip()
@@ -307,18 +331,32 @@ def _clean_tags(raw: list, topic: str) -> str:
             continue
         seen.add(t.lower())
         out.append(t)
+<<<<<<< HEAD
         if len(out) >= 12:
             break
     return ",".join(out[:12])
+=======
+        if len(out) >= 8:
+            break
+    return ",".join(out)
+>>>>>>> origin/main
 
 
 def _fallback_seo(topic: str, script_text: str) -> dict:
     safe_topic = re.sub(r"[^\x00-\x7F]", "", topic or "Health Tips")
     title = f"{safe_topic[:75]} #Shorts"
+<<<<<<< HEAD
+=======
+    
+    ht = _generate_topic_hashtags(safe_topic)[:5]
+    tag_block = " ".join(ht)
+
+>>>>>>> origin/main
     description = (
         f"{safe_topic} - quick science-backed wellness tips for your daily routine.\n"
         "Like and subscribe for daily health tips.\n"
         "Educational only, not medical advice.\n\n"
+<<<<<<< HEAD
         + "\n".join(_generate_topic_hashtags(safe_topic)[:350])
     )
     words    = re.findall(r"[a-zA-Z0-9]+", safe_topic)
@@ -326,6 +364,12 @@ def _fallback_seo(topic: str, script_text: str) -> dict:
         (words[:6] + ["health", "wellness", "shorts",
                       "healthy habits", "fitness", "tips"])[:12]
     )
+=======
+        + tag_block
+    )
+    words    = re.findall(r"[a-zA-Z0-9]+", safe_topic)
+    tags_csv = ",".join((words[:5] + ["health", "wellness", "shorts"])[:8])
+>>>>>>> origin/main
     return {
         "title": title,
         "description": description,

@@ -169,6 +169,7 @@ Trending, actionable topics. Scheduled publish (IST): **{scheduled_ist.strftime(
 {numbered}
 
 ---
+<<<<<<< HEAD
 **Reply with either:**
 1. **Combined (Topic + Script in one comment):**
    - `/approve-topic 1 /use-default-prompt` (or `/approve-topic 2 /set-script Your custom script text...`)
@@ -178,19 +179,46 @@ Trending, actionable topics. Scheduled publish (IST): **{scheduled_ist.strftime(
    - `/approve-topic 1` (or 2-6) — approve a numbered topic (bot will then prompt for script)
    - `/custom-topic Your Specific Topic` — use your own topic
    - `/reject-topic` — get fresh suggestions
+=======
+### ⚡ FASTEST: Approve & Start Building in ONE Comment
+Reply with one of these to skip the back-and-forth:
+- `/approve-topic 1 /use-default-prompt` — (Approves #1 and starts building with AI script)
+- `/approve-topic 1 /set-script [your text]` — (Approves #1 with your own custom text)
+
+---
+**Standard Workflow (Multiple Steps):**
+- `/approve-topic 1` — Just approve the topic (bot will ask for script next)
+- `/custom-topic Your Specific Topic` — Use your own topic title
+- `/reject-topic` — Get 6 fresh suggestions
+>>>>>>> origin/main
 
 {note}
 """
     meta_block = set_metadata_in_issue_body(body, {"slot": SLOT, "scheduled_ist": scheduled_ist.strftime("%Y-%m-%d %H:%M"), "topics": topics})
     gh("POST", f"https://api.github.com/repos/{owner}/{repo}/issues", json={
+<<<<<<< HEAD
         "title": title,
         "body": meta_block,
         "labels": [f"slot:{SLOT}", "await-topic-approval"]
+=======
+        "title": title, 
+        "body": meta_block,
+        "labels": [f"slot:{SLOT}", "await-approval"]
+>>>>>>> origin/main
     })
 
 def main() -> None:
     owner, repo = REPO.split("/", 1)
+<<<<<<< HEAD
     if open_issues_with_labels(owner, repo, [f"slot:{SLOT}"]): return
+=======
+    
+    # Block if ANY previous issue for this slot is still open (not approved/closed)
+    pending = open_issues_with_labels(owner, repo, [f"slot:{SLOT}"])
+    if pending:
+        log.info(f"Slot '{SLOT}' has {len(pending)} open issue(s). Skipping new proposal until they are approved (closed).")
+        return
+>>>>>>> origin/main
     
     approved = load_recent_approved_topics(owner, repo)
     pool = get_topics_pool(owner, repo)

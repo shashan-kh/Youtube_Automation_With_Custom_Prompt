@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write
   issues: write
+<<<<<<< HEAD
 
 jobs:
   gemini_chat:
@@ -14,18 +15,33 @@ jobs:
     # Runs when you comment with @gemini-cli on an Issue
     if: github.event.issue.pull_request == null && contains(github.event.comment.body, '@gemini-cli')
 
+=======
+  pull-requests: write
+
+jobs:
+  gemini-cli:
+    runs-on: ubuntu-latest
+    if: contains(github.event.comment.body, '@gemini-cli')
+>>>>>>> origin/main
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+<<<<<<< HEAD
           token: ${{ secrets.GH_PAT }}
 
       - name: Set up Node.js
+=======
+          fetch-depth: 0
+
+      - name: Setup Node.js
+>>>>>>> origin/main
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install Gemini CLI
+<<<<<<< HEAD
         run: npm install -g @google/gemini-cli@latest
 
       - name: Run Gemini Agent
@@ -61,3 +77,24 @@ jobs:
           git add -A
           git diff --cached --quiet || git commit -m "refactor: apply updates via @gemini-cli instruction"
           git push origin HEAD:${{ github.ref_name }}
+=======
+        run: npm install -g @google/gemini-cli
+
+      - name: Run Gemini CLI
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: gemini --yolo -p "$COMMENT_BODY"
+
+      - name: Commit and Push changes
+        run: |
+          git config --global user.name "gemini-cli[bot]"
+          git config --global user.email "gemini-cli[bot]@users.noreply.github.com"
+          if [[ -n $(git status -s) ]]; then
+            git add .
+            git commit -m "chore: apply changes from @gemini-cli"
+            git push
+          else
+            echo "No changes to commit"
+          fi
+>>>>>>> origin/main

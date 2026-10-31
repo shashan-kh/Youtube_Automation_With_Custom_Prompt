@@ -7,7 +7,11 @@ on:
 permissions:
   actions: none
   checks: none
+<<<<<<< HEAD
   contents: write
+=======
+  contents: read
+>>>>>>> origin/main
   deployments: none
   id-token: none
   issues: write
@@ -26,6 +30,7 @@ jobs:
   handle:
     runs-on: ubuntu-latest
     if: |
+<<<<<<< HEAD
       github.event.issue.pull_request == null &&
       github.event.comment.user.type != 'Bot' &&
       (
@@ -39,6 +44,17 @@ jobs:
         contains(github.event.comment.body, '/set-script')         ||
         contains(github.event.comment.body, '/use-default-prompt')
       )
+=======
+      contains(github.event.comment.body, '/approve-topic')    ||
+      contains(github.event.comment.body, '/reject-topic')     ||
+      contains(github.event.comment.body, '/approve-video')    ||
+      contains(github.event.comment.body, '/reject-video')     ||
+      contains(github.event.comment.body, '/regenerate-video') ||
+      contains(github.event.comment.body, '/new-topic')        ||
+      contains(github.event.comment.body, '/custom-topic')     ||
+      contains(github.event.comment.body, '/set-script')       ||
+      contains(github.event.comment.body, '/use-default-prompt')
+>>>>>>> origin/main
 
     steps:
       - uses: actions/checkout@v4
@@ -82,7 +98,11 @@ jobs:
         shell: bash
         run: |
           missing=0
+<<<<<<< HEAD
           for v in GROQ_API_KEY YT_CLIENT_ID YT_CLIENT_SECRET YT_REFRESH_TOKEN; do
+=======
+          for v in GROQ_API_KEY PEXELS_API_KEY YT_CLIENT_ID YT_CLIENT_SECRET YT_REFRESH_TOKEN; do
+>>>>>>> origin/main
             if [ -z "${!v}" ]; then
               echo "::error::Missing secret: $v"
               missing=1
@@ -90,11 +110,14 @@ jobs:
               echo "$v is set ✓"
             fi
           done
+<<<<<<< HEAD
           if [ -z "$PEXELS_API_KEY" ]; then
             echo "::warning::PEXELS_API_KEY is not set (falling back to built-in synthetic B-roll)."
           else
             echo "PEXELS_API_KEY is set ✓"
           fi
+=======
+>>>>>>> origin/main
           [ "$missing" -eq 0 ] || exit 1
         env:
           GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
@@ -103,6 +126,12 @@ jobs:
           YT_CLIENT_SECRET:  ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN:  ${{ secrets.YT_REFRESH_TOKEN }}
 
+<<<<<<< HEAD
+=======
+      - name: Dump event payload (debug)
+        run: cat "$GITHUB_EVENT_PATH"
+
+>>>>>>> origin/main
       - name: Handle comment
         env:
           REGION:               IN
@@ -116,7 +145,13 @@ jobs:
           GROQ_MODEL:           llama-3.3-70b-versatile
           GROQ_FALLBACK_MODELS: >-
             llama-3.3-70b-versatile,llama-3.1-8b-instant,
+<<<<<<< HEAD
             qwen/qwen3-32b,openai/gpt-oss-20b,openai/gpt-oss-120b,
             groq/compound-mini,moonshotai/kimi-k2-instruct
           DEBUG:                "1"
+=======
+            openai/gpt-oss-20b,openai/gpt-oss-120b,
+            groq/compound-mini,moonshotai/kimi-k2-instruct
+          DEBUG:                "0"
+>>>>>>> origin/main
         run: python handle_comment.py
