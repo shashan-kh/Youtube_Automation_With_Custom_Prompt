@@ -18,7 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GH_PAT }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -31,39 +31,15 @@ jobs:
       - name: Run Gemini Agent
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_CLI_TRUST_WORKSPACE: true
         run: |
           # Configure Git user for automated commits
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # =========================================================================
-          # ACTIVE GEMINI CLI MODELS (Uncomment ONLY ONE line below to run)
-          # =========================================================================
-          
-          # 1. Gemini 3.5 Flash-Lite (Recommended right now since your 3.8 Flash hit limit!)
-          #gemini --yolo --skip-trust --model gemini-3.5-flash-lite -p "${{ github.event.comment.body }}"
-          
-          # 2. Gemini 3.6 Flash (Direct stable alternative to 3.8 Flash with separate quota)
-          #gemini --yolo --skip-trust --model gemini-3.6-flash -p "${{ github.event.comment.body }}"
-          
-          # 3. Gemini 3.8 Flash (Flagship coding Flash model - use when quota resets)
-          #gemini --yolo --skip-trust --model gemini-3.8-flash -p "${{ github.event.comment.body }}"
-          
-          # 4. Gemini 3.1 Flash-Lite (Ultra-lightweight backup for simple script/prompt edits)
+          # Run Gemini CLI with --skip-trust explicitly bypassing the workspace trust check
           gemini --yolo --skip-trust --model gemini-3.1-flash-lite -p "${{ github.event.comment.body }}"
           
-          # 5. Gemini 3.1 Pro Preview (High reasoning, strict free-tier limit)
-          #gemini --yolo --skip-trust --model gemini-3.1-pro-preview -p "${{ github.event.comment.body }}"
-
-          #gemini --yolo --skip-trust --model gemini-3-flash-preview -p "${{ github.event.comment.body }}"
-
-          #gemini --yolo --skip-trust --model gemini-2.5-pro -p "${{ github.event.comment.body }}"
-
-          #gemini --yolo --skip-trust --model gemma-4-31b-it -p "${{ github.event.comment.body }}"
-
-          #gemini --yolo --skip-trust --model gemma-4-26b-a4b-it -p "${{ github.event.comment.body }}"
-          # =========================================================================
-
           # Automatically commit and push any changes made by the AI agent
           git add -A
           git diff --cached --quiet || git commit -m "refactor: apply updates via @gemini-cli instruction"
