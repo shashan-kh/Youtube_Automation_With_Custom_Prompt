@@ -54,7 +54,14 @@ jobs:
           
           # 5. Gemini 3.1 Pro Preview (High reasoning, strict free-tier limit)
           #gemini --yolo --skip-trust --model gemini-3.1-pro-preview -p "${{ github.event.comment.body }}"
-          
+
+          #gemini --yolo --skip-trust --model gemini-3-flash-preview -p "${{ github.event.comment.body }}"
+
+          #gemini --yolo --skip-trust --model gemini-2.5-pro -p "${{ github.event.comment.body }}"
+
+          #gemini --yolo --skip-trust --model gemma-4-31b-it -p "${{ github.event.comment.body }}"
+
+          #gemini --yolo --skip-trust --model gemma-4-26b-a4b-it -p "${{ github.event.comment.body }}"
           # =========================================================================
 
           # Automatically commit and push any changes made by the AI agent
