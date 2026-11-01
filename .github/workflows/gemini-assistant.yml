@@ -20,9 +20,27 @@ jobs:
         with:
           token: ${{ secrets.GH_PAT }}
 
-      - name: Run Gemini CLI Action
-        uses: google-github-actions/run-gemini-cli@v0
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          gemini_skip_trust: true
-          model: "gemini-3.1-flash-lite"
+          node-version: '20'
+
+      - name: Install Gemini CLI
+        run: npm install -g @google/gemini-cli@latest
+
+      - name: Run Gemini Agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_CLI_TRUST_WORKSPACE: true
+        run: |
+          # Configure Git user for automated commits
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Run Gemini CLI with --skip-trust explicitly bypassing the workspace trust check
+          gemini --yolo --skip-trust --model gemini-3.1-flash-lite -p "${{ github.event.comment.body }}"
+          
+          # Automatically commit and push any changes made by the AI agent
+          git add -A
+          git diff --cached --quiet || git commit -m "refactor: apply updates via @gemini-cli instruction"
+          git push origin HEAD:${{ github.ref_name }}
